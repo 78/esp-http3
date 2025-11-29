@@ -1,0 +1,14 @@
+dependencies:
+  idf: '>=5.3'
+description: A QUIC HTTP/3 Client for ESP32, ported from Python implementation
+maintainers:
+  - Terrence
+files:
+  exclude:
+  - .git
+  - dist
+  - "*.md"
+license: MIT
+repository: https://github.com/78/esp-http3
+url: https://github.com/78/esp-http3
+version: 1.0.0
