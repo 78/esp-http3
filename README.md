@@ -17,6 +17,77 @@ ESP32 平台的 QUIC/HTTP3 客户端库，实现了 RFC 9000 (QUIC) 和 RFC 9114
 - **用户提供传输层**：通过回调函数发送 UDP 数据
 - **用户驱动事件循环**：调用 `ProcessReceivedData()` 处理接收的数据，调用 `OnTimerTick()` 驱动定时器
 
+## 并发测试示例
+
+以下是一个并发测试的输出示例，展示了在同一个 QUIC 连接上同时发送两个 HTTP/3 请求（`GET /` 和 `GET /pocket-sage/health`）的能力：
+
+```
+I (5003) HTTPS_DEMO: === QUIC/HTTP3 WiFi Concurrent Test Start ===
+I (5003) HTTPS_DEMO: Target: api.tenclass.net:443
+I (5003) HTTPS_DEMO: Testing concurrent requests: / and /pocket-sage/health
+I (5013) HTTPS_DEMO: Resolved api.tenclass.net to 112.74.84.224
+I (5013) HTTPS_DEMO: UDP socket connected
+I (5013) HTTPS_DEMO: Starting QUIC handshake...
+I (5093) HTTPS_DEMO: Waiting for handshake...
+I (5123) wifi:<ba-add>idx:0 (ifx:0, c2:3d:2a:62:7b:3c), tid:0, ssn:1, winSize:64
+I (5293) HTTPS_DEMO: >>> QUIC Connection established!
+I (5303) HTTPS_DEMO: Sending concurrent HTTP/3 GET requests...
+I (5303) HTTPS_DEMO: Sending request 1: GET /
+I (5303) HTTPS_DEMO: Request 1 sent on stream 0
+I (5303) HTTPS_DEMO: Sending request 2: GET /pocket-sage/health
+I (5303) HTTPS_DEMO: Request 2 sent on stream 4
+I (5303) HTTPS_DEMO: Waiting for responses (need 2 streams)...
+I (5323) HTTPS_DEMO: >>> HTTP/3 Response on stream 0
+I (5323) HTTPS_DEMO:     Status: 200
+I (5323) HTTPS_DEMO:     Headers: 6
+I (5323) HTTPS_DEMO:       date: Sat, 29 Nov 2025 02:55:28 GMT
+I (5323) HTTPS_DEMO:       content-type: text/html
+I (5323) HTTPS_DEMO:       content-length: 452
+I (5323) HTTPS_DEMO:       last-modified: Thu
+I (5323) HTTPS_DEMO:       etag: "60dd8909-1c4"
+I (5323) HTTPS_DEMO:       accept-ranges: bytes
+I (5323) HTTPS_DEMO:     Body size: 452 bytes
+I (5323) HTTPS_DEMO:     Body preview: <!DOCTYPE html>
+<html>
+<head>
+<title>HTTP Server Test Page</title>
+<style>
+    body {
+        width: 35em;
+        margin: 0 auto;
+        font-family: Tahoma, Verdana, Arial, sans-serif;
+    }
+</styl...
+I (5323) HTTPS_DEMO:     Received responses: 1/2
+I (5323) HTTPS_DEMO: >>> HTTP/3 Response on stream 4
+I (5323) HTTPS_DEMO:     Status: 200
+I (5323) HTTPS_DEMO:     Headers: 3
+I (5323) HTTPS_DEMO:       date: Sat, 29 Nov 2025 02:55:28 GMT
+I (5323) HTTPS_DEMO:       content-type: application/json; charset=utf-8
+I (5323) HTTPS_DEMO:       content-length: 67
+I (5323) HTTPS_DEMO:     Body size: 67 bytes
+I (5323) HTTPS_DEMO:     Body preview: {"status":"ok","timestamp":1764384928659,"uptime":467252.919434436}
+I (5323) HTTPS_DEMO:     Received responses: 2/2
+I (5333) HTTPS_DEMO: === Connection Stats ===
+I (5333) HTTPS_DEMO:   Packets sent: 13
+I (5333) HTTPS_DEMO:   Packets received: 10
+I (5333) HTTPS_DEMO:   Bytes sent: 1868
+I (5333) HTTPS_DEMO:   Bytes received: 5881
+I (5333) HTTPS_DEMO:   RTT: 72 ms
+I (5333) HTTPS_DEMO: === Concurrent Test Results ===
+I (5333) HTTPS_DEMO: === Test PASSED (both responses received) ===
+I (5333) HTTPS_DEMO: Stream 0 (GET /): Status 200, Body size: 452 bytes
+I (5333) HTTPS_DEMO: Stream 4 (GET /pocket-sage/health): Status 200, Body size: 67 bytes
+I (5333) HTTPS_DEMO: >>> Disconnected: code=0, reason=
+I (5333) HTTPS_DEMO: === QUIC/HTTP3 WiFi Concurrent Test Complete ===
+```
+
+测试结果显示：
+- ✅ 成功建立 QUIC 连接
+- ✅ 在同一连接上并发发送两个请求（Stream 0 和 Stream 4）
+- ✅ 两个响应都成功接收（均在 20ms 内完成）
+- ✅ 连接统计：发送 13 个数据包，接收 10 个数据包
+
 ## WiFi 使用示例
 
 以下示例展示如何在 ESP32 上使用 WiFi 连接进行 QUIC/HTTP3 通信：
