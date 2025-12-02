@@ -148,6 +148,54 @@ bool BuildStreamFrame(BufferWriter* writer,
     return true;
 }
 
+bool BuildResetStreamFrame(BufferWriter* writer,
+                           uint64_t stream_id,
+                           uint64_t error_code,
+                           uint64_t final_size) {
+    // RESET_STREAM frame type (0x04)
+    if (!writer->WriteUint8(frame::kResetStream)) {
+        return false;
+    }
+    
+    // Stream ID
+    if (!writer->WriteVarint(stream_id)) {
+        return false;
+    }
+    
+    // Application Protocol Error Code
+    if (!writer->WriteVarint(error_code)) {
+        return false;
+    }
+    
+    // Final Size
+    if (!writer->WriteVarint(final_size)) {
+        return false;
+    }
+    
+    return true;
+}
+
+bool BuildStopSendingFrame(BufferWriter* writer,
+                           uint64_t stream_id,
+                           uint64_t error_code) {
+    // STOP_SENDING frame type (0x05)
+    if (!writer->WriteUint8(frame::kStopSending)) {
+        return false;
+    }
+    
+    // Stream ID
+    if (!writer->WriteVarint(stream_id)) {
+        return false;
+    }
+    
+    // Application Protocol Error Code
+    if (!writer->WriteVarint(error_code)) {
+        return false;
+    }
+    
+    return true;
+}
+
 bool BuildMaxDataFrame(BufferWriter* writer, uint64_t max_data) {
     if (!writer->WriteUint8(frame::kMaxData)) {
         return false;

@@ -161,6 +161,14 @@ public:
     uint64_t GetPtoTimeout() const;
     
     /**
+     * @brief Get time until next PTO fires (microseconds)
+     * 
+     * @param current_time_us Current time in microseconds
+     * @return Time until next PTO in microseconds, or 0 if no pending PTO
+     */
+    uint64_t GetTimeUntilNextPto(uint64_t current_time_us) const;
+    
+    /**
      * @brief Get RTT estimator
      */
     RttEstimator& GetRttEstimator() { return rtt_; }

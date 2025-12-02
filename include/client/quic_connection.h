@@ -226,8 +226,11 @@ public:
      * - Send flow control updates
      * 
      * @param elapsed_ms Milliseconds since last call
+     * @return Time in milliseconds until the next timer should fire.
+     *         Returns 0 if timer processing is not needed (e.g., disconnected).
+     *         Returns a maximum of 60000ms (1 minute) as an upper bound.
      */
-    void OnTimerTick(uint32_t elapsed_ms);
+    uint32_t OnTimerTick(uint32_t elapsed_ms);
     
     //=========================================================================
     // HTTP/3 Requests
@@ -283,6 +286,19 @@ public:
      * @return true on success, false on failure
      */
     bool FinishStream(int stream_id);
+    
+    /**
+     * @brief Reset a stream by sending RESET_STREAM frame
+     * 
+     * This abruptly terminates the stream, discarding any queued data.
+     * Use this when you want to abort an ongoing request/upload.
+     * The peer will receive RESET_STREAM frame with the specified error code.
+     * 
+     * @param stream_id Stream ID to reset
+     * @param error_code Application error code (default: H3_REQUEST_CANCELLED = 0x10c)
+     * @return true on success, false if stream doesn't exist or already closed
+     */
+    bool ResetStream(int stream_id, uint64_t error_code = 0x10c);
     
     //=========================================================================
     // Queued Write API (Recommended for large uploads)

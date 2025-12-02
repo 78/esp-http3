@@ -70,7 +70,7 @@ public:
     bool IsConnected() const { return state_ == ConnectionState::kConnected; }
     
     void ProcessReceivedData(uint8_t* data, size_t len);
-    void OnTimerTick(uint32_t elapsed_ms);
+    uint32_t OnTimerTick(uint32_t elapsed_ms);
     
     int SendRequest(const std::string& method,
                     const std::string& path,
@@ -82,6 +82,7 @@ public:
                    const std::vector<std::pair<std::string, std::string>>& headers);
     bool WriteStream(int stream_id, const uint8_t* data, size_t len);
     bool FinishStream(int stream_id);
+    bool ResetStream(int stream_id, uint64_t error_code);
     
     // Flow control checks (borrowed from Python version)
     bool CanSend(int stream_id, size_t len) const;
@@ -330,12 +331,17 @@ private:
     uint64_t time_since_last_activity_us_ = 0;
     uint64_t handshake_start_time_us_ = 0;
     uint64_t current_time_us_ = 0;
+    uint32_t effective_idle_timeout_ms_ = 0;  // min(local, peer) idle timeout
     
     // Stats
     uint32_t packets_sent_ = 0;
     uint32_t packets_received_ = 0;
     uint32_t bytes_sent_ = 0;
     uint32_t bytes_received_ = 0;
+    
+    // Decrypt failure tracking - close connection after too many consecutive failures
+    uint32_t consecutive_decrypt_failures_ = 0;
+    static constexpr uint32_t kMaxConsecutiveDecryptFailures = 3;
     
     // Retry token
     std::vector<uint8_t> retry_token_;
@@ -369,6 +375,9 @@ QuicConnection::Impl::Impl(SendCallback send_cb, const QuicConfig& config)
     , config_(config) {
     
     h3_handler_ = std::make_unique<h3::H3Handler>();
+    
+    // Initialize effective idle timeout with local config (will be updated with min(local, peer) after handshake)
+    effective_idle_timeout_ms_ = config_.idle_timeout_ms;
     
     // Set up local transport parameters
     local_params_.max_idle_timeout = config_.idle_timeout_ms;
@@ -763,11 +772,36 @@ bool QuicConnection::Impl::Process1RttPacket(uint8_t* data, size_t len) {
         payload_buf_, sizeof(payload_buf_));
     
     if (payload_len == 0) {
+        // Check if this is a Stateless Reset (RFC 9000 Section 10.3)
+        // Stateless Reset: at least 21 bytes, last 16 bytes are reset token
+        if (len >= 21 && peer_params_.stateless_reset_token_present) {
+            const uint8_t* token_in_packet = data + len - 16;
+            if (std::memcmp(token_in_packet, peer_params_.stateless_reset_token, 16) == 0) {
+                ESP_LOGW(TAG, "Received Stateless Reset from server - connection was closed by peer");
+                Close(0, "stateless reset received");
+                return false;
+            }
+        }
+        
+        // Track consecutive decrypt failures - likely means server closed connection
+        // but we didn't receive a proper close signal (e.g., server restarted, network issue)
+        consecutive_decrypt_failures_++;
+        if (consecutive_decrypt_failures_ >= kMaxConsecutiveDecryptFailures) {
+            ESP_LOGW(TAG, "Too many consecutive decrypt failures (%lu), closing connection",
+                     consecutive_decrypt_failures_);
+            Close(0, "decrypt failures - connection likely stale");
+            return false;
+        }
+        
         if (config_.enable_debug) {
-            ESP_LOGW(TAG, "Decrypt1RttPacket failed");
+            ESP_LOGW(TAG, "Decrypt1RttPacket failed (len=%zu, failures=%lu)",
+                     len, consecutive_decrypt_failures_);
         }
         return false;
     }
+    
+    // Reset failure counter on successful decrypt
+    consecutive_decrypt_failures_ = 0;
     
     if (config_.enable_debug) {
         ESP_LOGI(TAG, "Decrypted 1-RTT packet, PN=%llu, payload=%zu bytes",
@@ -1184,6 +1218,22 @@ bool QuicConnection::Impl::ProcessEncryptedExtensions(const uint8_t* data,
         flow_controller_.OnMaxDataReceived(peer_params_.initial_max_data);
         loss_detector_.SetMaxAckDelay(peer_params_.max_ack_delay);
         
+        // Calculate effective idle timeout (RFC 9000 Section 10.1)
+        // Use minimum of local and peer idle timeout, 0 means disabled
+        uint32_t peer_idle_ms = static_cast<uint32_t>(peer_params_.max_idle_timeout);
+        if (peer_idle_ms > 0 && config_.idle_timeout_ms > 0) {
+            effective_idle_timeout_ms_ = std::min(config_.idle_timeout_ms, peer_idle_ms);
+        } else if (peer_idle_ms > 0) {
+            effective_idle_timeout_ms_ = peer_idle_ms;
+        } else {
+            effective_idle_timeout_ms_ = config_.idle_timeout_ms;
+        }
+        
+        if (config_.enable_debug) {
+            ESP_LOGI(TAG, "Effective idle timeout: %lu ms (local=%lu, peer=%lu)",
+                     effective_idle_timeout_ms_, config_.idle_timeout_ms, peer_idle_ms);
+        }
+        
         // Update DATAGRAM support (RFC 9221)
         if (peer_params_.max_datagram_frame_size > 0) {
             peer_max_datagram_frame_size_ = static_cast<uint32_t>(peer_params_.max_datagram_frame_size);
@@ -1351,9 +1401,19 @@ void QuicConnection::Impl::ProcessStreamFrame(quic::BufferReader* reader,
                  stream_data.fin ? 1 : 0);
     }
     
-    // Update flow control
+    // Update flow control (must do this even for cancelled streams for protocol consistency)
     flow_controller_.OnStreamBytesReceived(stream_data.stream_id, 
                                             stream_data.length);
+    
+    // Check if we've sent STOP_SENDING for this stream - if so, ignore the data
+    // The peer may not have received our STOP_SENDING yet, so we just silently drop
+    if (stop_sending_streams_.find(stream_data.stream_id) != stop_sending_streams_.end()) {
+        if (config_.enable_debug) {
+            ESP_LOGW(TAG, "  Ignoring STREAM data for cancelled stream %llu",
+                     (unsigned long long)stream_data.stream_id);
+        }
+        return;
+    }
     
     // Pass to H3 handler with offset for proper reassembly
     if (h3_handler_) {
@@ -1632,26 +1692,46 @@ bool QuicConnection::Impl::SendStreamData(uint64_t stream_id,
 // Timer
 //=============================================================================
 
-void QuicConnection::Impl::OnTimerTick(uint32_t elapsed_ms) {
+uint32_t QuicConnection::Impl::OnTimerTick(uint32_t elapsed_ms) {
     current_time_us_ = quic::GetCurrentTimeUs();
     time_since_last_activity_us_ += elapsed_ms * 1000;
     
-    // Check idle timeout
-    if (handshake_complete_ && 
-        time_since_last_activity_us_ > config_.idle_timeout_ms * 1000) {
-        Close(0, "idle timeout");
-        return;
+    // Maximum wait time (60 seconds as upper bound)
+    static constexpr uint32_t kMaxWaitMs = 60000;
+    uint32_t next_timer_ms = kMaxWaitMs;
+    
+    // Check idle timeout (use effective timeout which is min of local and peer)
+    if (handshake_complete_ && effective_idle_timeout_ms_ > 0) {
+        uint64_t idle_deadline_us = effective_idle_timeout_ms_ * 1000ULL;
+        if (time_since_last_activity_us_ > idle_deadline_us) {
+            Close(0, "idle timeout");
+            return 0;
+        }
+        // Calculate time until idle timeout
+        uint64_t remaining_us = idle_deadline_us - time_since_last_activity_us_;
+        uint32_t remaining_ms = static_cast<uint32_t>(remaining_us / 1000);
+        if (remaining_ms < next_timer_ms) {
+            next_timer_ms = remaining_ms;
+        }
     }
     
     // Check handshake timeout
-    if (!handshake_complete_ &&
-        current_time_us_ - handshake_start_time_us_ > 
-        config_.handshake_timeout_ms * 1000ULL) {
-        state_ = ConnectionState::kFailed;
-        if (on_disconnected_) {
-            on_disconnected_(-1, "handshake timeout");
+    if (!handshake_complete_) {
+        uint64_t handshake_deadline_us = handshake_start_time_us_ + 
+                                         config_.handshake_timeout_ms * 1000ULL;
+        if (current_time_us_ > handshake_deadline_us) {
+            state_ = ConnectionState::kFailed;
+            if (on_disconnected_) {
+                on_disconnected_(-1, "handshake timeout");
+            }
+            return 0;
         }
-        return;
+        // Calculate time until handshake timeout
+        uint64_t remaining_us = handshake_deadline_us - current_time_us_;
+        uint32_t remaining_ms = static_cast<uint32_t>(remaining_us / 1000);
+        if (remaining_ms < next_timer_ms) {
+            next_timer_ms = remaining_ms;
+        }
     }
     
     // Check PTO
@@ -1665,10 +1745,42 @@ void QuicConnection::Impl::OnTimerTick(uint32_t elapsed_ms) {
         }
     }
     
+    // Calculate precise time until next PTO (considering exponential backoff)
+    uint64_t time_until_pto_us = loss_detector_.GetTimeUntilNextPto(current_time_us_);
+    if (time_until_pto_us > 0) {
+        // Round up: 500us -> 1ms, not 0ms
+        uint32_t pto_ms = static_cast<uint32_t>((time_until_pto_us + 999) / 1000);
+        if (pto_ms < next_timer_ms) {
+            next_timer_ms = pto_ms;
+        }
+    }
+    
     // Process write queues (send queued data respecting flow control)
     if (IsConnected()) {
         ProcessWriteQueue();
+        
+        // If there's pending data in write queues, use a shorter poll interval
+        // to check when flow control window opens up (after receiving ACK/WINDOW_UPDATE)
+        if (!write_queues_.empty()) {
+            // Use a reasonable poll interval for blocked queues
+            // The main wake-up will come from select() on UDP recv,
+            // but this provides a fallback
+            static constexpr uint32_t kQueuePollIntervalMs = 100;
+            if (kQueuePollIntervalMs < next_timer_ms) {
+                next_timer_ms = kQueuePollIntervalMs;
+            }
+        }
     }
+    
+    // Ensure we don't return 0 (which would mean immediate re-trigger)
+    // and cap at maximum wait time
+    if (next_timer_ms == 0) {
+        next_timer_ms = 1;
+    } else if (next_timer_ms > kMaxWaitMs) {
+        next_timer_ms = kMaxWaitMs;
+    }
+    
+    return next_timer_ms;
 }
 
 //=============================================================================
@@ -1792,6 +1904,83 @@ bool QuicConnection::Impl::FinishStream(int stream_id) {
     return SendStreamData(static_cast<uint64_t>(stream_id), nullptr, 0, true);
 }
 
+bool QuicConnection::Impl::ResetStream(int stream_id, uint64_t error_code) {
+    if (!IsConnected()) {
+        return false;
+    }
+    
+    uint64_t sid = static_cast<uint64_t>(stream_id);
+    
+    // Check if stream was already reset
+    if (reset_streams_.find(sid) != reset_streams_.end()) {
+        ESP_LOGW(TAG, "ResetStream: stream %d already reset", stream_id);
+        return false;
+    }
+    
+    // Get stream flow state to determine final size
+    uint64_t final_size = 0;
+    StreamFlowState* stream_state = flow_controller_.GetStreamState(sid);
+    if (stream_state) {
+        final_size = stream_state->send_offset;
+    }
+    
+    // Clean up write queue for this stream
+    auto it = write_queues_.find(stream_id);
+    if (it != write_queues_.end()) {
+        auto& queue = it->second;
+        // Call deleters for queued items
+        for (auto& item : queue.items) {
+            if (item.deleter) {
+                item.deleter();
+            }
+        }
+        write_queues_.erase(it);
+        
+        if (config_.enable_debug) {
+            ESP_LOGI(TAG, "ResetStream: cleaned up write queue for stream %d", stream_id);
+        }
+    }
+    
+    // Build both RESET_STREAM and STOP_SENDING frames in the same packet
+    // RESET_STREAM: tells peer we won't send more data
+    // STOP_SENDING: tells peer to stop sending data to us
+    quic::BufferWriter writer(frame_buf_, sizeof(frame_buf_));
+    
+    if (!quic::BuildResetStreamFrame(&writer, sid, error_code, final_size)) {
+        ESP_LOGE(TAG, "ResetStream: failed to build RESET_STREAM frame");
+        return false;
+    }
+    
+    if (!quic::BuildStopSendingFrame(&writer, sid, error_code)) {
+        ESP_LOGE(TAG, "ResetStream: failed to build STOP_SENDING frame");
+        return false;
+    }
+    
+    // Build 1-RTT packet and send
+    uint64_t pn = app_tracker_.AllocatePacketNumber();
+    size_t packet_len = quic::Build1RttPacket(dcid_, pn, false, crypto_.GetKeyPhase() != 0,
+                                               frame_buf_, writer.Offset(),
+                                               crypto_.GetClientAppSecrets(),
+                                               packet_buf_, sizeof(packet_buf_));
+    
+    if (packet_len == 0) {
+        ESP_LOGE(TAG, "ResetStream: failed to build 1-RTT packet");
+        return false;
+    }
+    
+    app_tracker_.OnPacketSent(pn, current_time_us_, packet_len, true);
+    loss_detector_.OnPacketSent(pn, current_time_us_, packet_len, true);
+    
+    // Mark stream as reset locally (both directions)
+    reset_streams_.insert(sid);
+    stop_sending_streams_.insert(sid);
+    
+    ESP_LOGI(TAG, "ResetStream: stream %d reset with RESET_STREAM + STOP_SENDING, error=0x%llx, final_size=%llu",
+             stream_id, (unsigned long long)error_code, (unsigned long long)final_size);
+    
+    return SendPacket(packet_buf_, packet_len);
+}
+
 //=============================================================================
 // Queued Write API
 //=============================================================================
@@ -1891,11 +2080,14 @@ void QuicConnection::Impl::ProcessWriteQueue() {
                         ESP_LOGI(TAG, "ProcessWriteQueue: stream %d finished, total %zu bytes",
                                  stream_id, queue.sent_bytes);
                     }
+                    
+                    // Remove completed queue from write_queues_
+                    it = write_queues_.erase(it);
+                    goto next_stream;
                 } else {
                     // FinishStream failed, try again later
                     break;
                 }
-                continue;
             }
             
             // Get available flow control window
@@ -2374,8 +2566,8 @@ void QuicConnection::ProcessReceivedData(uint8_t* data, size_t len) {
     impl_->ProcessReceivedData(data, len);
 }
 
-void QuicConnection::OnTimerTick(uint32_t elapsed_ms) {
-    impl_->OnTimerTick(elapsed_ms);
+uint32_t QuicConnection::OnTimerTick(uint32_t elapsed_ms) {
+    return impl_->OnTimerTick(elapsed_ms);
 }
 
 int QuicConnection::SendRequest(
@@ -2399,6 +2591,10 @@ bool QuicConnection::WriteStream(int stream_id, const uint8_t* data, size_t len)
 
 bool QuicConnection::FinishStream(int stream_id) {
     return impl_->FinishStream(stream_id);
+}
+
+bool QuicConnection::ResetStream(int stream_id, uint64_t error_code) {
+    return impl_->ResetStream(stream_id, error_code);
 }
 
 bool QuicConnection::CanSend(int stream_id, size_t len) const {

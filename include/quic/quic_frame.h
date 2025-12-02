@@ -84,6 +84,37 @@ bool BuildStreamFrame(BufferWriter* writer,
                       bool fin);
 
 /**
+ * @brief Build RESET_STREAM frame
+ * 
+ * Abruptly terminates sending on a stream. The receiver will get
+ * this frame and stop expecting more data on the stream.
+ * 
+ * @param writer Buffer writer
+ * @param stream_id Stream ID to reset
+ * @param error_code Application error code (e.g., H3_REQUEST_CANCELLED = 0x10c)
+ * @param final_size Total bytes sent on this stream before reset
+ * @return true on success
+ */
+bool BuildResetStreamFrame(BufferWriter* writer,
+                           uint64_t stream_id,
+                           uint64_t error_code,
+                           uint64_t final_size);
+
+/**
+ * @brief Build STOP_SENDING frame
+ * 
+ * Requests that the peer stop sending on a stream.
+ * 
+ * @param writer Buffer writer
+ * @param stream_id Stream ID
+ * @param error_code Application error code
+ * @return true on success
+ */
+bool BuildStopSendingFrame(BufferWriter* writer,
+                           uint64_t stream_id,
+                           uint64_t error_code);
+
+/**
  * @brief Build MAX_DATA frame
  * 
  * @param writer Buffer writer

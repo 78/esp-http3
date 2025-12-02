@@ -228,5 +228,20 @@ uint64_t LossDetector::GetPtoTimeout() const {
     return pto;
 }
 
+uint64_t LossDetector::GetTimeUntilNextPto(uint64_t current_time_us) const {
+    if (last_ack_eliciting_time_us_ == 0) {
+        return 0;  // No pending PTO
+    }
+    
+    uint64_t pto = GetPtoTimeout();
+    uint64_t deadline = last_ack_eliciting_time_us_ + pto * (1ULL << pto_count_);
+    
+    if (current_time_us >= deadline) {
+        return 0;  // PTO already expired
+    }
+    
+    return deadline - current_time_us;
+}
+
 } // namespace esp_http3
 

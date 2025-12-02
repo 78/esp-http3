@@ -157,29 +157,30 @@ constexpr QpackStaticEntry kQpackStaticTable[] = {
     {"accept-language", ""},              // 72
     {"access-control-allow-credentials", "FALSE"}, // 73
     {"access-control-allow-credentials", "TRUE"},  // 74
-    {"access-control-allow-methods", "get"},       // 75
-    {"access-control-allow-methods", "get, post, options"}, // 76
-    {"access-control-allow-methods", "options"},   // 77
-    {"access-control-expose-headers", "content-length"}, // 78
-    {"access-control-request-headers", "content-type"}, // 79
-    {"access-control-request-method", "get"},      // 80
-    {"access-control-request-method", "post"},     // 81
-    {"alt-svc", "clear"},                 // 82
-    {"authorization", ""},                // 83
-    {"content-security-policy", "script-src 'none'; object-src 'none'; base-uri 'none'"}, // 84
-    {"early-data", "1"},                  // 85
-    {"expect-ct", ""},                    // 86
-    {"forwarded", ""},                    // 87
-    {"if-range", ""},                     // 88
-    {"origin", ""},                       // 89
-    {"purpose", "prefetch"},              // 90
-    {"server", ""},                       // 91
-    {"timing-allow-origin", "*"},         // 92
-    {"upgrade-insecure-requests", "1"},   // 93
-    {"user-agent", ""},                   // 94
-    {"x-forwarded-for", ""},              // 95
-    {"x-frame-options", "deny"},          // 96
-    {"x-frame-options", "sameorigin"},    // 97
+    {"access-control-allow-headers", "*"},         // 75
+    {"access-control-allow-methods", "get"},       // 76
+    {"access-control-allow-methods", "get, post, options"}, // 77
+    {"access-control-allow-methods", "options"},   // 78
+    {"access-control-expose-headers", "content-length"}, // 79
+    {"access-control-request-headers", "content-type"}, // 80
+    {"access-control-request-method", "get"},      // 81
+    {"access-control-request-method", "post"},     // 82
+    {"alt-svc", "clear"},                 // 83
+    {"authorization", ""},                // 84
+    {"content-security-policy", "script-src 'none'; object-src 'none'; base-uri 'none'"}, // 85
+    {"early-data", "1"},                  // 86
+    {"expect-ct", ""},                    // 87
+    {"forwarded", ""},                    // 88
+    {"if-range", ""},                     // 89
+    {"origin", ""},                       // 90
+    {"purpose", "prefetch"},              // 91
+    {"server", ""},                       // 92
+    {"timing-allow-origin", "*"},         // 93
+    {"upgrade-insecure-requests", "1"},   // 94
+    {"user-agent", ""},                   // 95
+    {"x-forwarded-for", ""},              // 96
+    {"x-frame-options", "deny"},          // 97
+    {"x-frame-options", "sameorigin"},    // 98
 };
 
 constexpr size_t kQpackStaticTableSize = sizeof(kQpackStaticTable) / sizeof(kQpackStaticTable[0]);
