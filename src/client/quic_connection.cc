@@ -1,12 +1,18 @@
 /**
  * @file quic_connection.cc
  * @brief QUIC Connection Implementation
+ * 
+ * Refactored to use component-based architecture:
+ * - CryptoManager: Handles all cryptographic operations
+ * - FrameProcessor: Parses and dispatches incoming frames
  */
 
 #include "client/quic_connection.h"
 #include "client/ack_manager.h"
 #include "client/flow_controller.h"
 #include "client/loss_detector.h"
+#include "client/crypto_manager.h"
+#include "client/frame_processor.h"
 #include "h3/h3_handler.h"
 #include "quic/quic_crypto.h"
 #include "quic/quic_aead.h"
@@ -16,8 +22,10 @@
 
 #include <cstring>
 #include <map>
+#include <set>
 #include <random>
 #include <esp_log.h>
+#include <esp_random.h>
 
 namespace esp_http3 {
 
@@ -75,10 +83,56 @@ public:
     bool WriteStream(int stream_id, const uint8_t* data, size_t len);
     bool FinishStream(int stream_id);
     
+    // Flow control checks (borrowed from Python version)
+    bool CanSend(int stream_id, size_t len) const;
+    size_t GetSendableBytes(int stream_id) const;
+    bool IsConnectionBlocked() const { return flow_controller_.IsConnectionBlocked(); }
+    bool IsStreamBlocked(int stream_id) const { 
+        return flow_controller_.IsStreamBlocked(static_cast<uint64_t>(stream_id)); 
+    }
+    
+    bool IsStreamReset(int stream_id) const {
+        uint64_t sid = static_cast<uint64_t>(stream_id);
+        return reset_streams_.find(sid) != reset_streams_.end() ||
+               stop_sending_streams_.find(sid) != stop_sending_streams_.end();
+    }
+    
     void SetOnConnected(OnConnectedCallback cb) { on_connected_ = std::move(cb); }
     void SetOnDisconnected(OnDisconnectedCallback cb) { on_disconnected_ = std::move(cb); }
     void SetOnResponse(OnResponseCallback cb) { on_response_ = std::move(cb); }
     void SetOnStreamData(OnStreamDataCallback cb) { on_stream_data_ = std::move(cb); }
+    void SetOnWriteComplete(OnWriteCompleteCallback cb) { on_write_complete_ = std::move(cb); }
+    void SetOnWriteError(OnWriteErrorCallback cb) { on_write_error_ = std::move(cb); }
+    
+    // DATAGRAM callback type (same as public API)
+    using OnDatagramCallback = QuicConnection::OnDatagramCallback;
+    void SetOnDatagram(OnDatagramCallback cb) { on_datagram_ = std::move(cb); }
+    
+    // Key Update
+    bool InitiateKeyUpdate();
+    uint8_t GetKeyPhase() const { return crypto_.GetKeyPhase(); }
+    uint32_t GetKeyUpdateGeneration() const { return crypto_.GetKeyUpdateGeneration(); }
+    
+    // Path Validation
+    bool SendPathChallenge();
+    bool IsPathValidated() const { return path_validated_; }
+    uint32_t GetPathValidationRtt() const { return path_validation_rtt_ms_; }
+    
+    // DATAGRAM
+    bool CanSendDatagram(size_t size) const;
+    bool SendDatagram(const uint8_t* data, size_t len);
+    size_t GetMaxDatagramSize() const;
+    bool IsDatagramAvailable() const;
+    
+    // Queued write API
+    // Queue data for sending (supports PSRAM and read-only data)
+    // @param data Pointer to data (can be read-only)
+    // @param size Size of data in bytes
+    // @param deleter Optional deleter function to free memory (nullptr for read-only data)
+    bool QueueWrite(int stream_id, const uint8_t* data, size_t size, std::function<void()> deleter = nullptr);
+    bool QueueFinish(int stream_id);
+    size_t GetQueuedBytes(int stream_id) const;
+    bool IsQueueEmpty(int stream_id) const;
     
     QuicConnection::Stats GetStats() const;
 
@@ -124,8 +178,91 @@ private:
     
     // Generate random bytes
     void GenerateRandom(uint8_t* buf, size_t len);
+    
+    // Setup frame processor callbacks
+    void SetupFrameProcessorCallbacks();
+    
+    // Frame processor callback handlers (for 1-RTT packets)
+    void OnFrameAck(const AckFrameData& ack_data);
+    void OnFrameStream(uint64_t stream_id, uint64_t offset,
+                       const uint8_t* data, size_t len, bool fin);
+    void OnFrameMaxData(uint64_t max_data);
+    void OnFrameMaxStreamData(uint64_t stream_id, uint64_t max_data);
+    void OnFrameDataBlocked(uint64_t limit);
+    void OnFrameStreamDataBlocked(uint64_t stream_id, uint64_t limit);
+    void OnFrameConnectionClose(const ConnectionCloseData& data);
+    void OnFrameHandshakeDone();
+    void OnFrameNewConnectionId(const NewConnectionIdData& data);
+    void OnFramePathChallenge(const uint8_t* data);
+    void OnFramePathResponse(const uint8_t* data);
+    void OnFrameDatagram(const uint8_t* data, size_t len);
+    
+    // Write queue processing
+    void ProcessWriteQueue();
 
 private:
+    // Write queue item
+    struct WriteQueueItem {
+        const uint8_t* data = nullptr;  // Pointer to data (can be read-only)
+        size_t size = 0;                 // Total size of data
+        size_t offset = 0;               // Current send offset within data
+        bool finish = false;             // If true, this is a FIN marker (data is nullptr)
+        std::function<void()> deleter;    // Optional deleter for freeing memory (null for read-only data)
+        
+        // Default constructor (required for std::vector)
+        WriteQueueItem() = default;
+        
+        // Constructor for data items
+        WriteQueueItem(const uint8_t* d, size_t s, std::function<void()> del = nullptr)
+            : data(d), size(s), offset(0), finish(false), deleter(std::move(del)) {}
+        
+        // Constructor for FIN marker
+        WriteQueueItem(bool fin) : data(nullptr), size(0), offset(0), finish(fin), deleter(nullptr) {}
+        
+        ~WriteQueueItem() {
+            if (deleter) {
+                deleter();
+            }
+        }
+        
+        // Move constructor
+        WriteQueueItem(WriteQueueItem&& other) noexcept
+            : data(other.data), size(other.size), offset(other.offset), 
+              finish(other.finish), deleter(std::move(other.deleter)) {
+            other.data = nullptr;
+            other.size = 0;
+            other.deleter = nullptr;
+        }
+        
+        // Move assignment
+        WriteQueueItem& operator=(WriteQueueItem&& other) noexcept {
+            if (this != &other) {
+                if (deleter) deleter();
+                data = other.data;
+                size = other.size;
+                offset = other.offset;
+                finish = other.finish;
+                deleter = std::move(other.deleter);
+                other.data = nullptr;
+                other.size = 0;
+                other.deleter = nullptr;
+            }
+            return *this;
+        }
+        
+        // Disable copy
+        WriteQueueItem(const WriteQueueItem&) = delete;
+        WriteQueueItem& operator=(const WriteQueueItem&) = delete;
+    };
+    
+    // Per-stream write queue
+    struct StreamWriteQueue {
+        std::vector<WriteQueueItem> items;
+        size_t total_bytes = 0;     // Total bytes queued
+        size_t sent_bytes = 0;      // Total bytes sent
+        bool finish_queued = false; // FIN is queued
+        bool finish_sent = false;   // FIN has been sent
+    };
     SendCallback send_cb_;
     QuicConfig config_;
     ConnectionState state_ = ConnectionState::kIdle;
@@ -135,27 +272,26 @@ private:
     OnDisconnectedCallback on_disconnected_;
     OnResponseCallback on_response_;
     OnStreamDataCallback on_stream_data_;
+    OnWriteCompleteCallback on_write_complete_;
+    OnWriteErrorCallback on_write_error_;
+    
+    // Write queues (stream_id -> queue)
+    std::map<int, StreamWriteQueue> write_queues_;
+    
+    // Track reset streams
+    std::set<uint64_t> reset_streams_;
+    std::set<uint64_t> stop_sending_streams_;
     
     // Connection IDs
     quic::ConnectionId dcid_;           // Destination CID (server's)
     quic::ConnectionId scid_;           // Source CID (ours)
     quic::ConnectionId initial_dcid_;   // Original DCID
     
-    // Crypto state
-    quic::CryptoSecrets client_initial_secrets_;
-    quic::CryptoSecrets server_initial_secrets_;
-    quic::CryptoSecrets client_handshake_secrets_;
-    quic::CryptoSecrets server_handshake_secrets_;
-    quic::CryptoSecrets client_app_secrets_;
-    quic::CryptoSecrets server_app_secrets_;
+    // Crypto manager (replaces scattered crypto state)
+    CryptoManager crypto_;
     
-    uint8_t x25519_private_key_[32];
-    uint8_t x25519_public_key_[32];
-    uint8_t client_random_[32];
-    uint8_t handshake_secret_[32];
-    
-    // TLS transcript hash
-    quic::Sha256Context transcript_hash_;
+    // Frame processor (handles incoming frame parsing and dispatch)
+    FrameProcessor frame_processor_;
     
     // Transport parameters
     quic::TransportParameters local_params_;
@@ -208,6 +344,16 @@ private:
     bool handshake_complete_ = false;
     bool h3_initialized_ = false;
     
+    // Path Validation state
+    bool path_validated_ = true;
+    uint8_t path_challenge_data_[8] = {0};
+    uint64_t path_challenge_sent_time_us_ = 0;
+    uint32_t path_validation_rtt_ms_ = 0;
+    
+    // DATAGRAM state (RFC 9221)
+    uint32_t peer_max_datagram_frame_size_ = 0;
+    OnDatagramCallback on_datagram_;
+    
     // Pre-allocated buffers to avoid heap allocation in hot paths
     uint8_t packet_buf_[1500];       // For building outgoing packets
     uint8_t payload_buf_[1500];      // For decrypted payloads
@@ -234,8 +380,21 @@ QuicConnection::Impl::Impl(SendCallback send_cb, const QuicConfig& config)
     local_params_.initial_max_streams_uni = 100;
     local_params_.active_connection_id_limit = 4;
     
+    // DATAGRAM support (RFC 9221)
+    if (config_.enable_datagram) {
+        local_params_.max_datagram_frame_size = config_.max_datagram_frame_size;
+    }
+    
     // Initialize flow controller
     flow_controller_.Initialize(config_.max_data, config_.max_stream_data);
+    
+    // Initialize crypto manager
+    crypto_.SetDebug(config_.enable_debug);
+    crypto_.Initialize();
+    
+    // Initialize frame processor and set up callbacks
+    frame_processor_.SetDebug(config_.enable_debug);
+    SetupFrameProcessorCallbacks();
 }
 
 QuicConnection::Impl::~Impl() = default;
@@ -266,30 +425,20 @@ bool QuicConnection::Impl::StartHandshake() {
     // Set local SCID in transport params
     local_params_.initial_source_connection_id = scid_;
     
-    // Generate X25519 key pair
-    if (!quic::GenerateX25519KeyPair(x25519_private_key_, x25519_public_key_)) {
+    // Generate X25519 key pair using CryptoManager
+    if (!crypto_.GenerateKeyPair()) {
         state_ = ConnectionState::kFailed;
         return false;
     }
     
-    // Generate client random
-    GenerateRandom(client_random_, 32);
-    
-    // Derive initial secrets
-    if (!quic::DeriveClientInitialSecrets(dcid_.Data(), dcid_.Length(),
-                                           &client_initial_secrets_)) {
-        state_ = ConnectionState::kFailed;
-        return false;
-    }
-    
-    if (!quic::DeriveServerInitialSecrets(dcid_.Data(), dcid_.Length(),
-                                           &server_initial_secrets_)) {
+    // Derive initial secrets using CryptoManager
+    if (!crypto_.DeriveInitialSecrets(dcid_.Data(), dcid_.Length())) {
         state_ = ConnectionState::kFailed;
         return false;
     }
     
     // Initialize transcript hash
-    transcript_hash_.Reset();
+    crypto_.ResetTranscript();
     
     // Send Initial packet with ClientHello
     if (!SendInitialPacket()) {
@@ -314,8 +463,8 @@ void QuicConnection::Impl::Close(int error_code, const std::string& reason) {
     }
     
     // Build and send CONNECTION_CLOSE
-    uint8_t frame_buf[256];
-    quic::BufferWriter writer(frame_buf, sizeof(frame_buf));
+    std::vector<uint8_t> frame_buf(256);
+    quic::BufferWriter writer(frame_buf.data(), frame_buf.size());
     
     quic::BuildConnectionCloseFrame(&writer, 
                                      static_cast<uint64_t>(error_code), 
@@ -327,17 +476,17 @@ void QuicConnection::Impl::Close(int error_code, const std::string& reason) {
     if (handshake_complete_) {
         packet_len = quic::Build1RttPacket(dcid_,
                                             app_tracker_.AllocatePacketNumber(),
-                                            false, false,
-                                            frame_buf, writer.Offset(),
-                                            client_app_secrets_,
+                                            false, crypto_.GetKeyPhase() != 0,
+                                            frame_buf.data(), writer.Offset(),
+                                            crypto_.GetClientAppSecrets(),
                                             packet_buf_, sizeof(packet_buf_));
     } else {
         packet_len = quic::BuildInitialPacket(dcid_, scid_,
                                                retry_token_.data(), 
                                                retry_token_.size(),
                                                initial_tracker_.AllocatePacketNumber(),
-                                               frame_buf, writer.Offset(),
-                                               client_initial_secrets_,
+                                               frame_buf.data(), writer.Offset(),
+                                               crypto_.GetClientInitialSecrets(),
                                                packet_buf_, sizeof(packet_buf_));
     }
     
@@ -359,8 +508,8 @@ void QuicConnection::Impl::Close(int error_code, const std::string& reason) {
 bool QuicConnection::Impl::SendInitialPacket(bool is_retransmit) {
     // Build ClientHello (use payload_buf_ temporarily)
     size_t ch_len = tls::BuildClientHello(config_.hostname,
-                                           client_random_,
-                                           x25519_public_key_,
+                                           crypto_.GetClientRandom(),
+                                           crypto_.GetPublicKey(),
                                            local_params_,
                                            payload_buf_, sizeof(payload_buf_));
     if (ch_len == 0) {
@@ -371,7 +520,7 @@ bool QuicConnection::Impl::SendInitialPacket(bool is_retransmit) {
     // Update transcript hash only on first send, not on retransmit
     // PTO retransmits the same ClientHello, so transcript hash should not be updated again
     if (!is_retransmit) {
-        transcript_hash_.Update(payload_buf_, ch_len);
+        crypto_.UpdateTranscript(payload_buf_, ch_len);
     }
     
     // Build CRYPTO frame
@@ -388,7 +537,7 @@ bool QuicConnection::Impl::SendInitialPacket(bool is_retransmit) {
                                                   retry_token_.size(),
                                                   pn,
                                                   frame_buf_, writer.Offset(),
-                                                  client_initial_secrets_,
+                                                  crypto_.GetClientInitialSecrets(),
                                                   packet_buf_, sizeof(packet_buf_),
                                                   1200);  // Minimum 1200 bytes
     
@@ -453,15 +602,12 @@ void QuicConnection::Impl::ProcessReceivedData(uint8_t* data, size_t len) {
                         dcid_ = new_scid;
                         retry_token_ = std::move(token);
                         
-                        // Re-derive initial secrets with new DCID
-                        quic::DeriveClientInitialSecrets(dcid_.Data(), dcid_.Length(),
-                                                          &client_initial_secrets_);
-                        quic::DeriveServerInitialSecrets(dcid_.Data(), dcid_.Length(),
-                                                          &server_initial_secrets_);
+                        // Re-derive initial secrets with new DCID using CryptoManager
+                        crypto_.DeriveInitialSecrets(dcid_.Data(), dcid_.Length());
                         
                         // Resend Initial
                         initial_tracker_.Reset();
-                        transcript_hash_.Reset();
+                        crypto_.ResetTranscript();
                         SendInitialPacket();
                     }
                 }
@@ -540,7 +686,7 @@ size_t QuicConnection::Impl::ProcessInitialPacket(uint8_t* data, size_t len) {
     
     size_t payload_len = quic::DecryptInitialPacket(
         data, len,
-        server_initial_secrets_,
+        crypto_.GetServerInitialSecrets(),
         initial_ack_mgr_.GetLargestReceived(),
         &info,
         payload_buf_, sizeof(payload_buf_));
@@ -570,7 +716,7 @@ size_t QuicConnection::Impl::ProcessInitialPacket(uint8_t* data, size_t len) {
 }
 
 size_t QuicConnection::Impl::ProcessHandshakePacket(uint8_t* data, size_t len) {
-    if (!server_handshake_secrets_.valid) {
+    if (!crypto_.HasHandshakeKeys()) {
         return 0;  // Haven't derived handshake keys yet
     }
     
@@ -578,7 +724,7 @@ size_t QuicConnection::Impl::ProcessHandshakePacket(uint8_t* data, size_t len) {
     
     size_t payload_len = quic::DecryptHandshakePacket(
         data, len,
-        server_handshake_secrets_,
+        crypto_.GetServerHandshakeSecrets(),
         handshake_ack_mgr_.GetLargestReceived(),
         &info,
         payload_buf_, sizeof(payload_buf_));
@@ -602,7 +748,7 @@ size_t QuicConnection::Impl::ProcessHandshakePacket(uint8_t* data, size_t len) {
 }
 
 bool QuicConnection::Impl::Process1RttPacket(uint8_t* data, size_t len) {
-    if (!server_app_secrets_.valid) {
+    if (!crypto_.HasApplicationKeys()) {
         return false;
     }
     
@@ -611,7 +757,7 @@ bool QuicConnection::Impl::Process1RttPacket(uint8_t* data, size_t len) {
     size_t payload_len = quic::Decrypt1RttPacket(
         data, len,
         scid_.Length(),  // Our SCID length is the expected DCID length
-        server_app_secrets_,
+        crypto_.GetServerAppSecrets(),
         app_ack_mgr_.GetLargestReceived(),
         &info,
         payload_buf_, sizeof(payload_buf_));
@@ -668,6 +814,36 @@ void QuicConnection::Impl::ProcessFrames(const uint8_t* data, size_t len,
             }
             reader.Seek(reader.Offset() - 1);  // Back up to include frame type
             ProcessAckFrame(&reader, pkt_type);
+        } else if (frame_type == 0x04) {
+            // RESET_STREAM - server is resetting the stream
+            uint64_t stream_id, error_code, final_size;
+            if (reader.ReadVarint(&stream_id) && 
+                reader.ReadVarint(&error_code) && 
+                reader.ReadVarint(&final_size)) {
+                if (config_.enable_debug) {
+                    ESP_LOGI(TAG, "[%s] Frame: RESET_STREAM stream=%llu, error=%llu, final_size=%llu", 
+                             pkt_type_str, (unsigned long long)stream_id, 
+                             (unsigned long long)error_code, (unsigned long long)final_size);
+                }
+                ESP_LOGW(TAG, "Server reset stream %llu with error code %llu (H3_FRAME_ERROR)", 
+                         (unsigned long long)stream_id, (unsigned long long)error_code);
+                // Stream was reset by server - this is a fatal error for the stream
+                reset_streams_.insert(stream_id);
+            }
+        } else if (frame_type == 0x05) {
+            // STOP_SENDING - server wants us to stop sending data
+            uint64_t stream_id, error_code;
+            if (reader.ReadVarint(&stream_id) && reader.ReadVarint(&error_code)) {
+                if (config_.enable_debug) {
+                    ESP_LOGI(TAG, "[%s] Frame: STOP_SENDING stream=%llu, error=%llu", 
+                             pkt_type_str, (unsigned long long)stream_id, 
+                             (unsigned long long)error_code);
+                }
+                ESP_LOGW(TAG, "Server requested stop sending on stream %llu (error=%llu)", 
+                         (unsigned long long)stream_id, (unsigned long long)error_code);
+                // Server wants us to stop sending - we should abort the upload
+                stop_sending_streams_.insert(stream_id);
+            }
         } else if (frame_type == 0x06) {
             // CRYPTO
             if (config_.enable_debug) {
@@ -927,38 +1103,38 @@ void QuicConnection::Impl::ProcessCryptoFrame(quic::BufferReader* reader,
         switch (msg_type) {
             case tls::HandshakeType::kServerHello:
                 ESP_LOGD(TAG, "Processing Server Hello");
-                transcript_hash_.Update(buffer->data(), hdr_len + msg_len);
+                crypto_.UpdateTranscript(buffer->data(), hdr_len + msg_len);
                 ProcessServerHello(msg_data, msg_len);
                 break;
                 
             case tls::HandshakeType::kEncryptedExtensions:
                 ESP_LOGD(TAG, "Processing EncryptedExtensions");
-                transcript_hash_.Update(buffer->data(), hdr_len + msg_len);
+                crypto_.UpdateTranscript(buffer->data(), hdr_len + msg_len);
                 ProcessEncryptedExtensions(msg_data, msg_len);
                 break;
                 
             case tls::HandshakeType::kCertificate:
                 ESP_LOGD(TAG, "Processing Certificate");
-                transcript_hash_.Update(buffer->data(), hdr_len + msg_len);
+                crypto_.UpdateTranscript(buffer->data(), hdr_len + msg_len);
                 ProcessCertificate(msg_data, msg_len);
                 break;
                 
             case tls::HandshakeType::kCertificateVerify:
                 ESP_LOGD(TAG, "Processing CertificateVerify");
-                transcript_hash_.Update(buffer->data(), hdr_len + msg_len);
+                crypto_.UpdateTranscript(buffer->data(), hdr_len + msg_len);
                 ProcessCertificateVerify(msg_data, msg_len);
                 break;
                 
             case tls::HandshakeType::kFinished:
                 ESP_LOGD(TAG, "Processing Server Finished");
-                transcript_hash_.Update(buffer->data(), hdr_len + msg_len);
+                crypto_.UpdateTranscript(buffer->data(), hdr_len + msg_len);
                 ProcessServerFinished(msg_data, msg_len);
                 break;
                 
             default:
                 ESP_LOGW(TAG, "Unknown TLS message type: %d", 
                          static_cast<int>(msg_type));
-                transcript_hash_.Update(buffer->data(), hdr_len + msg_len);
+                crypto_.UpdateTranscript(buffer->data(), hdr_len + msg_len);
                 break;
         }
         
@@ -983,24 +1159,9 @@ bool QuicConnection::Impl::ProcessServerHello(const uint8_t* data, size_t len) {
         return false;
     }
     
-    // Compute shared secret
-    uint8_t shared_secret[32];
-    if (!quic::X25519ECDH(x25519_private_key_, sh.key_share_public_key,
-                          shared_secret)) {
-        ESP_LOGW(TAG, "ProcessServerHello: X25519ECDH failed");
-        state_ = ConnectionState::kFailed;
-        return false;
-    }
-    
-    // Get transcript hash up to ServerHello
-    uint8_t transcript[32];
-    transcript_hash_.GetHash(transcript);
-    
-    // Derive handshake secrets
-    if (!quic::DeriveHandshakeSecrets(shared_secret, transcript,
-                                       &client_handshake_secrets_,
-                                       &server_handshake_secrets_,
-                                       handshake_secret_)) {
+    // Derive handshake secrets using CryptoManager
+    // Note: ServerHello should already be in transcript before this call
+    if (!crypto_.DeriveHandshakeSecrets(sh.key_share_public_key, nullptr, 0)) {
         ESP_LOGW(TAG, "ProcessServerHello: DeriveHandshakeSecrets failed");
         state_ = ConnectionState::kFailed;
         return false;
@@ -1022,6 +1183,14 @@ bool QuicConnection::Impl::ProcessEncryptedExtensions(const uint8_t* data,
         // Update flow controller with peer limits
         flow_controller_.OnMaxDataReceived(peer_params_.initial_max_data);
         loss_detector_.SetMaxAckDelay(peer_params_.max_ack_delay);
+        
+        // Update DATAGRAM support (RFC 9221)
+        if (peer_params_.max_datagram_frame_size > 0) {
+            peer_max_datagram_frame_size_ = static_cast<uint32_t>(peer_params_.max_datagram_frame_size);
+            if (config_.enable_debug && config_.enable_datagram) {
+                ESP_LOGI(TAG, "Peer supports DATAGRAM (max_size=%lu)", peer_max_datagram_frame_size_);
+            }
+        }
     }
     
     return true;
@@ -1060,15 +1229,8 @@ bool QuicConnection::Impl::ProcessServerFinished(const uint8_t* data, size_t len
     
     // TODO: Verify finished MAC
     
-    // Derive application secrets
-    uint8_t transcript[32];
-    transcript_hash_.GetHash(transcript);
-    
-    uint8_t master_secret[32];
-    if (!quic::DeriveApplicationSecrets(handshake_secret_, transcript,
-                                         &client_app_secrets_,
-                                         &server_app_secrets_,
-                                         master_secret)) {
+    // Derive application secrets using CryptoManager
+    if (!crypto_.DeriveApplicationSecrets()) {
         ESP_LOGW(TAG, "DeriveApplicationSecrets failed");
         state_ = ConnectionState::kFailed;
         return false;
@@ -1081,22 +1243,16 @@ bool QuicConnection::Impl::ProcessServerFinished(const uint8_t* data, size_t len
 }
 
 bool QuicConnection::Impl::SendClientFinished() {
-    // Get transcript hash before Finished
-    uint8_t transcript[32];
-    transcript_hash_.GetHash(transcript);
-    
-    // Build Finished message
+    // Build Finished message using CryptoManager
     uint8_t finished_msg[36];
     size_t finished_len;
-    if (!quic::BuildClientFinishedMessage(client_handshake_secrets_.traffic_secret.data(),
-                                           transcript,
-                                           finished_msg, &finished_len)) {
-        ESP_LOGW(TAG, "BuildClientFinishedMessage failed");
+    if (!crypto_.BuildClientFinished(finished_msg, &finished_len)) {
+        ESP_LOGW(TAG, "BuildClientFinished failed");
         return false;
     }
     
     // Update transcript with our Finished
-    transcript_hash_.Update(finished_msg, finished_len);
+    crypto_.UpdateTranscript(finished_msg, finished_len);
     
     // Build CRYPTO frame
     uint8_t frames[64];
@@ -1107,13 +1263,13 @@ bool QuicConnection::Impl::SendClientFinished() {
     }
     
     // Build Handshake packet
-    uint8_t packet[512];
+    std::vector<uint8_t> packet(512);
     uint64_t pn = handshake_tracker_.AllocatePacketNumber();
     size_t packet_len = quic::BuildHandshakePacket(dcid_, scid_,
                                                     pn,
                                                     frames, writer.Offset(),
-                                                    client_handshake_secrets_,
-                                                    packet, sizeof(packet));
+                                                    crypto_.GetClientHandshakeSecrets(),
+                                                    packet.data(), packet.size());
     
     if (packet_len == 0) {
         ESP_LOGW(TAG, "BuildHandshakePacket failed");
@@ -1126,7 +1282,7 @@ bool QuicConnection::Impl::SendClientFinished() {
     handshake_tracker_.OnPacketSent(pn, current_time_us_, packet_len, true);
     loss_detector_.OnPacketSent(pn, current_time_us_, packet_len, true);
     
-    bool ok = SendPacket(packet, packet_len);
+    bool ok = SendPacket(packet.data(), packet_len);
     if (ok) {
         state_ = ConnectionState::kConnected;
     }
@@ -1153,8 +1309,8 @@ void QuicConnection::Impl::ProcessHandshakeDoneFrame() {
                 H3Response resp;
                 resp.status = response.status;
                 resp.headers = response.headers;
-                resp.body = response.body;
                 resp.complete = response.complete;
+                resp.error = response.error;
                 on_response_(static_cast<int>(stream_id), resp);
             }
         });
@@ -1264,7 +1420,7 @@ void QuicConnection::Impl::ProcessNewConnectionIdFrame(quic::BufferReader* reade
 //=============================================================================
 
 bool QuicConnection::Impl::SendMaxDataFrame() {
-    if (!client_app_secrets_.valid) {
+    if (!crypto_.HasApplicationKeys()) {
         return false;
     }
     
@@ -1277,12 +1433,12 @@ bool QuicConnection::Impl::SendMaxDataFrame() {
     }
     
     // Build 1-RTT packet
-    uint8_t packet[256];
+    std::vector<uint8_t> packet(256);
     uint64_t pn = app_tracker_.AllocatePacketNumber();
-    size_t packet_len = quic::Build1RttPacket(dcid_, pn, false, false,
+    size_t packet_len = quic::Build1RttPacket(dcid_, pn, false, crypto_.GetKeyPhase() != 0,
                                                frames, writer.Offset(),
-                                               client_app_secrets_,
-                                               packet, sizeof(packet));
+                                               crypto_.GetClientAppSecrets(),
+                                               packet.data(), packet.size());
     
     if (packet_len == 0) {
         return false;
@@ -1293,11 +1449,11 @@ bool QuicConnection::Impl::SendMaxDataFrame() {
     }
     
     app_tracker_.OnPacketSent(pn, current_time_us_, packet_len, false);
-    return SendPacket(packet, packet_len);
+    return SendPacket(packet.data(), packet_len);
 }
 
 bool QuicConnection::Impl::SendMaxStreamDataFrame(uint64_t stream_id) {
-    if (!client_app_secrets_.valid) {
+    if (!crypto_.HasApplicationKeys()) {
         return false;
     }
     
@@ -1310,12 +1466,12 @@ bool QuicConnection::Impl::SendMaxStreamDataFrame(uint64_t stream_id) {
     }
     
     // Build 1-RTT packet
-    uint8_t packet[256];
+    std::vector<uint8_t> packet(256);
     uint64_t pn = app_tracker_.AllocatePacketNumber();
-    size_t packet_len = quic::Build1RttPacket(dcid_, pn, false, false,
+    size_t packet_len = quic::Build1RttPacket(dcid_, pn, false, crypto_.GetKeyPhase() != 0,
                                                frames, writer.Offset(),
-                                               client_app_secrets_,
-                                               packet, sizeof(packet));
+                                               crypto_.GetClientAppSecrets(),
+                                               packet.data(), packet.size());
     
     if (packet_len == 0) {
         return false;
@@ -1327,7 +1483,7 @@ bool QuicConnection::Impl::SendMaxStreamDataFrame(uint64_t stream_id) {
     }
     
     app_tracker_.OnPacketSent(pn, current_time_us_, packet_len, false);
-    return SendPacket(packet, packet_len);
+    return SendPacket(packet.data(), packet_len);
 }
 
 void QuicConnection::Impl::CheckAndSendFlowControlUpdates() {
@@ -1386,7 +1542,7 @@ bool QuicConnection::Impl::SendAckIfNeeded(quic::PacketType pkt_type) {
     }
     
     // Build packet
-    uint8_t packet[512];
+    std::vector<uint8_t> packet(512);
     uint64_t pn = tracker->AllocatePacketNumber();
     size_t packet_len = 0;
     
@@ -1397,21 +1553,21 @@ bool QuicConnection::Impl::SendAckIfNeeded(quic::PacketType pkt_type) {
                                                    retry_token_.size(),
                                                    pn,
                                                    frames, writer.Offset(),
-                                                   client_initial_secrets_,
-                                                   packet, sizeof(packet),
+                                                   crypto_.GetClientInitialSecrets(),
+                                                   packet.data(), packet.size(),
                                                    0);  // No padding for ACK-only
             break;
         case quic::PacketType::kHandshake:
             packet_len = quic::BuildHandshakePacket(dcid_, scid_, pn,
                                                      frames, writer.Offset(),
-                                                     client_handshake_secrets_,
-                                                     packet, sizeof(packet));
+                                                     crypto_.GetClientHandshakeSecrets(),
+                                                     packet.data(), packet.size());
             break;
         default:
-            packet_len = quic::Build1RttPacket(dcid_, pn, false, false,
+            packet_len = quic::Build1RttPacket(dcid_, pn, false, crypto_.GetKeyPhase() != 0,
                                                 frames, writer.Offset(),
-                                                client_app_secrets_,
-                                                packet, sizeof(packet));
+                                                crypto_.GetClientAppSecrets(),
+                                                packet.data(), packet.size());
             break;
     }
     
@@ -1421,13 +1577,13 @@ bool QuicConnection::Impl::SendAckIfNeeded(quic::PacketType pkt_type) {
     
     tracker->OnPacketSent(pn, current_time_us_, packet_len, false);
     ack_mgr->OnAckSent();
-    return SendPacket(packet, packet_len);
+    return SendPacket(packet.data(), packet_len);
 }
 
 bool QuicConnection::Impl::SendStreamData(uint64_t stream_id,
                                            const uint8_t* data,
                                            size_t len, bool fin) {
-    if (!client_app_secrets_.valid) {
+    if (!crypto_.HasApplicationKeys()) {
         return false;
     }
     
@@ -1454,9 +1610,9 @@ bool QuicConnection::Impl::SendStreamData(uint64_t stream_id,
     
     // Build 1-RTT packet
     uint64_t pn = app_tracker_.AllocatePacketNumber();
-    size_t packet_len = quic::Build1RttPacket(dcid_, pn, false, false,
+    size_t packet_len = quic::Build1RttPacket(dcid_, pn, false, crypto_.GetKeyPhase() != 0,
                                                frame_buf_, writer.Offset(),
-                                               client_app_secrets_,
+                                               crypto_.GetClientAppSecrets(),
                                                packet_buf_, sizeof(packet_buf_));
     
     if (packet_len == 0) {
@@ -1507,6 +1663,11 @@ void QuicConnection::Impl::OnTimerTick(uint32_t elapsed_ms) {
             }
             SendInitialPacket(true);  // Mark as retransmit to avoid updating transcript hash
         }
+    }
+    
+    // Process write queues (send queued data respecting flow control)
+    if (IsConnected()) {
+        ProcessWriteQueue();
     }
 }
 
@@ -1575,12 +1736,12 @@ int QuicConnection::Impl::OpenStream(
     
     // Build HEADERS frame directly into frame_buf_
     // Note: h3::BuildHeadersFrame needs the data as a vector, so we create a lightweight view
-    uint8_t h3_frame_buf[1200];  // Local buffer for H3 frame (small, on stack)
+    std::vector<uint8_t> h3_frame_buf(1200);
     std::vector<uint8_t> encoded(payload_buf_, payload_buf_ + qpack_len);
-    size_t hf_len = h3::BuildHeadersFrame(encoded, h3_frame_buf, sizeof(h3_frame_buf));
+    size_t hf_len = h3::BuildHeadersFrame(encoded, h3_frame_buf.data(), h3_frame_buf.size());
     
     if (hf_len == 0 || !SendStreamData(static_cast<uint64_t>(stream_id), 
-                                        h3_frame_buf, hf_len, false)) {
+                                        h3_frame_buf.data(), hf_len, false)) {
         return -1;
     }
     
@@ -1590,16 +1751,36 @@ int QuicConnection::Impl::OpenStream(
 bool QuicConnection::Impl::WriteStream(int stream_id, 
                                         const uint8_t* data, size_t len) {
     if (!IsConnected()) {
+        ESP_LOGE(TAG, "WriteStream failed: not connected");
         return false;
+    }
+    
+    // Check flow control before building frame
+    size_t sendable = GetSendableBytes(stream_id);
+    if (sendable < len) {
+        ESP_LOGW(TAG, "WriteStream: flow control limit: sendable=%zu, requested=%zu", sendable, len);
+        // Still try to send what we can
+        len = sendable;
+        if (len == 0) {
+            ESP_LOGW(TAG, "WriteStream: flow control blocked");
+            return false;
+        }
     }
     
     // Build DATA frame (use payload_buf_ as temp buffer, SendStreamData uses frame_buf_)
     size_t frame_len = h3::BuildDataFrame(data, len, payload_buf_, sizeof(payload_buf_));
     if (frame_len == 0) {
+        ESP_LOGE(TAG, "WriteStream failed: BuildDataFrame returned 0 (len=%zu, buf_size=%zu)", 
+                 len, sizeof(payload_buf_));
         return false;
     }
     
-    return SendStreamData(static_cast<uint64_t>(stream_id), payload_buf_, frame_len, false);
+    bool result = SendStreamData(static_cast<uint64_t>(stream_id), payload_buf_, frame_len, false);
+    if (!result) {
+        ESP_LOGE(TAG, "WriteStream failed: SendStreamData returned false (stream_id=%d, frame_len=%zu)", 
+                 stream_id, frame_len);
+    }
+    return result;
 }
 
 bool QuicConnection::Impl::FinishStream(int stream_id) {
@@ -1609,6 +1790,176 @@ bool QuicConnection::Impl::FinishStream(int stream_id) {
     
     // Send empty STREAM frame with FIN
     return SendStreamData(static_cast<uint64_t>(stream_id), nullptr, 0, true);
+}
+
+//=============================================================================
+// Queued Write API
+//=============================================================================
+
+bool QuicConnection::Impl::QueueWrite(int stream_id, 
+                                       const uint8_t* data, 
+                                       size_t size,
+                                       std::function<void()> deleter) {
+    if (!data || size == 0) {
+        return false;
+    }
+    
+    auto& queue = write_queues_[stream_id];
+    if (queue.finish_queued) {
+        ESP_LOGE(TAG, "QueueWrite: stream %d already has FIN queued", stream_id);
+        return false;
+    }
+    
+    queue.items.emplace_back(data, size, std::move(deleter));
+    queue.total_bytes += size;
+    
+    if (config_.enable_debug) {
+        ESP_LOGI(TAG, "QueueWrite: stream %d, queued %zu bytes, total pending: %zu",
+                 stream_id, size, queue.total_bytes - queue.sent_bytes);
+    }
+    
+    return true;
+}
+
+bool QuicConnection::Impl::QueueFinish(int stream_id) {
+    auto& queue = write_queues_[stream_id];
+    
+    if (queue.finish_queued) {
+        ESP_LOGW(TAG, "QueueFinish: stream %d already has FIN queued", stream_id);
+        return false;
+    }
+    
+    queue.items.emplace_back(true);  // FIN marker
+    queue.finish_queued = true;
+    
+    if (config_.enable_debug) {
+        ESP_LOGI(TAG, "QueueFinish: stream %d, FIN queued", stream_id);
+    }
+    
+    return true;
+}
+
+size_t QuicConnection::Impl::GetQueuedBytes(int stream_id) const {
+    auto it = write_queues_.find(stream_id);
+    if (it == write_queues_.end()) {
+        return 0;
+    }
+    return it->second.total_bytes - it->second.sent_bytes;
+}
+
+bool QuicConnection::Impl::IsQueueEmpty(int stream_id) const {
+    auto it = write_queues_.find(stream_id);
+    if (it == write_queues_.end()) {
+        return true;
+    }
+    const auto& queue = it->second;
+    return queue.items.empty() && (!queue.finish_queued || queue.finish_sent);
+}
+
+void QuicConnection::Impl::ProcessWriteQueue() {
+    // Process each stream's write queue
+    for (auto it = write_queues_.begin(); it != write_queues_.end(); ) {
+        int stream_id = it->first;
+        auto& queue = it->second;
+        
+        // Check if stream was reset
+        if (IsStreamReset(stream_id)) {
+            // Notify error and remove queue
+            if (on_write_error_) {
+                on_write_error_(stream_id, 1, "stream reset by peer");
+            }
+            it = write_queues_.erase(it);
+            continue;
+        }
+        
+        // Process items in this stream's queue
+        while (!queue.items.empty()) {
+            auto& item = queue.items.front();
+            
+            // Handle FIN marker
+            if (item.finish) {
+                if (FinishStream(stream_id)) {
+                    queue.finish_sent = true;
+                    queue.items.erase(queue.items.begin());
+                    
+                    // Notify completion
+                    if (on_write_complete_) {
+                        on_write_complete_(stream_id, queue.sent_bytes);
+                    }
+                    
+                    if (config_.enable_debug) {
+                        ESP_LOGI(TAG, "ProcessWriteQueue: stream %d finished, total %zu bytes",
+                                 stream_id, queue.sent_bytes);
+                    }
+                } else {
+                    // FinishStream failed, try again later
+                    break;
+                }
+                continue;
+            }
+            
+            // Get available flow control window
+            size_t sendable = GetSendableBytes(stream_id);
+            if (sendable == 0) {
+                // Flow control blocked, try next stream
+                break;
+            }
+            
+            // Calculate how much to send
+            size_t remaining = item.size - item.offset;
+            
+            // Use a reasonable chunk size (similar to WriteStream's payload_buf_ limit)
+            const size_t MAX_CHUNK = 1200;
+            size_t chunk_size = std::min({MAX_CHUNK, sendable, remaining});
+            
+            // Send the chunk
+            if (!WriteStream(stream_id, item.data + item.offset, chunk_size)) {
+                // Write failed, notify error
+                if (on_write_error_) {
+                    on_write_error_(stream_id, 2, "WriteStream failed");
+                }
+                // Remove this stream's queue
+                it = write_queues_.erase(it);
+                goto next_stream;  // Use goto to break out of inner loop and skip ++it
+            }
+            
+            item.offset += chunk_size;
+            queue.sent_bytes += chunk_size;
+            
+            // Check if this item is complete
+            if (item.offset >= item.size) {
+                queue.items.erase(queue.items.begin());
+            }
+            
+            // Only send one chunk per tick to allow other streams and avoid blocking
+            // (Remove this break if you want to send more aggressively)
+            break;
+        }
+        
+        ++it;
+        next_stream:;
+    }
+}
+
+//=============================================================================
+// Flow Control Checks (borrowed from Python version)
+//=============================================================================
+
+bool QuicConnection::Impl::CanSend(int stream_id, size_t len) const {
+    return GetSendableBytes(stream_id) >= len;
+}
+
+size_t QuicConnection::Impl::GetSendableBytes(int stream_id) const {
+    // Get connection-level window
+    uint64_t conn_window = flow_controller_.GetConnectionSendWindow();
+    
+    // Get stream-level window
+    uint64_t stream_window = flow_controller_.GetStreamSendWindow(
+        static_cast<uint64_t>(stream_id));
+    
+    // Return minimum of both
+    uint64_t result = std::min(conn_window, stream_window);
+    return static_cast<size_t>(result);
 }
 
 //=============================================================================
@@ -1640,13 +1991,358 @@ QuicConnection::Stats QuicConnection::Impl::GetStats() const {
 //=============================================================================
 
 void QuicConnection::Impl::GenerateRandom(uint8_t* buf, size_t len) {
-    std::random_device rd;
-    std::mt19937 gen(rd());
-    std::uniform_int_distribution<> dis(0, 255);
-    
-    for (size_t i = 0; i < len; i++) {
-        buf[i] = static_cast<uint8_t>(dis(gen));
+    // Use ESP-IDF hardware random number generator
+    // This avoids stack allocation (~2.5KB for std::mt19937) and is more efficient
+    for (size_t i = 0; i < len; i += 4) {
+        uint32_t random_word = esp_random();
+        size_t remaining = len - i;
+        size_t copy_len = remaining < 4 ? remaining : 4;
+        memcpy(buf + i, &random_word, copy_len);
     }
+}
+
+//=============================================================================
+// Frame Processor Setup (for 1-RTT packets)
+//=============================================================================
+
+void QuicConnection::Impl::SetupFrameProcessorCallbacks() {
+    // ACK frame callback
+    frame_processor_.SetOnAck([this](const AckFrameData& ack_data) {
+        OnFrameAck(ack_data);
+    });
+    
+    // STREAM frame callback
+    frame_processor_.SetOnStream([this](uint64_t stream_id, uint64_t offset,
+                                         const uint8_t* data, size_t len, bool fin) {
+        OnFrameStream(stream_id, offset, data, len, fin);
+    });
+    
+    // MAX_DATA frame callback
+    frame_processor_.SetOnMaxData([this](uint64_t max_data) {
+        OnFrameMaxData(max_data);
+    });
+    
+    // MAX_STREAM_DATA frame callback
+    frame_processor_.SetOnMaxStreamData([this](uint64_t stream_id, uint64_t max_data) {
+        OnFrameMaxStreamData(stream_id, max_data);
+    });
+    
+    // DATA_BLOCKED frame callback
+    frame_processor_.SetOnDataBlocked([this](uint64_t limit) {
+        OnFrameDataBlocked(limit);
+    });
+    
+    // STREAM_DATA_BLOCKED frame callback
+    frame_processor_.SetOnStreamDataBlocked([this](uint64_t stream_id, uint64_t limit) {
+        OnFrameStreamDataBlocked(stream_id, limit);
+    });
+    
+    // CONNECTION_CLOSE frame callback
+    frame_processor_.SetOnConnectionClose([this](const ConnectionCloseData& data) {
+        OnFrameConnectionClose(data);
+    });
+    
+    // HANDSHAKE_DONE frame callback
+    frame_processor_.SetOnHandshakeDone([this]() {
+        OnFrameHandshakeDone();
+    });
+    
+    // NEW_CONNECTION_ID frame callback
+    frame_processor_.SetOnNewConnectionId([this](const NewConnectionIdData& data) {
+        OnFrameNewConnectionId(data);
+    });
+    
+    // PATH_CHALLENGE frame callback
+    frame_processor_.SetOnPathChallenge([this](const uint8_t* data) {
+        OnFramePathChallenge(data);
+    });
+    
+    // PATH_RESPONSE frame callback
+    frame_processor_.SetOnPathResponse([this](const uint8_t* data) {
+        OnFramePathResponse(data);
+    });
+    
+    // DATAGRAM frame callback
+    frame_processor_.SetOnDatagram([this](const uint8_t* data, size_t len) {
+        OnFrameDatagram(data, len);
+    });
+    
+    // RESET_STREAM frame callback
+    frame_processor_.SetOnResetStream([this](const ResetStreamData& data) {
+        reset_streams_.insert(data.stream_id);
+    });
+    
+    // STOP_SENDING frame callback
+    frame_processor_.SetOnStopSending([this](const StopSendingData& data) {
+        stop_sending_streams_.insert(data.stream_id);
+    });
+}
+
+//=============================================================================
+// Frame Callback Handlers
+//=============================================================================
+
+void QuicConnection::Impl::OnFrameAck(const AckFrameData& ack_data) {
+    // Process ACK for application packet number space
+    size_t newly_acked;
+    app_tracker_.OnAckReceived(ack_data.largest_ack,
+                               ack_data.ack_delay,
+                               ack_data.first_ack_range,
+                               ack_data.ack_ranges,
+                               current_time_us_,
+                               &newly_acked);
+    
+    // Update loss detector with RTT
+    if (app_tracker_.GetLatestRttUs() > 0) {
+        loss_detector_.GetRttEstimator().OnRttSample(
+            app_tracker_.GetLatestRttUs(),
+            ack_data.ack_delay << app_ack_mgr_.GetAckDelayExponent());
+    }
+}
+
+void QuicConnection::Impl::OnFrameStream(uint64_t stream_id, uint64_t offset,
+                                          const uint8_t* data, size_t len, bool fin) {
+    // Update flow control
+    flow_controller_.OnStreamBytesReceived(stream_id, len);
+    
+    // Pass to H3 handler
+    if (h3_handler_) {
+        h3_handler_->OnStreamData(stream_id, offset, data, len, fin);
+    }
+    
+    // Check if we should send flow control updates
+    if (flow_controller_.ShouldSendMaxData()) {
+        SendMaxDataFrame();
+    }
+    if (flow_controller_.ShouldSendMaxStreamData(stream_id)) {
+        SendMaxStreamDataFrame(stream_id);
+    }
+}
+
+void QuicConnection::Impl::OnFrameMaxData(uint64_t max_data) {
+    flow_controller_.OnMaxDataReceived(max_data);
+}
+
+void QuicConnection::Impl::OnFrameMaxStreamData(uint64_t stream_id, uint64_t max_data) {
+    flow_controller_.OnMaxStreamDataReceived(stream_id, max_data);
+}
+
+void QuicConnection::Impl::OnFrameDataBlocked(uint64_t limit) {
+    // Peer is blocked on connection-level flow control, send MAX_DATA
+    SendMaxDataFrame();
+}
+
+void QuicConnection::Impl::OnFrameStreamDataBlocked(uint64_t stream_id, uint64_t limit) {
+    // Peer is blocked on stream-level flow control, send MAX_STREAM_DATA
+    SendMaxStreamDataFrame(stream_id);
+}
+
+void QuicConnection::Impl::OnFrameConnectionClose(const ConnectionCloseData& data) {
+    state_ = ConnectionState::kClosed;
+    
+    if (on_disconnected_) {
+        on_disconnected_(static_cast<int>(data.error_code), data.reason);
+    }
+}
+
+void QuicConnection::Impl::OnFrameHandshakeDone() {
+    ProcessHandshakeDoneFrame();
+}
+
+void QuicConnection::Impl::OnFrameNewConnectionId(const NewConnectionIdData& data) {
+    // Store new connection ID for potential migration (not implemented in v1)
+    if (config_.enable_debug) {
+        ESP_LOGI(TAG, "NEW_CONNECTION_ID: seq=%llu, cid_len=%zu",
+                 (unsigned long long)data.sequence_number, data.connection_id.length);
+    }
+}
+
+void QuicConnection::Impl::OnFramePathChallenge(const uint8_t* data) {
+    // Respond to PATH_CHALLENGE with PATH_RESPONSE
+    if (!crypto_.HasApplicationKeys()) {
+        return;
+    }
+    
+    if (config_.enable_debug) {
+        ESP_LOGI(TAG, "PATH_CHALLENGE received, sending PATH_RESPONSE");
+    }
+    
+    // Build PATH_RESPONSE frame
+    quic::BufferWriter writer(frame_buf_, sizeof(frame_buf_));
+    if (!quic::BuildPathResponseFrame(&writer, data)) {
+        return;
+    }
+    
+    // Build 1-RTT packet
+    uint64_t pn = app_tracker_.AllocatePacketNumber();
+    size_t packet_len = quic::Build1RttPacket(dcid_, pn, false, crypto_.GetKeyPhase() != 0,
+                                               frame_buf_, writer.Offset(),
+                                               crypto_.GetClientAppSecrets(),
+                                               packet_buf_, sizeof(packet_buf_));
+    
+    if (packet_len > 0) {
+        app_tracker_.OnPacketSent(pn, current_time_us_, packet_len, true);
+        SendPacket(packet_buf_, packet_len);
+    }
+}
+
+void QuicConnection::Impl::OnFramePathResponse(const uint8_t* data) {
+    // Check if this matches our pending PATH_CHALLENGE
+    if (memcmp(data, path_challenge_data_, 8) == 0) {
+        path_validated_ = true;
+        
+        if (path_challenge_sent_time_us_ > 0) {
+            uint64_t rtt_us = current_time_us_ - path_challenge_sent_time_us_;
+            path_validation_rtt_ms_ = static_cast<uint32_t>(rtt_us / 1000);
+            
+            if (config_.enable_debug) {
+                ESP_LOGI(TAG, "Path validated! RTT: %lu ms", path_validation_rtt_ms_);
+            }
+        }
+        
+        path_challenge_sent_time_us_ = 0;
+        memset(path_challenge_data_, 0, 8);
+    }
+}
+
+void QuicConnection::Impl::OnFrameDatagram(const uint8_t* data, size_t len) {
+    if (config_.enable_debug) {
+        ESP_LOGI(TAG, "DATAGRAM received: %zu bytes", len);
+    }
+    
+    if (on_datagram_) {
+        on_datagram_(data, len);
+    }
+}
+
+//=============================================================================
+// Key Update
+//=============================================================================
+
+bool QuicConnection::Impl::InitiateKeyUpdate() {
+    if (!handshake_complete_) {
+        if (config_.enable_debug) {
+            ESP_LOGW(TAG, "Cannot initiate Key Update: handshake not complete");
+        }
+        return false;
+    }
+    
+    return crypto_.InitiateKeyUpdate();
+}
+
+//=============================================================================
+// Path Validation
+//=============================================================================
+
+bool QuicConnection::Impl::SendPathChallenge() {
+    if (!crypto_.HasApplicationKeys()) {
+        return false;
+    }
+    
+    // Generate random challenge data
+    GenerateRandom(path_challenge_data_, 8);
+    path_challenge_sent_time_us_ = current_time_us_;
+    path_validated_ = false;
+    
+    // Build PATH_CHALLENGE frame
+    quic::BufferWriter writer(frame_buf_, sizeof(frame_buf_));
+    if (!quic::BuildPathChallengeFrame(&writer, path_challenge_data_)) {
+        return false;
+    }
+    
+    // Build 1-RTT packet
+    uint64_t pn = app_tracker_.AllocatePacketNumber();
+    size_t packet_len = quic::Build1RttPacket(dcid_, pn, false, crypto_.GetKeyPhase() != 0,
+                                               frame_buf_, writer.Offset(),
+                                               crypto_.GetClientAppSecrets(),
+                                               packet_buf_, sizeof(packet_buf_));
+    
+    if (packet_len == 0) {
+        return false;
+    }
+    
+    if (config_.enable_debug) {
+        ESP_LOGI(TAG, "Sending PATH_CHALLENGE");
+    }
+    
+    app_tracker_.OnPacketSent(pn, current_time_us_, packet_len, true);
+    return SendPacket(packet_buf_, packet_len);
+}
+
+//=============================================================================
+// DATAGRAM (RFC 9221)
+//=============================================================================
+
+bool QuicConnection::Impl::CanSendDatagram(size_t size) const {
+    if (!config_.enable_datagram) {
+        return false;
+    }
+    if (peer_max_datagram_frame_size_ == 0) {
+        return false;
+    }
+    if (size > 0 && size > peer_max_datagram_frame_size_) {
+        return false;
+    }
+    return true;
+}
+
+bool QuicConnection::Impl::SendDatagram(const uint8_t* data, size_t len) {
+    if (!crypto_.HasApplicationKeys()) {
+        if (config_.enable_debug) {
+            ESP_LOGW(TAG, "Cannot send DATAGRAM: handshake not complete");
+        }
+        return false;
+    }
+    
+    if (!CanSendDatagram(len)) {
+        if (config_.enable_debug) {
+            if (!config_.enable_datagram) {
+                ESP_LOGW(TAG, "DATAGRAM not enabled");
+            } else if (peer_max_datagram_frame_size_ == 0) {
+                ESP_LOGW(TAG, "Peer doesn't support DATAGRAM");
+            } else {
+                ESP_LOGW(TAG, "DATAGRAM data (%zu bytes) exceeds peer limit (%lu bytes)",
+                         len, peer_max_datagram_frame_size_);
+            }
+        }
+        return false;
+    }
+    
+    // Build DATAGRAM frame
+    quic::BufferWriter writer(frame_buf_, sizeof(frame_buf_));
+    if (!quic::BuildDatagramFrame(&writer, data, len, true)) {
+        return false;
+    }
+    
+    // Build 1-RTT packet
+    uint64_t pn = app_tracker_.AllocatePacketNumber();
+    size_t packet_len = quic::Build1RttPacket(dcid_, pn, false, crypto_.GetKeyPhase() != 0,
+                                               frame_buf_, writer.Offset(),
+                                               crypto_.GetClientAppSecrets(),
+                                               packet_buf_, sizeof(packet_buf_));
+    
+    if (packet_len == 0) {
+        return false;
+    }
+    
+    if (config_.enable_debug) {
+        ESP_LOGI(TAG, "Sending DATAGRAM: %zu bytes", len);
+    }
+    
+    // Track sent packet (but DATAGRAM is NOT retransmitted on loss)
+    app_tracker_.OnPacketSent(pn, current_time_us_, packet_len, true);
+    return SendPacket(packet_buf_, packet_len);
+}
+
+size_t QuicConnection::Impl::GetMaxDatagramSize() const {
+    if (!IsDatagramAvailable()) {
+        return 0;
+    }
+    return std::min(config_.max_datagram_frame_size, peer_max_datagram_frame_size_);
+}
+
+bool QuicConnection::Impl::IsDatagramAvailable() const {
+    return config_.enable_datagram && peer_max_datagram_frame_size_ > 0;
 }
 
 //=============================================================================
@@ -1705,6 +2401,26 @@ bool QuicConnection::FinishStream(int stream_id) {
     return impl_->FinishStream(stream_id);
 }
 
+bool QuicConnection::CanSend(int stream_id, size_t len) const {
+    return impl_->CanSend(stream_id, len);
+}
+
+size_t QuicConnection::GetSendableBytes(int stream_id) const {
+    return impl_->GetSendableBytes(stream_id);
+}
+
+bool QuicConnection::IsConnectionBlocked() const {
+    return impl_->IsConnectionBlocked();
+}
+
+bool QuicConnection::IsStreamBlocked(int stream_id) const {
+    return impl_->IsStreamBlocked(stream_id);
+}
+
+bool QuicConnection::IsStreamReset(int stream_id) const {
+    return impl_->IsStreamReset(stream_id);
+}
+
 void QuicConnection::SetOnConnected(OnConnectedCallback cb) {
     impl_->SetOnConnected(std::move(cb));
 }
@@ -1721,8 +2437,88 @@ void QuicConnection::SetOnStreamData(OnStreamDataCallback cb) {
     impl_->SetOnStreamData(std::move(cb));
 }
 
+void QuicConnection::SetOnWriteComplete(OnWriteCompleteCallback cb) {
+    impl_->SetOnWriteComplete(std::move(cb));
+}
+
+void QuicConnection::SetOnWriteError(OnWriteErrorCallback cb) {
+    impl_->SetOnWriteError(std::move(cb));
+}
+
+bool QuicConnection::QueueWrite(int stream_id, const uint8_t* data, size_t size, std::function<void()> deleter) {
+    return impl_->QueueWrite(stream_id, data, size, std::move(deleter));
+}
+
+bool QuicConnection::QueueFinish(int stream_id) {
+    return impl_->QueueFinish(stream_id);
+}
+
+size_t QuicConnection::GetQueuedBytes(int stream_id) const {
+    return impl_->GetQueuedBytes(stream_id);
+}
+
+bool QuicConnection::IsQueueEmpty(int stream_id) const {
+    return impl_->IsQueueEmpty(stream_id);
+}
+
 QuicConnection::Stats QuicConnection::GetStats() const {
     return impl_->GetStats();
+}
+
+//=============================================================================
+// Key Update Public API
+//=============================================================================
+
+bool QuicConnection::InitiateKeyUpdate() {
+    return impl_->InitiateKeyUpdate();
+}
+
+uint8_t QuicConnection::GetKeyPhase() const {
+    return impl_->GetKeyPhase();
+}
+
+uint32_t QuicConnection::GetKeyUpdateGeneration() const {
+    return impl_->GetKeyUpdateGeneration();
+}
+
+//=============================================================================
+// Path Validation Public API
+//=============================================================================
+
+bool QuicConnection::SendPathChallenge() {
+    return impl_->SendPathChallenge();
+}
+
+bool QuicConnection::IsPathValidated() const {
+    return impl_->IsPathValidated();
+}
+
+uint32_t QuicConnection::GetPathValidationRtt() const {
+    return impl_->GetPathValidationRtt();
+}
+
+//=============================================================================
+// DATAGRAM Public API (RFC 9221)
+//=============================================================================
+
+bool QuicConnection::CanSendDatagram(size_t size) const {
+    return impl_->CanSendDatagram(size);
+}
+
+bool QuicConnection::SendDatagram(const uint8_t* data, size_t len) {
+    return impl_->SendDatagram(data, len);
+}
+
+void QuicConnection::SetOnDatagram(OnDatagramCallback cb) {
+    impl_->SetOnDatagram(std::move(cb));
+}
+
+size_t QuicConnection::GetMaxDatagramSize() const {
+    return impl_->GetMaxDatagramSize();
+}
+
+bool QuicConnection::IsDatagramAvailable() const {
+    return impl_->IsDatagramAvailable();
 }
 
 } // namespace esp_http3

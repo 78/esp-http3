@@ -516,8 +516,19 @@ void H3Handler::HandleRequestStream(uint64_t stream_id,
                             stream->response.status = std::atoi(h.value.c_str());
                             ESP_LOGD(TAG, "    Status: %d", stream->response.status);
                         } else if (h.name[0] != ':') {
-                            stream->response.headers.push_back({h.name, h.value});
+                            // URL decode header value
+                            std::string decoded_value;
+                            UrlDecode(h.value, &decoded_value);
+                            stream->response.headers.push_back({h.name, decoded_value});
                         }
+                    }
+                    
+                    // Trigger OnResponse callback immediately after headers are parsed
+                    // Since H3Response no longer contains body, we can notify early
+                    if (on_response_ && !stream->response_headers_sent) {
+                        stream->response_headers_sent = true;
+                        ESP_LOGD(TAG, "    Triggering OnResponse callback (headers received)");
+                        on_response_(stream_id, stream->response);
                     }
                 } else {
                     ESP_LOGW(TAG, "    Failed to decode QPACK headers");
@@ -526,13 +537,13 @@ void H3Handler::HandleRequestStream(uint64_t stream_id,
             }
             
             case H3FrameType::kData:
-                stream->response.body.insert(stream->response.body.end(),
-                                              payload, payload + header.length);
-                ESP_LOGD(TAG, "  H3 Frame: DATA (len=%llu) Body total: %zu bytes", (unsigned long long)header.length, stream->response.body.size());
+                ESP_LOGD(TAG, "  H3 Frame: DATA (len=%llu bytes)", (unsigned long long)header.length);
                 
-                // Notify streaming data if callback set
+                // Notify streaming data if callback set (don't store body to save memory)
                 if (on_stream_data_) {
                     on_stream_data_(stream_id, payload, header.length, false);
+                } else {
+                    ESP_LOGW(TAG, "  No OnStreamData callback set - body data will be discarded!");
                 }
                 break;
                 
@@ -556,17 +567,19 @@ void H3Handler::HandleRequestStream(uint64_t stream_id,
     // Check if response is complete
     if (fin) {
         stream->response.complete = true;
-        ESP_LOGD(TAG, "  Response complete! status=%d, body=%zu bytes",
-                 stream->response.status, stream->response.body.size());
+        ESP_LOGD(TAG, "  Response complete! status=%d", stream->response.status);
         
-        if (on_response_) {
-            on_response_(stream_id, stream->response);
-        } else {
-            ESP_LOGW(TAG, "  No on_response_ callback set!");
-        }
-        
+        // Notify stream data callback that stream is finished
         if (on_stream_data_) {
             on_stream_data_(stream_id, nullptr, 0, true);
+        }
+        
+        // OnResponse callback should have been triggered when headers were received
+        // Only trigger here if headers were never received (edge case)
+        if (on_response_ && !stream->response_headers_sent) {
+            ESP_LOGW(TAG, "  Stream finished but headers never received, triggering OnResponse anyway");
+            stream->response_headers_sent = true;
+            on_response_(stream_id, stream->response);
         }
     }
 }

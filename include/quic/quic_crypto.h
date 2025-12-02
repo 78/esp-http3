@@ -112,6 +112,28 @@ bool DeriveApplicationSecrets(const uint8_t* handshake_secret,
                               uint8_t* master_secret_out);
 
 //=============================================================================
+// Key Update (RFC 9001 Section 6)
+//=============================================================================
+
+/**
+ * @brief Derive next generation application secrets for Key Update
+ * 
+ * Implements RFC 9001 Section 6 Key Update.
+ * application_traffic_secret_N+1 = HKDF-Expand-Label(application_traffic_secret_N,
+ *                                                     "quic ku", "", 32)
+ * 
+ * @param current_client_secret Current client application traffic secret
+ * @param current_server_secret Current server application traffic secret
+ * @param next_client_out Output next client secrets
+ * @param next_server_out Output next server secrets
+ * @return true on success
+ */
+bool DeriveNextApplicationSecrets(const uint8_t* current_client_secret,
+                                   const uint8_t* current_server_secret,
+                                   CryptoSecrets* next_client_out,
+                                   CryptoSecrets* next_server_out);
+
+//=============================================================================
 // Finished Message
 //=============================================================================
 

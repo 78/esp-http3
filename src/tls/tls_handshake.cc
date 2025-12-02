@@ -42,8 +42,8 @@ size_t BuildClientHello(const std::string& hostname,
     
     // 1. SNI extension
     {
-        uint8_t sni_data[256];
-        BufferWriter sni(sni_data, sizeof(sni_data));
+        std::vector<uint8_t> sni_data(256);
+        BufferWriter sni(sni_data.data(), sni_data.size());
         
         // Server Name List length (2 bytes) - will fill later
         size_t list_len_pos = sni.Offset();
@@ -63,7 +63,7 @@ size_t BuildClientHello(const std::string& hostname,
         sni_data[list_len_pos + 1] = static_cast<uint8_t>(list_len & 0xFF);
         
         if (!WriteExtension(&ext_writer, ExtensionType::kServerName,
-                            sni_data, sni.Offset())) {
+                            sni_data.data(), sni.Offset())) {
             return 0;
         }
     }
@@ -141,14 +141,14 @@ size_t BuildClientHello(const std::string& hostname,
     
     // 7. QUIC Transport Parameters extension
     {
-        uint8_t tp_data[256];
+        std::vector<uint8_t> tp_data(256);
         size_t tp_len = quic::BuildTransportParameters(transport_params, 
-                                                        tp_data, sizeof(tp_data));
+                                                        tp_data.data(), tp_data.size());
         if (tp_len == 0) {
             return 0;
         }
         if (!WriteExtension(&ext_writer, ExtensionType::kQUICTransportParameters,
-                            tp_data, tp_len)) {
+                            tp_data.data(), tp_len)) {
             return 0;
         }
     }

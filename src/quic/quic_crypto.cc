@@ -396,6 +396,61 @@ bool DeriveApplicationSecrets(const uint8_t* handshake_secret,
 }
 
 //=============================================================================
+// Key Update (RFC 9001 Section 6)
+//=============================================================================
+
+bool DeriveNextApplicationSecrets(const uint8_t* current_client_secret,
+                                   const uint8_t* current_server_secret,
+                                   CryptoSecrets* next_client_out,
+                                   CryptoSecrets* next_server_out) {
+    // Key Update uses "quic ku" label:
+    // application_traffic_secret_N+1 = HKDF-Expand-Label(
+    //     application_traffic_secret_N, "quic ku", "", 32)
+    
+    const uint8_t* ku_label = reinterpret_cast<const uint8_t*>("quic ku");
+    
+    // Derive next client secret
+    if (next_client_out) {
+        uint8_t next_client_secret[32];
+        if (!HkdfExpandLabel(current_client_secret, 32, ku_label, 7, 
+                             nullptr, 0, next_client_secret, 32)) {
+            ESP_LOGW(TAG, "DeriveNextApplicationSecrets: client key update failed");
+            return false;
+        }
+        
+        // Store the new traffic secret
+        std::memcpy(next_client_out->traffic_secret.data(), next_client_secret, 32);
+        
+        // Derive traffic keys from new secret
+        if (!DeriveTrafficKeys(next_client_secret, next_client_out)) {
+            ESP_LOGW(TAG, "DeriveNextApplicationSecrets: DeriveTrafficKeys(client) failed");
+            return false;
+        }
+    }
+    
+    // Derive next server secret
+    if (next_server_out) {
+        uint8_t next_server_secret[32];
+        if (!HkdfExpandLabel(current_server_secret, 32, ku_label, 7,
+                             nullptr, 0, next_server_secret, 32)) {
+            ESP_LOGW(TAG, "DeriveNextApplicationSecrets: server key update failed");
+            return false;
+        }
+        
+        // Store the new traffic secret
+        std::memcpy(next_server_out->traffic_secret.data(), next_server_secret, 32);
+        
+        // Derive traffic keys from new secret
+        if (!DeriveTrafficKeys(next_server_secret, next_server_out)) {
+            ESP_LOGW(TAG, "DeriveNextApplicationSecrets: DeriveTrafficKeys(server) failed");
+            return false;
+        }
+    }
+    
+    return true;
+}
+
+//=============================================================================
 // Finished Message
 //=============================================================================
 

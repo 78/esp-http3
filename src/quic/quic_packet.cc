@@ -9,6 +9,7 @@
 #include "quic/quic_frame.h"
 
 #include <cstring>
+#include <vector>
 #include <esp_log.h>
 
 namespace esp_http3 {
@@ -89,7 +90,7 @@ size_t BuildInitialPacket(const ConnectionId& dcid,
     size_t pn_len = GetPacketNumberLength(packet_number);
     
     // Build header (without length and PN)
-    uint8_t header[256];
+    std::vector<uint8_t> header(256);
     size_t header_offset = 0;
     
     // First byte (will update PN length later)
@@ -103,19 +104,19 @@ size_t BuildInitialPacket(const ConnectionId& dcid,
     
     // DCID
     header[header_offset++] = static_cast<uint8_t>(dcid.Length());
-    std::memcpy(header + header_offset, dcid.Data(), dcid.Length());
+    std::memcpy(header.data() + header_offset, dcid.Data(), dcid.Length());
     header_offset += dcid.Length();
     
     // SCID
     header[header_offset++] = static_cast<uint8_t>(scid.Length());
-    std::memcpy(header + header_offset, scid.Data(), scid.Length());
+    std::memcpy(header.data() + header_offset, scid.Data(), scid.Length());
     header_offset += scid.Length();
     
     // Token length + token
-    header_offset += EncodeVarint(token_len, header + header_offset, 
-                                   sizeof(header) - header_offset);
+    header_offset += EncodeVarint(token_len, header.data() + header_offset, 
+                                   header.size() - header_offset);
     if (token_len > 0) {
-        std::memcpy(header + header_offset, token, token_len);
+        std::memcpy(header.data() + header_offset, token, token_len);
         header_offset += token_len;
     }
     
@@ -145,7 +146,7 @@ size_t BuildInitialPacket(const ConnectionId& dcid,
     
     // Build final packet
     size_t offset = 0;
-    std::memcpy(out, header, header_offset);
+    std::memcpy(out, header.data(), header_offset);
     offset = header_offset;
     
     // Length field
@@ -201,7 +202,7 @@ size_t BuildHandshakePacket(const ConnectionId& dcid,
     size_t pn_len = GetPacketNumberLength(packet_number);
     
     // Build header
-    uint8_t header[256];
+    std::vector<uint8_t> header(256);
     size_t header_offset = 0;
     
     // First byte: Handshake type = 2
@@ -215,12 +216,12 @@ size_t BuildHandshakePacket(const ConnectionId& dcid,
     
     // DCID
     header[header_offset++] = static_cast<uint8_t>(dcid.Length());
-    std::memcpy(header + header_offset, dcid.Data(), dcid.Length());
+    std::memcpy(header.data() + header_offset, dcid.Data(), dcid.Length());
     header_offset += dcid.Length();
     
     // SCID
     header[header_offset++] = static_cast<uint8_t>(scid.Length());
-    std::memcpy(header + header_offset, scid.Data(), scid.Length());
+    std::memcpy(header.data() + header_offset, scid.Data(), scid.Length());
     header_offset += scid.Length();
     
     // Calculate encrypted payload length
@@ -228,11 +229,11 @@ size_t BuildHandshakePacket(const ConnectionId& dcid,
     
     // Length field
     size_t length_val = pn_len + encrypted_payload_len;
-    header_offset += EncodeVarint(length_val, header + header_offset,
-                                   sizeof(header) - header_offset);
+    header_offset += EncodeVarint(length_val, header.data() + header_offset,
+                                   header.size() - header_offset);
     
     // Copy header to output
-    std::memcpy(out, header, header_offset);
+    std::memcpy(out, header.data(), header_offset);
     size_t offset = header_offset;
     
     // PN offset

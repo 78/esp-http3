@@ -308,29 +308,46 @@ size_t BuildQpackRequestHeaders(const std::string& method,
             return true;
         }
         
-        // Literal Header Field Without Name Reference
-        // 001Nxxxx - literal without name reference
-        uint8_t first = 0x20;  // No Huffman on name
-        if (!writer.WriteUint8(first)) return false;
+        // Literal Header Field Without Name Reference (RFC 9204 Section 4.5.6)
+        // Format: 001NHXXX | name (H-encoded) | value (L-encoded)
+        // N = 0 (never index = false)
+        // H = 0 (no Huffman on name)
+        // XXX = 3-bit prefix for name length
         
-        // Name
-        size_t consumed = QpackEncodeString(name, false,
-                                             writer.Data() + writer.Offset() - 1,
-                                             writer.Remaining() + 1);
-        // Adjust first byte
-        writer.Data()[writer.Offset() - 1] = first | 
-            (static_cast<uint8_t>(name.size()) & 0x07);
+        uint8_t first = 0x20;  // 001N=0 H=0
+        size_t name_len = name.size();
         
-        consumed = QpackEncodeString(name, false,
-                                      writer.Data() + writer.Offset(),
-                                      writer.Remaining());
-        if (consumed == 0) return false;
-        writer.Seek(writer.Offset() + consumed);
+        // Encode name length with 3-bit prefix (max 7)
+        if (name_len < 7) {
+            first |= static_cast<uint8_t>(name_len);
+            if (!writer.WriteUint8(first)) return false;
+        } else {
+            // Multi-byte name length
+            first |= 0x07;  // 111 = 7, indicating multi-byte
+            if (!writer.WriteUint8(first)) return false;
+            
+            // Continue encoding remaining length
+            size_t remaining = name_len - 7;
+            while (remaining >= 128) {
+                if (!writer.WriteUint8(static_cast<uint8_t>((remaining & 0x7F) | 0x80))) {
+                    return false;
+                }
+                remaining >>= 7;
+            }
+            if (!writer.WriteUint8(static_cast<uint8_t>(remaining))) {
+                return false;
+            }
+        }
         
-        // Value
-        consumed = QpackEncodeString(value, false,
-                                      writer.Data() + writer.Offset(),
-                                      writer.Remaining());
+        // Write name bytes directly (no length prefix - already encoded above)
+        if (!writer.WriteBytes(reinterpret_cast<const uint8_t*>(name.data()), name_len)) {
+            return false;
+        }
+        
+        // Write value string with standard QPACK string encoding (H + 7-bit length + data)
+        size_t consumed = QpackEncodeString(value, false,
+                                             writer.Data() + writer.Offset(),
+                                             writer.Remaining());
         if (consumed == 0) return false;
         writer.Seek(writer.Offset() + consumed);
         return true;
@@ -596,6 +613,60 @@ static size_t HuffmanDecode(const uint8_t* input, size_t input_len,
     }
     
     return output->size();
+}
+
+/**
+ * @brief URL decode (percent decode) a string
+ * 
+ * Decodes percent-encoded characters (e.g., %E7%8E%B0 -> 现)
+ * 
+ * @param input Input string (may contain %XX encoded bytes)
+ * @param output Output decoded string
+ * @return true on success, false on invalid encoding
+ */
+bool UrlDecode(const std::string& input, std::string* output) {
+    output->clear();
+    output->reserve(input.size());  // Usually same or smaller
+    
+    for (size_t i = 0; i < input.size(); ++i) {
+        if (input[i] == '%' && i + 2 < input.size()) {
+            // Try to decode %XX
+            char hex1 = input[i + 1];
+            char hex2 = input[i + 2];
+            
+            if ((hex1 >= '0' && hex1 <= '9') || (hex1 >= 'A' && hex1 <= 'F') || (hex1 >= 'a' && hex1 <= 'f')) {
+                if ((hex2 >= '0' && hex2 <= '9') || (hex2 >= 'A' && hex2 <= 'F') || (hex2 >= 'a' && hex2 <= 'f')) {
+                    // Valid hex digits
+                    uint8_t byte = 0;
+                    if (hex1 >= '0' && hex1 <= '9') {
+                        byte = (hex1 - '0') << 4;
+                    } else if (hex1 >= 'A' && hex1 <= 'F') {
+                        byte = (hex1 - 'A' + 10) << 4;
+                    } else {
+                        byte = (hex1 - 'a' + 10) << 4;
+                    }
+                    
+                    if (hex2 >= '0' && hex2 <= '9') {
+                        byte |= (hex2 - '0');
+                    } else if (hex2 >= 'A' && hex2 <= 'F') {
+                        byte |= (hex2 - 'A' + 10);
+                    } else {
+                        byte |= (hex2 - 'a' + 10);
+                    }
+                    
+                    output->push_back(static_cast<char>(byte));
+                    i += 2;  // Skip the two hex digits
+                    continue;
+                }
+            }
+            // Invalid % encoding, keep as-is
+            output->push_back(input[i]);
+        } else {
+            output->push_back(input[i]);
+        }
+    }
+    
+    return true;
 }
 
 size_t QpackDecodeInteger(const uint8_t* data, size_t len,

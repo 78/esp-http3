@@ -21,6 +21,8 @@ set(COMPONENT_SRCS
     "src/client/ack_manager.cc"
     "src/client/flow_controller.cc"
     "src/client/loss_detector.cc"
+    "src/client/crypto_manager.cc"
+    "src/client/frame_processor.cc"
     "src/client/quic_connection.cc"
 )
 

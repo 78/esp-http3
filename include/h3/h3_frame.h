@@ -221,6 +221,17 @@ bool DecodeQpackHeaderBlock(const uint8_t* data, size_t len,
                             std::vector<HeaderField>* headers);
 
 /**
+ * @brief URL decode (percent decode) a string
+ * 
+ * Decodes percent-encoded characters (e.g., %E7%8E%B0 -> 现)
+ * 
+ * @param input Input string (may contain %XX encoded bytes)
+ * @param output Output decoded string
+ * @return true on success, false on invalid encoding
+ */
+bool UrlDecode(const std::string& input, std::string* output);
+
+/**
  * @brief Get static table entry by index
  * 
  * @param index Static table index

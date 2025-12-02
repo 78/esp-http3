@@ -275,6 +275,25 @@ bool BuildPathResponseFrame(BufferWriter* writer, const uint8_t* data) {
     return writer->WriteBytes(data, 8);
 }
 
+bool BuildDatagramFrame(BufferWriter* writer, const uint8_t* data, size_t len,
+                         bool include_length) {
+    // DATAGRAM frame type: 0x30 (no length) or 0x31 (with length)
+    uint8_t frame_type = include_length ? frame::kDatagramLen : frame::kDatagram;
+    if (!writer->WriteUint8(frame_type)) {
+        return false;
+    }
+    
+    // Optional length field
+    if (include_length) {
+        if (!writer->WriteVarint(len)) {
+            return false;
+        }
+    }
+    
+    // Data
+    return writer->WriteBytes(data, len);
+}
+
 //=============================================================================
 // Frame Parsing
 //=============================================================================
@@ -601,6 +620,14 @@ size_t BuildTransportParameters(const TransportParameters& params,
         }
     }
     
+    // max_datagram_frame_size (0x20) - RFC 9221
+    if (params.max_datagram_frame_size > 0) {
+        if (!write_param(transport_param::kMaxDatagramFrameSize, 
+                         params.max_datagram_frame_size)) {
+            return 0;
+        }
+    }
+    
     return writer.Offset();
 }
 
@@ -696,6 +723,11 @@ bool ParseTransportParameters(const uint8_t* data, size_t len,
                 break;
             case 0x10:  // retry_source_connection_id
                 out->retry_source_connection_id.Set(param_data, param_len);
+                break;
+            case 0x20:  // max_datagram_frame_size (RFC 9221)
+                if (!param_reader.ReadVarint(&out->max_datagram_frame_size)) {
+                    return false;
+                }
                 break;
             default:
                 // Unknown parameter, skip

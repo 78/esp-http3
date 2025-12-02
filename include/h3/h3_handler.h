@@ -19,11 +19,13 @@ namespace h3 {
 
 /**
  * @brief HTTP/3 response data
+ * 
+ * Note: Body data is not stored here to save memory. Use OnStreamData callback
+ * to receive body data in a streaming fashion.
  */
 struct H3Response {
     int status = 0;
     std::vector<std::pair<std::string, std::string>> headers;
-    std::vector<uint8_t> body;
     bool complete = false;
     std::string error;
 };
@@ -63,6 +65,7 @@ struct H3Stream {
     
     // Response data
     H3Response response;
+    bool response_headers_sent = false;  // Track if OnResponse callback has been triggered
     
     // Stream reassembly (like Python's H3StreamManager)
     std::vector<uint8_t> recv_buffer;      // Contiguous data buffer

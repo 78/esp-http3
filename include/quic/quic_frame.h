@@ -194,6 +194,18 @@ bool BuildPathChallengeFrame(BufferWriter* writer, const uint8_t* data);
  */
 bool BuildPathResponseFrame(BufferWriter* writer, const uint8_t* data);
 
+/**
+ * @brief Build DATAGRAM frame (RFC 9221)
+ * 
+ * @param writer Buffer writer
+ * @param data Datagram data
+ * @param len Data length
+ * @param include_length If true, include length field (0x31), else no length field (0x30)
+ * @return true on success
+ */
+bool BuildDatagramFrame(BufferWriter* writer, const uint8_t* data, size_t len,
+                         bool include_length = true);
+
 //=============================================================================
 // Frame Parsing
 //=============================================================================
@@ -374,6 +386,9 @@ struct TransportParameters {
     uint64_t max_ack_delay = 25;
     bool disable_active_migration = false;
     uint64_t active_connection_id_limit = 2;
+    
+    // DATAGRAM extension (RFC 9221)
+    uint64_t max_datagram_frame_size = 0;  ///< 0 = DATAGRAM not supported
     
     // Server-provided
     ConnectionId original_destination_connection_id;
