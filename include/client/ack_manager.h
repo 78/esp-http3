@@ -32,11 +32,23 @@ public:
     void OnPacketReceived(uint64_t pn, uint64_t recv_time_us);
     
     /**
-     * @brief Check if ACK should be sent
+     * @brief Check if ACK should be sent (simple check, 2+ ack-eliciting packets)
      * 
      * @return true if ACK is needed
      */
     bool ShouldSendAck() const;
+    
+    /**
+     * @brief Check if ACK should be sent with max_ack_delay timer (RFC 9002)
+     * 
+     * Returns true if:
+     * - 2+ ack-eliciting packets received, OR
+     * - 1+ ack-eliciting packet received AND max_ack_delay has elapsed
+     * 
+     * @param current_time_us Current time in microseconds
+     * @return true if ACK is needed
+     */
+    bool ShouldSendAck(uint64_t current_time_us) const;
     
     /**
      * @brief Get largest received packet number
@@ -73,8 +85,26 @@ public:
      * @brief Reset state
      */
     void Reset();
+    
+    /**
+     * @brief Check if there are any pending ack-eliciting packets
+     * 
+     * @return true if there are packets waiting to be ACKed
+     */
+    bool HasPendingAck() const { return ack_eliciting_count_ > 0; }
+    
+    /**
+     * @brief Get the time when we should send ACK if no more packets arrive
+     * 
+     * Returns 0 if no pending ACK, otherwise returns the deadline in microseconds.
+     * 
+     * @return ACK deadline in microseconds, or 0 if no pending ACK
+     */
+    uint64_t GetAckDeadlineUs() const;
 
 private:
+    // Maximum ACK delay in microseconds (RFC 9002 default: 25ms)
+    static constexpr uint64_t kMaxAckDelayUs = 25000;
     // Received packet numbers (for generating ACK ranges)
     std::set<uint64_t> received_packets_;
     

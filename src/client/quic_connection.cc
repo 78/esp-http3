@@ -31,30 +31,6 @@ namespace esp_http3 {
 
 static const char* TAG = "QuicConnection";
 
-// Helper to dump packet data in debug mode
-static void DumpPacket(const char* direction, const uint8_t* data, size_t len, bool enabled) {
-    if (!enabled || len == 0) return;
-    
-    ESP_LOGI(TAG, "%s packet (%zu bytes):", direction, len);
-    
-    // Print hex dump (max 64 bytes to avoid flooding)
-    size_t dump_len = len > 64 ? 64 : len;
-    char hex_line[50];  // 16 bytes * 3 chars = 48 + null
-    
-    for (size_t i = 0; i < dump_len; i += 16) {
-        size_t line_len = 0;
-        for (size_t j = 0; j < 16 && (i + j) < dump_len; j++) {
-            line_len += snprintf(hex_line + line_len, sizeof(hex_line) - line_len, 
-                                 "%02x ", data[i + j]);
-        }
-        ESP_LOGI(TAG, "  %04x: %s", (unsigned)i, hex_line);
-    }
-    
-    if (len > 64) {
-        ESP_LOGI(TAG, "  ... (%zu more bytes)", len - 64);
-    }
-}
-
 //=============================================================================
 // QuicConnection::Impl
 //=============================================================================
@@ -200,6 +176,9 @@ private:
     
     // Write queue processing
     void ProcessWriteQueue();
+    
+    // Stream cleanup - releases memory associated with a completed stream
+    void CleanupStream(uint64_t stream_id);
 
 private:
     // Write queue item
@@ -702,13 +681,13 @@ size_t QuicConnection::Impl::ProcessInitialPacket(uint8_t* data, size_t len) {
     
     if (payload_len == 0) {
         if (config_.enable_debug) {
-            ESP_LOGW(TAG, "DecryptInitialPacket failed (len=%zu)", len);
+            ESP_LOGE(TAG, "DecryptInitialPacket failed (len=%zu)", len);
         }
         return 0;  // Decryption failed
     }
     
     if (config_.enable_debug) {
-        ESP_LOGI(TAG, "Decrypted Initial packet, PN=%llu, payload=%zu bytes, packet_size=%zu",
+        ESP_LOGW(TAG, "Decrypted Initial packet, PN=%llu, payload=%zu bytes, packet_size=%zu",
                  (unsigned long long)info.packet_number, payload_len, info.packet_size);
     }
     
@@ -1021,10 +1000,11 @@ void QuicConnection::Impl::ProcessAckFrame(quic::BufferReader* reader,
                            &newly_acked);
     
     // Update loss detector with RTT
+    // Note: Decode peer's ACK delay using peer's ack_delay_exponent (from transport params)
     if (tracker->GetLatestRttUs() > 0) {
         loss_detector_.GetRttEstimator().OnRttSample(
             tracker->GetLatestRttUs(),
-            ack_data.ack_delay << initial_ack_mgr_.GetAckDelayExponent());
+            ack_data.ack_delay << peer_params_.ack_delay_exponent);
     }
 }
 
@@ -1343,6 +1323,25 @@ void QuicConnection::Impl::ProcessHandshakeDoneFrame() {
     handshake_complete_ = true;
     state_ = ConnectionState::kConnected;
     
+    // Release handshake-related buffers that are no longer needed
+    // These can be quite large (several KB) and are only used during handshake
+    // Use swap trick for guaranteed memory release (shrink_to_fit is non-binding)
+    std::vector<uint8_t>().swap(initial_crypto_buffer_);
+    std::vector<uint8_t>().swap(handshake_crypto_buffer_);
+    initial_crypto_cache_.clear();
+    handshake_crypto_cache_.clear();
+    
+    // Reset Initial and Handshake packet number space trackers
+    // (no longer needed after handshake completion)
+    initial_ack_mgr_.Reset();
+    handshake_ack_mgr_.Reset();
+    initial_tracker_.Reset();
+    handshake_tracker_.Reset();
+    
+    if (config_.enable_debug) {
+        ESP_LOGI(TAG, "Handshake complete, released crypto buffers and trackers");
+    }
+    
     // Initialize HTTP/3
     if (!h3_initialized_) {
         h3_handler_->Initialize(0, 2);  // Client stream IDs
@@ -1370,6 +1369,14 @@ void QuicConnection::Impl::ProcessHandshakeDoneFrame() {
                                              size_t len, bool fin) {
             if (on_stream_data_) {
                 on_stream_data_(static_cast<int>(stream_id), data, len, fin);
+            }
+            
+            // Clean up stream resources when response is complete (FIN received)
+            // This is the proper time to clean up because both directions are now closed:
+            // - We sent our FIN (request complete)
+            // - Server sent FIN (response complete)
+            if (fin) {
+                CleanupStream(stream_id);
             }
         });
         
@@ -1590,7 +1597,8 @@ bool QuicConnection::Impl::SendAckIfNeeded(quic::PacketType pkt_type) {
             break;
     }
     
-    if (!ack_mgr->ShouldSendAck()) {
+    // Use time-based check for proper max_ack_delay handling (RFC 9002)
+    if (!ack_mgr->ShouldSendAck(current_time_us_)) {
         return true;
     }
     
@@ -1637,6 +1645,12 @@ bool QuicConnection::Impl::SendAckIfNeeded(quic::PacketType pkt_type) {
     
     tracker->OnPacketSent(pn, current_time_us_, packet_len, false);
     ack_mgr->OnAckSent();
+    
+    if (config_.enable_debug) {
+        ESP_LOGI(TAG, "Sending ACK packet, PN=%llu, len=%zu", 
+                 (unsigned long long)pn, packet_len);
+    }
+    
     return SendPacket(packet.data(), packet_len);
 }
 
@@ -1755,21 +1769,36 @@ uint32_t QuicConnection::Impl::OnTimerTick(uint32_t elapsed_ms) {
         }
     }
     
+    // Check if delayed ACKs need to be sent (RFC 9002 max_ack_delay timer)
+    if (handshake_complete_) {
+        if (app_ack_mgr_.ShouldSendAck(current_time_us_)) {
+            SendAckIfNeeded(quic::PacketType::k1Rtt);
+        }
+    } else {
+        // During handshake, check Initial and Handshake ACKs
+        if (initial_ack_mgr_.ShouldSendAck(current_time_us_)) {
+            SendAckIfNeeded(quic::PacketType::kInitial);
+        }
+        if (handshake_ack_mgr_.ShouldSendAck(current_time_us_)) {
+            SendAckIfNeeded(quic::PacketType::kHandshake);
+        }
+    }
+    
+    // Calculate time until next ACK deadline
+    uint64_t ack_deadline_us = app_ack_mgr_.GetAckDeadlineUs();
+    if (ack_deadline_us > 0 && ack_deadline_us > current_time_us_) {
+        uint64_t time_until_ack_us = ack_deadline_us - current_time_us_;
+        uint32_t ack_deadline_ms = static_cast<uint32_t>((time_until_ack_us + 999) / 1000);
+        if (ack_deadline_ms < next_timer_ms) {
+            next_timer_ms = ack_deadline_ms;
+        }
+    }
+    
     // Process write queues (send queued data respecting flow control)
+    // Note: ProcessWriteQueue is also called immediately when MAX_DATA/MAX_STREAM_DATA
+    // frames are received, so no polling needed here - just process any remaining data
     if (IsConnected()) {
         ProcessWriteQueue();
-        
-        // If there's pending data in write queues, use a shorter poll interval
-        // to check when flow control window opens up (after receiving ACK/WINDOW_UPDATE)
-        if (!write_queues_.empty()) {
-            // Use a reasonable poll interval for blocked queues
-            // The main wake-up will come from select() on UDP recv,
-            // but this provides a fallback
-            static constexpr uint32_t kQueuePollIntervalMs = 100;
-            if (kQueuePollIntervalMs < next_timer_ms) {
-                next_timer_ms = kQueuePollIntervalMs;
-            }
-        }
     }
     
     // Ensure we don't return 0 (which would mean immediate re-trigger)
@@ -2058,6 +2087,9 @@ void QuicConnection::Impl::ProcessWriteQueue() {
                 on_write_error_(stream_id, 1, "stream reset by peer");
             }
             it = write_queues_.erase(it);
+            
+            // Clean up stream resources
+            CleanupStream(static_cast<uint64_t>(stream_id));
             continue;
         }
         
@@ -2112,6 +2144,10 @@ void QuicConnection::Impl::ProcessWriteQueue() {
                 }
                 // Remove this stream's queue
                 it = write_queues_.erase(it);
+                
+                // Clean up stream resources
+                CleanupStream(static_cast<uint64_t>(stream_id));
+                
                 goto next_stream;  // Use goto to break out of inner loop and skip ++it
             }
             
@@ -2130,6 +2166,25 @@ void QuicConnection::Impl::ProcessWriteQueue() {
         
         ++it;
         next_stream:;
+    }
+}
+
+void QuicConnection::Impl::CleanupStream(uint64_t stream_id) {
+    // Remove from reset/stop_sending tracking sets
+    reset_streams_.erase(stream_id);
+    stop_sending_streams_.erase(stream_id);
+    
+    // Remove flow control state
+    flow_controller_.RemoveStream(stream_id);
+    
+    // Close H3 stream (releases recv_buffer, pending_chunks, etc.)
+    if (h3_handler_) {
+        h3_handler_->CloseStream(stream_id);
+    }
+    
+    if (config_.enable_debug) {
+        ESP_LOGD(TAG, "CleanupStream: stream %llu resources released",
+                 (unsigned long long)stream_id);
     }
 }
 
@@ -2285,10 +2340,17 @@ void QuicConnection::Impl::OnFrameAck(const AckFrameData& ack_data) {
                                &newly_acked);
     
     // Update loss detector with RTT
+    // Note: Decode peer's ACK delay using peer's ack_delay_exponent (from transport params)
     if (app_tracker_.GetLatestRttUs() > 0) {
         loss_detector_.GetRttEstimator().OnRttSample(
             app_tracker_.GetLatestRttUs(),
-            ack_data.ack_delay << app_ack_mgr_.GetAckDelayExponent());
+            ack_data.ack_delay << peer_params_.ack_delay_exponent);
+    }
+    
+    // ACK frees up congestion window (bytes_in_flight decreases, cwnd may increase
+    // during slow start), try to send blocked data immediately
+    if (newly_acked > 0) {
+        ProcessWriteQueue();
     }
 }
 
@@ -2313,10 +2375,14 @@ void QuicConnection::Impl::OnFrameStream(uint64_t stream_id, uint64_t offset,
 
 void QuicConnection::Impl::OnFrameMaxData(uint64_t max_data) {
     flow_controller_.OnMaxDataReceived(max_data);
+    // Flow control window updated, immediately try to send blocked data
+    ProcessWriteQueue();
 }
 
 void QuicConnection::Impl::OnFrameMaxStreamData(uint64_t stream_id, uint64_t max_data) {
     flow_controller_.OnMaxStreamDataReceived(stream_id, max_data);
+    // Flow control window updated, immediately try to send blocked data
+    ProcessWriteQueue();
 }
 
 void QuicConnection::Impl::OnFrameDataBlocked(uint64_t limit) {

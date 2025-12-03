@@ -43,8 +43,9 @@ bool BuildAckFrame(BufferWriter* writer,
         return false;
     }
     
-    // ACK Delay (in 2^ack_delay_exponent microseconds, we use exponent=3)
-    if (!writer->WriteVarint(ack_delay >> 3)) {
+    // ACK Delay - already encoded by caller using ack_delay_exponent
+    // Note: Do NOT encode again here! Caller passes pre-encoded value.
+    if (!writer->WriteVarint(ack_delay)) {
         return false;
     }
     

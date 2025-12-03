@@ -38,39 +38,6 @@ size_t EncodePacketNumber(uint64_t pn, uint8_t* out) {
 }
 
 //=============================================================================
-// Packet Building - Helper
-//=============================================================================
-
-static size_t BuildLongHeader(PacketType type,
-                              const ConnectionId& dcid,
-                              const ConnectionId& scid,
-                              uint8_t* out) {
-    size_t offset = 0;
-    
-    // First byte: 1 | 1 | TT | Reserved | PN Len (will be set later)
-    // For now, use 2-byte PN length (0x01)
-    out[offset++] = 0xC0 | (static_cast<uint8_t>(type) << 4) | 0x01;
-    
-    // Version
-    out[offset++] = (kQuicVersion1 >> 24) & 0xFF;
-    out[offset++] = (kQuicVersion1 >> 16) & 0xFF;
-    out[offset++] = (kQuicVersion1 >> 8) & 0xFF;
-    out[offset++] = kQuicVersion1 & 0xFF;
-    
-    // DCID length + DCID
-    out[offset++] = static_cast<uint8_t>(dcid.Length());
-    std::memcpy(out + offset, dcid.Data(), dcid.Length());
-    offset += dcid.Length();
-    
-    // SCID length + SCID
-    out[offset++] = static_cast<uint8_t>(scid.Length());
-    std::memcpy(out + offset, scid.Data(), scid.Length());
-    offset += scid.Length();
-    
-    return offset;
-}
-
-//=============================================================================
 // Packet Building
 //=============================================================================
 

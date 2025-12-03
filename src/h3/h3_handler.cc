@@ -569,17 +569,23 @@ void H3Handler::HandleRequestStream(uint64_t stream_id,
         stream->response.complete = true;
         ESP_LOGD(TAG, "  Response complete! status=%d", stream->response.status);
         
-        // Notify stream data callback that stream is finished
-        if (on_stream_data_) {
-            on_stream_data_(stream_id, nullptr, 0, true);
-        }
-        
         // OnResponse callback should have been triggered when headers were received
         // Only trigger here if headers were never received (edge case)
         if (on_response_ && !stream->response_headers_sent) {
             ESP_LOGW(TAG, "  Stream finished but headers never received, triggering OnResponse anyway");
             stream->response_headers_sent = true;
             on_response_(stream_id, stream->response);
+        }
+        
+        // NOTE: Do NOT release buffers here!
+        // The on_stream_data_ callback (below) may trigger CleanupStream -> CloseStream,
+        // which deletes the entire H3Stream object. Accessing stream-> after the callback
+        // would cause use-after-free.
+        // Buffer memory is released when CloseStream deletes the H3Stream object.
+        
+        // Notify stream data callback that stream is finished (MUST be last!)
+        if (on_stream_data_) {
+            on_stream_data_(stream_id, nullptr, 0, true);
         }
     }
 }
