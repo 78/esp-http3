@@ -179,6 +179,12 @@ private:
     
     // Stream cleanup - releases memory associated with a completed stream
     void CleanupStream(uint64_t stream_id);
+    
+    // Retransmission - resend lost packets
+    void RetransmitLostPackets(const std::vector<SentPacketInfo*>& lost_packets);
+    
+    // PTO probe - send probe packets when PTO fires
+    void SendPtoProbe();
 
 private:
     // Write queue item
@@ -383,6 +389,15 @@ QuicConnection::Impl::Impl(SendCallback send_cb, const QuicConfig& config)
     // Initialize frame processor and set up callbacks
     frame_processor_.SetDebug(config_.enable_debug);
     SetupFrameProcessorCallbacks();
+    
+    // Set up loss detection callbacks for retransmission
+    loss_detector_.SetOnLoss([this](const std::vector<SentPacketInfo*>& lost_packets) {
+        RetransmitLostPackets(lost_packets);
+    });
+    
+    loss_detector_.SetOnPto([this]() {
+        SendPtoProbe();
+    });
 }
 
 QuicConnection::Impl::~Impl() = default;
@@ -1682,6 +1697,9 @@ bool QuicConnection::Impl::SendStreamData(uint64_t stream_id,
         return false;
     }
     
+    // Save frame data for potential retransmission
+    std::vector<uint8_t> frame_copy(frame_buf_, frame_buf_ + writer.Offset());
+    
     // Build 1-RTT packet
     uint64_t pn = app_tracker_.AllocatePacketNumber();
     size_t packet_len = quic::Build1RttPacket(dcid_, pn, false, crypto_.GetKeyPhase() != 0,
@@ -1693,7 +1711,8 @@ bool QuicConnection::Impl::SendStreamData(uint64_t stream_id,
         return false;
     }
     
-    app_tracker_.OnPacketSent(pn, current_time_us_, packet_len, true);
+    // Track sent packet with frame data for retransmission
+    app_tracker_.OnPacketSent(pn, current_time_us_, packet_len, true, std::move(frame_copy));
     loss_detector_.OnPacketSent(pn, current_time_us_, packet_len, true);
     
     // Update flow control
@@ -1748,14 +1767,17 @@ uint32_t QuicConnection::Impl::OnTimerTick(uint32_t elapsed_ms) {
         }
     }
     
-    // Check PTO (only when actively handshaking)
-    if (state_ == ConnectionState::kHandshakeInProgress &&
-        loss_detector_.OnTimerTick(current_time_us_)) {
-        // PTO fired - retransmit
-        if (config_.enable_debug) {
-            ESP_LOGI(TAG, "PTO fired, retransmitting Initial");
+    // Check PTO for handshake or application data
+    if (loss_detector_.OnTimerTick(current_time_us_)) {
+        if (state_ == ConnectionState::kHandshakeInProgress) {
+            // PTO fired during handshake - retransmit Initial
+            if (config_.enable_debug) {
+                ESP_LOGI(TAG, "PTO fired, retransmitting Initial");
+            }
+            SendInitialPacket(true);  // Mark as retransmit to avoid updating transcript hash
         }
-        SendInitialPacket(true);  // Mark as retransmit to avoid updating transcript hash
+        // Note: For connected state, the PTO callback (SendPtoProbe) is already invoked
+        // by loss_detector_.OnTimerTick() via the on_pto_ callback set in constructor
     }
     
     // Calculate precise time until next PTO (considering exponential backoff)
@@ -2188,6 +2210,124 @@ void QuicConnection::Impl::CleanupStream(uint64_t stream_id) {
 }
 
 //=============================================================================
+// Retransmission
+//=============================================================================
+
+void QuicConnection::Impl::RetransmitLostPackets(const std::vector<SentPacketInfo*>& lost_packets) {
+    if (!crypto_.HasApplicationKeys()) {
+        return;
+    }
+    
+    for (auto* pkt : lost_packets) {
+        if (pkt->frames.empty()) {
+            // No frame data saved, skip (e.g., ACK-only packets)
+            continue;
+        }
+        
+        if (config_.enable_debug) {
+            ESP_LOGI(TAG, "Retransmitting lost packet PN=%llu (%zu bytes of frames)",
+                     (unsigned long long)pkt->packet_number, pkt->frames.size());
+        }
+        
+        // Build new 1-RTT packet with the same frames
+        uint64_t new_pn = app_tracker_.AllocatePacketNumber();
+        size_t packet_len = quic::Build1RttPacket(dcid_, new_pn, false, crypto_.GetKeyPhase() != 0,
+                                                   pkt->frames.data(), pkt->frames.size(),
+                                                   crypto_.GetClientAppSecrets(),
+                                                   packet_buf_, sizeof(packet_buf_));
+        
+        if (packet_len == 0) {
+            ESP_LOGW(TAG, "Failed to build retransmit packet");
+            continue;
+        }
+        
+        // Copy frames for the new packet (in case it also gets lost)
+        std::vector<uint8_t> frame_copy = pkt->frames;
+        
+        // Track the new packet
+        app_tracker_.OnPacketSent(new_pn, current_time_us_, packet_len, true, std::move(frame_copy));
+        loss_detector_.OnPacketSent(new_pn, current_time_us_, packet_len, true);
+        
+        SendPacket(packet_buf_, packet_len);
+    }
+}
+
+void QuicConnection::Impl::SendPtoProbe() {
+    if (!crypto_.HasApplicationKeys()) {
+        return;
+    }
+    
+    // Get unacked packets that have frame data for potential retransmission
+    auto unacked = app_tracker_.GetUnackedPackets();
+    
+    if (config_.enable_debug) {
+        ESP_LOGI(TAG, "PTO fired for 1-RTT, %zu unacked packets", unacked.size());
+    }
+    
+    // Find the oldest unacked packet with frame data to retransmit
+    SentPacketInfo* oldest_with_data = nullptr;
+    for (auto* pkt : unacked) {
+        if (!pkt->frames.empty()) {
+            if (!oldest_with_data || pkt->sent_time_us < oldest_with_data->sent_time_us) {
+                oldest_with_data = pkt;
+            }
+        }
+    }
+    
+    if (oldest_with_data) {
+        // Retransmit the oldest unacked packet with frame data
+        if (config_.enable_debug) {
+            ESP_LOGI(TAG, "PTO probe: retransmitting PN=%llu",
+                     (unsigned long long)oldest_with_data->packet_number);
+        }
+        
+        uint64_t new_pn = app_tracker_.AllocatePacketNumber();
+        size_t packet_len = quic::Build1RttPacket(dcid_, new_pn, false, crypto_.GetKeyPhase() != 0,
+                                                   oldest_with_data->frames.data(),
+                                                   oldest_with_data->frames.size(),
+                                                   crypto_.GetClientAppSecrets(),
+                                                   packet_buf_, sizeof(packet_buf_));
+        
+        if (packet_len > 0) {
+            std::vector<uint8_t> frame_copy = oldest_with_data->frames;
+            app_tracker_.OnPacketSent(new_pn, current_time_us_, packet_len, true, std::move(frame_copy));
+            loss_detector_.OnPacketSent(new_pn, current_time_us_, packet_len, true);
+            SendPacket(packet_buf_, packet_len);
+        }
+    } else {
+        // No data to retransmit - check if we have any unacked ack-eliciting packets
+        // If not, we don't need to send PING as there's nothing waiting for ACK
+        if (unacked.empty()) {
+            if (config_.enable_debug) {
+                ESP_LOGI(TAG, "PTO probe: no unacked packets, clearing PTO timer");
+            }
+            // Clear PTO timer since there's nothing to probe
+            loss_detector_.ClearPtoTimer();
+            return;
+        }
+        
+        // We have unacked packets but none have frame data (e.g., pure ACK packets
+        // that don't need retransmission). Send PING to elicit ACK.
+        if (config_.enable_debug) {
+            ESP_LOGI(TAG, "PTO probe: sending PING (no data to retransmit)");
+        }
+        
+        uint8_t ping_frame[1] = {0x01};  // PING frame
+        uint64_t pn = app_tracker_.AllocatePacketNumber();
+        size_t packet_len = quic::Build1RttPacket(dcid_, pn, false, crypto_.GetKeyPhase() != 0,
+                                                   ping_frame, 1,
+                                                   crypto_.GetClientAppSecrets(),
+                                                   packet_buf_, sizeof(packet_buf_));
+        
+        if (packet_len > 0) {
+            app_tracker_.OnPacketSent(pn, current_time_us_, packet_len, true);
+            loss_detector_.OnPacketSent(pn, current_time_us_, packet_len, true);
+            SendPacket(packet_buf_, packet_len);
+        }
+    }
+}
+
+//=============================================================================
 // Flow Control Checks (borrowed from Python version)
 //=============================================================================
 
@@ -2338,13 +2478,19 @@ void QuicConnection::Impl::OnFrameAck(const AckFrameData& ack_data) {
                                current_time_us_,
                                &newly_acked);
     
-    // Update loss detector with RTT
+    // Update loss detector with RTT and detect lost packets
     // Note: Decode peer's ACK delay using peer's ack_delay_exponent (from transport params)
+    uint64_t decoded_ack_delay = ack_data.ack_delay << peer_params_.ack_delay_exponent;
+    
     if (app_tracker_.GetLatestRttUs() > 0) {
         loss_detector_.GetRttEstimator().OnRttSample(
             app_tracker_.GetLatestRttUs(),
-            ack_data.ack_delay << peer_params_.ack_delay_exponent);
+            decoded_ack_delay);
     }
+    
+    // Detect lost packets and trigger retransmission via on_loss_ callback
+    loss_detector_.OnAckReceived(ack_data.largest_ack, decoded_ack_delay,
+                                  current_time_us_, &app_tracker_);
     
     // ACK frees up congestion window (bytes_in_flight decreases, cwnd may increase
     // during slow start), try to send blocked data immediately

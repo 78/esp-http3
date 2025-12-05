@@ -191,6 +191,16 @@ public:
     void SetMaxAckDelay(uint64_t max_ack_delay_ms) {
         max_ack_delay_us_ = max_ack_delay_ms * 1000;
     }
+    
+    /**
+     * @brief Clear PTO timer state
+     * 
+     * Call this when there are no more ack-eliciting packets in flight.
+     */
+    void ClearPtoTimer() {
+        last_ack_eliciting_time_us_ = 0;
+        pto_count_ = 0;
+    }
 
 private:
     RttEstimator rtt_;
