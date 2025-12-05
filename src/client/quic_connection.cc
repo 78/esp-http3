@@ -1729,9 +1729,9 @@ uint32_t QuicConnection::Impl::OnTimerTick(uint32_t elapsed_ms) {
         }
     }
     
-    // Check handshake timeout
-    if (!handshake_complete_) {
-        uint64_t handshake_deadline_us = handshake_start_time_us_ + 
+    // Check handshake timeout (only when actively handshaking)
+    if (state_ == ConnectionState::kHandshakeInProgress) {
+        uint64_t handshake_deadline_us = handshake_start_time_us_ +
                                          config_.handshake_timeout_ms * 1000ULL;
         if (current_time_us_ > handshake_deadline_us) {
             state_ = ConnectionState::kFailed;
@@ -1748,15 +1748,14 @@ uint32_t QuicConnection::Impl::OnTimerTick(uint32_t elapsed_ms) {
         }
     }
     
-    // Check PTO
-    if (loss_detector_.OnTimerTick(current_time_us_)) {
+    // Check PTO (only when actively handshaking)
+    if (state_ == ConnectionState::kHandshakeInProgress &&
+        loss_detector_.OnTimerTick(current_time_us_)) {
         // PTO fired - retransmit
-        if (!handshake_complete_) {
-            if (config_.enable_debug) {
-                ESP_LOGI(TAG, "PTO fired, retransmitting Initial");
-            }
-            SendInitialPacket(true);  // Mark as retransmit to avoid updating transcript hash
+        if (config_.enable_debug) {
+            ESP_LOGI(TAG, "PTO fired, retransmitting Initial");
         }
+        SendInitialPacket(true);  // Mark as retransmit to avoid updating transcript hash
     }
     
     // Calculate precise time until next PTO (considering exponential backoff)

@@ -375,7 +375,21 @@ void H3Handler::HandleUniStreamType(uint64_t stream_id) {
         return;
     }
     
-    // First byte is stream type
+    // Skip if stream type already identified - forward to appropriate handler
+    if (stream->is_control) {
+        // Already identified as control stream, forward new data
+        HandleControlStream(stream_id, 
+                            stream->recv_buffer.data(),
+                            stream->recv_buffer.size());
+        return;
+    }
+    if (stream->is_qpack_encoder || stream->is_qpack_decoder) {
+        // QPACK streams data is ignored (we don't use dynamic table)
+        stream->recv_buffer.clear();
+        return;
+    }
+    
+    // First byte is stream type (only for new streams)
     uint8_t stream_type = stream->recv_buffer[0];
     
     switch (stream_type) {
