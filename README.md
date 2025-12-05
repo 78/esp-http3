@@ -1,25 +1,25 @@
 # ESP-HTTP3
 
-ESP32 平台的 QUIC/HTTP3 客户端库，实现了 RFC 9000 (QUIC) 和 RFC 9114 (HTTP/3) 协议。
+A QUIC/HTTP3 client library for ESP32 platform, implementing RFC 9000 (QUIC) and RFC 9114 (HTTP/3) protocols.
 
-## 特性
+## Features
 
-- ✅ QUIC v1 传输协议
-- ✅ TLS 1.3 握手（使用 mbedtls）
-- ✅ HTTP/3 请求/响应
-- ✅ 流多路复用
-- ✅ 流控
-- ✅ 丢包检测与恢复
-- ✅ 单线程事件驱动模型，无需多线程
+- ✅ QUIC v1 transport protocol
+- ✅ TLS 1.3 handshake (using mbedtls)
+- ✅ HTTP/3 request/response
+- ✅ Stream multiplexing
+- ✅ Flow control
+- ✅ Packet loss detection and recovery
+- ✅ Single-threaded event-driven model, no multi-threading required
 
-## 设计原则
+## Design Principles
 
-- **用户提供传输层**：通过回调函数发送 UDP 数据
-- **用户驱动事件循环**：调用 `ProcessReceivedData()` 处理接收的数据，调用 `OnTimerTick()` 驱动定时器
+- **User-provided transport layer**: Send UDP data through callback functions
+- **User-driven event loop**: Call `ProcessReceivedData()` to process received data, call `OnTimerTick()` to drive timers
 
-## 并发测试示例
+## Concurrent Test Example
 
-以下是一个并发测试的输出示例，展示了在同一个 QUIC 连接上同时发送两个 HTTP/3 请求（`GET /` 和 `GET /pocket-sage/health`）的能力：
+The following is a concurrent test output example, demonstrating the ability to send two HTTP/3 requests simultaneously (`GET /` and `GET /pocket-sage/health`) on the same QUIC connection:
 
 ```
 I (5003) HTTPS_DEMO: === QUIC/HTTP3 WiFi Concurrent Test Start ===
@@ -82,15 +82,15 @@ I (5333) HTTPS_DEMO: >>> Disconnected: code=0, reason=
 I (5333) HTTPS_DEMO: === QUIC/HTTP3 WiFi Concurrent Test Complete ===
 ```
 
-测试结果显示：
-- ✅ 成功建立 QUIC 连接
-- ✅ 在同一连接上并发发送两个请求（Stream 0 和 Stream 4）
-- ✅ 两个响应都成功接收（均在 20ms 内完成）
-- ✅ 连接统计：发送 13 个数据包，接收 10 个数据包
+Test results show:
+- ✅ Successfully established QUIC connection
+- ✅ Concurrently sent two requests on the same connection (Stream 0 and Stream 4)
+- ✅ Both responses successfully received (both completed within 20ms)
+- ✅ Connection statistics: 13 packets sent, 10 packets received
 
-## WiFi 使用示例
+## WiFi Usage Example
 
-以下示例展示如何在 ESP32 上使用 WiFi 连接进行 QUIC/HTTP3 通信：
+The following example demonstrates how to use WiFi connection for QUIC/HTTP3 communication on ESP32:
 
 ```cpp
 #include "esp_http3.h"
@@ -105,7 +105,7 @@ I (5333) HTTPS_DEMO: === QUIC/HTTP3 WiFi Concurrent Test Complete ===
 
 static const char *TAG = "QUIC_DEMO";
 
-// WiFi 事件组位定义
+// WiFi event group bit definitions
 #define WIFI_CONNECTED_BIT BIT0
 #define WIFI_FAIL_BIT      BIT1
 
@@ -115,7 +115,7 @@ static const int WIFI_MAX_RETRY = 5;
 static char s_ip_str[16] = {0};
 
 /**
- * WiFi 事件处理器
+ * WiFi event handler
  */
 static void wifi_event_handler(void* arg, esp_event_base_t event_base,
                                int32_t event_id, void* event_data) {
@@ -140,12 +140,12 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base,
 }
 
 /**
- * 初始化 WiFi 并等待连接（使用 ESP-IDF 标准 API）
+ * Initialize WiFi and wait for connection (using ESP-IDF standard API)
  */
 static bool InitWifi(const char* ssid, const char* password) {
     ESP_LOGI(TAG, "Initializing WiFi...");
     
-    // 初始化 NVS
+    // Initialize NVS
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         ESP_ERROR_CHECK(nvs_flash_erase());
@@ -153,23 +153,23 @@ static bool InitWifi(const char* ssid, const char* password) {
     }
     ESP_ERROR_CHECK(ret);
     
-    // 创建事件组
+    // Create event group
     s_wifi_event_group = xEventGroupCreate();
     
-    // 初始化网络接口
+    // Initialize network interface
     ESP_ERROR_CHECK(esp_netif_init());
     
-    // 创建默认事件循环
+    // Create default event loop
     ESP_ERROR_CHECK(esp_event_loop_create_default());
     
-    // 创建默认 WiFi Station 网络接口
+    // Create default WiFi Station network interface
     esp_netif_create_default_wifi_sta();
     
-    // 初始化 WiFi 配置
+    // Initialize WiFi configuration
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
     
-    // 注册事件处理器
+    // Register event handlers
     esp_event_handler_instance_t instance_any_id;
     esp_event_handler_instance_t instance_got_ip;
     ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT,
@@ -183,7 +183,7 @@ static bool InitWifi(const char* ssid, const char* password) {
                                                         NULL,
                                                         &instance_got_ip));
     
-    // 配置 WiFi Station 模式
+    // Configure WiFi Station mode
     wifi_config_t wifi_config = {};
     strlcpy((char*)wifi_config.sta.ssid, ssid, sizeof(wifi_config.sta.ssid));
     strlcpy((char*)wifi_config.sta.password, password, sizeof(wifi_config.sta.password));
@@ -197,7 +197,7 @@ static bool InitWifi(const char* ssid, const char* password) {
     
     ESP_LOGI(TAG, "WiFi initialization finished. Connecting to %s...", ssid);
     
-    // 等待连接完成（超时 30 秒）
+    // Wait for connection to complete (30 second timeout)
     EventBits_t bits = xEventGroupWaitBits(s_wifi_event_group,
                                            WIFI_CONNECTED_BIT | WIFI_FAIL_BIT,
                                            pdFALSE,
@@ -217,9 +217,9 @@ static bool InitWifi(const char* ssid, const char* password) {
 }
 
 /**
- * QUIC/HTTP3 WiFi 测试函数
+ * QUIC/HTTP3 WiFi test function
  * 
- * 使用标准 lwip socket 进行 UDP 通信
+ * Uses standard lwip socket for UDP communication
  */
 void TestQuicHttp3Wifi(const char* hostname, uint16_t port, const char* path) {
     using namespace esp_http3;
@@ -227,7 +227,7 @@ void TestQuicHttp3Wifi(const char* hostname, uint16_t port, const char* path) {
     ESP_LOGI(TAG, "=== QUIC/HTTP3 WiFi Test Start ===");
     ESP_LOGI(TAG, "Target: %s:%u%s", hostname, port, path);
     
-    // 1. DNS 解析
+    // 1. DNS resolution
     struct hostent* he = gethostbyname(hostname);
     if (!he) {
         ESP_LOGE(TAG, "DNS lookup failed for %s", hostname);
@@ -239,25 +239,25 @@ void TestQuicHttp3Wifi(const char* hostname, uint16_t port, const char* path) {
     inet_ntop(AF_INET, addr, ip_str, sizeof(ip_str));
     ESP_LOGI(TAG, "Resolved %s to %s", hostname, ip_str);
     
-    // 2. 创建 UDP socket
+    // 2. Create UDP socket
     int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     if (sock < 0) {
         ESP_LOGE(TAG, "Failed to create socket: %d", errno);
         return;
     }
     
-    // 设置非阻塞模式
+    // Set non-blocking mode
     int flags = fcntl(sock, F_GETFL, 0);
     fcntl(sock, F_SETFL, flags | O_NONBLOCK);
     
-    // 服务器地址
+    // Server address
     struct sockaddr_in server_addr;
     memset(&server_addr, 0, sizeof(server_addr));
     server_addr.sin_family = AF_INET;
     server_addr.sin_port = htons(port);
     server_addr.sin_addr = *addr;
     
-    // 连接 (对于 UDP，这只是设置默认目标地址)
+    // Connect (for UDP, this just sets the default destination address)
     if (connect(sock, (struct sockaddr*)&server_addr, sizeof(server_addr)) < 0) {
         ESP_LOGE(TAG, "Failed to connect socket: %d", errno);
         close(sock);
@@ -265,7 +265,7 @@ void TestQuicHttp3Wifi(const char* hostname, uint16_t port, const char* path) {
     }
     ESP_LOGI(TAG, "UDP socket connected");
     
-    // 3. 配置 QUIC
+    // 3. Configure QUIC
     QuicConfig config;
     config.hostname = hostname;
     config.port = port;
@@ -273,9 +273,9 @@ void TestQuicHttp3Wifi(const char* hostname, uint16_t port, const char* path) {
     config.idle_timeout_ms = 60000;
     config.enable_debug = false;
     
-    // 4. 创建 QUIC 连接，传入发送回调
+    // 4. Create QUIC connection, pass send callback
     auto conn = std::make_unique<QuicConnection>(
-        // SendCallback: 通过 socket 发送 UDP 数据
+        // SendCallback: Send UDP data through socket
         [sock](const uint8_t* data, size_t len) -> int {
             int sent = send(sock, data, len, 0);
             if (sent < 0) {
@@ -286,7 +286,7 @@ void TestQuicHttp3Wifi(const char* hostname, uint16_t port, const char* path) {
         config
     );
     
-    // 5. 设置事件回调
+    // 5. Set event callbacks
     bool connected = false;
     bool response_received = false;
     int response_status = 0;
@@ -321,7 +321,7 @@ void TestQuicHttp3Wifi(const char* hostname, uint16_t port, const char* path) {
         ESP_LOGI(TAG, ">>> Disconnected: code=%d, reason=%s", code, reason.c_str());
     });
     
-    // 6. 开始握手
+    // 6. Start handshake
     ESP_LOGI(TAG, "Starting QUIC handshake...");
     if (!conn->StartHandshake()) {
         ESP_LOGE(TAG, "Failed to start handshake");
@@ -329,14 +329,14 @@ void TestQuicHttp3Wifi(const char* hostname, uint16_t port, const char* path) {
         return;
     }
     
-    // 7. 事件循环参数
+    // 7. Event loop parameters
     const int tick_interval_ms = 10;
     const TickType_t tick_wait = pdMS_TO_TICKS(tick_interval_ms);
     uint8_t recv_buffer[1500];
     
-    // Helper: 执行一次事件循环迭代
+    // Helper: Execute one event loop iteration
     auto run_event_loop_once = [&]() {
-        // 接收 UDP 数据（非阻塞）
+        // Receive UDP data (non-blocking)
         while (true) {
             int recv_len = recv(sock, recv_buffer, sizeof(recv_buffer), 0);
             if (recv_len > 0) {
@@ -349,14 +349,14 @@ void TestQuicHttp3Wifi(const char* hostname, uint16_t port, const char* path) {
             }
         }
         
-        // 等待一个 tick 间隔
+        // Wait for one tick interval
         vTaskDelay(tick_wait);
         
-        // 执行定时器 tick
+        // Execute timer tick
         conn->OnTimerTick(tick_interval_ms);
     };
     
-    // 8. 事件循环：等待连接
+    // 8. Event loop: Wait for connection
     ESP_LOGI(TAG, "Waiting for handshake...");
     for (int wait_ms = 0; !connected && wait_ms < 20000; wait_ms += tick_interval_ms) {
         run_event_loop_once();
@@ -372,7 +372,7 @@ void TestQuicHttp3Wifi(const char* hostname, uint16_t port, const char* path) {
         return;
     }
     
-    // 9. 发送 HTTP/3 GET 请求
+    // 9. Send HTTP/3 GET request
     ESP_LOGI(TAG, "Sending HTTP/3 GET request to %s", path);
     int stream_id = conn->SendRequest("GET", path);
     if (stream_id < 0) {
@@ -383,7 +383,7 @@ void TestQuicHttp3Wifi(const char* hostname, uint16_t port, const char* path) {
     }
     ESP_LOGI(TAG, "Request sent on stream %d", stream_id);
     
-    // 10. 事件循环：等待响应
+    // 10. Event loop: Wait for response
     ESP_LOGI(TAG, "Waiting for response...");
     for (int wait_ms = 0; !response_received && wait_ms < 10000; wait_ms += tick_interval_ms) {
         run_event_loop_once();
@@ -392,7 +392,7 @@ void TestQuicHttp3Wifi(const char* hostname, uint16_t port, const char* path) {
         }
     }
     
-    // 11. 打印统计信息
+    // 11. Print statistics
     auto stats = conn->GetStats();
     ESP_LOGI(TAG, "=== Connection Stats ===");
     ESP_LOGI(TAG, "  Packets sent: %lu", stats.packets_sent);
@@ -401,7 +401,7 @@ void TestQuicHttp3Wifi(const char* hostname, uint16_t port, const char* path) {
     ESP_LOGI(TAG, "  Bytes received: %lu", stats.bytes_received);
     ESP_LOGI(TAG, "  RTT: %lu ms", stats.rtt_ms);
     
-    // 12. 检查结果
+    // 12. Check results
     if (response_received) {
         ESP_LOGI(TAG, "=== Test PASSED ===");
         ESP_LOGI(TAG, "HTTP Status: %d", response_status);
@@ -409,7 +409,7 @@ void TestQuicHttp3Wifi(const char* hostname, uint16_t port, const char* path) {
         ESP_LOGW(TAG, "=== Test INCOMPLETE (no response) ===");
     }
     
-    // 13. 优雅关闭
+    // 13. Graceful shutdown
     conn->Close();
     close(sock);
     
@@ -417,48 +417,48 @@ void TestQuicHttp3Wifi(const char* hostname, uint16_t port, const char* path) {
 }
 
 extern "C" void app_main(void) {
-    // 注意：app_main 任务的堆栈大小需要在 sdkconfig 中配置
-    // 设置 CONFIG_ESP_MAIN_TASK_STACK_SIZE 至少为 8192 (8KB)
-    // 或者创建独立任务时使用 xTaskCreate() 并指定至少 8192 字节的堆栈
+    // Note: The stack size of the app_main task needs to be configured in sdkconfig
+    // Set CONFIG_ESP_MAIN_TASK_STACK_SIZE to at least 8192 (8KB)
+    // Or when creating an independent task, use xTaskCreate() and specify at least 8192 bytes of stack
     
     ESP_LOGI(TAG, "QUIC/HTTP3 Demo Starting...");
     
-    // 初始化并连接 WiFi（使用 ESP-IDF 标准 API）
+    // Initialize and connect WiFi (using ESP-IDF standard API)
     if (!InitWifi("YOUR_SSID", "YOUR_PASSWORD")) {
         ESP_LOGE(TAG, "Failed to connect WiFi");
         return;
     }
     
-    // 测试 QUIC/HTTP3 客户端 (使用 WiFi + BSD socket)
+    // Test QUIC/HTTP3 client (using WiFi + BSD socket)
     TestQuicHttp3Wifi("api.tenclass.net", 443, "/pocket-sage/health");
     
     ESP_LOGI(TAG, "Demo completed");
     
-    // 保持运行
+    // Keep running
     while (1) {
         vTaskDelay(pdMS_TO_TICKS(10000));
     }
 }
 ```
 
-## 关键步骤说明
+## Key Steps Explanation
 
-1. **WiFi 初始化**：使用 ESP-IDF 标准 WiFi API (`esp_wifi_init`, `esp_wifi_set_config`, `esp_wifi_start`, `esp_wifi_connect`) 初始化并连接 WiFi
-2. **DNS 解析**：使用 `gethostbyname()` 解析主机名
-3. **UDP Socket 创建**：创建非阻塞 UDP socket 并连接到服务器
-4. **QUIC 连接配置**：创建 `QuicConfig` 并设置主机名、端口等参数
-5. **创建 QuicConnection**：传入发送回调函数（通过 socket 发送数据）
-6. **设置事件回调**：设置连接、响应、断开连接的回调函数
-7. **开始握手**：调用 `StartHandshake()` 启动 QUIC 握手
-8. **事件循环**：
-   - 接收 UDP 数据并调用 `ProcessReceivedData()`
-   - 定期调用 `OnTimerTick()` 驱动定时器
-   - 等待握手完成
-9. **发送请求**：握手完成后调用 `SendRequest()` 发送 HTTP/3 请求
-10. **等待响应**：在事件循环中等待响应回调
-11. **清理资源**：关闭连接和 socket
+1. **WiFi Initialization**: Initialize and connect WiFi using ESP-IDF standard WiFi API (`esp_wifi_init`, `esp_wifi_set_config`, `esp_wifi_start`, `esp_wifi_connect`)
+2. **DNS Resolution**: Use `gethostbyname()` to resolve hostname
+3. **UDP Socket Creation**: Create non-blocking UDP socket and connect to server
+4. **QUIC Connection Configuration**: Create `QuicConfig` and set hostname, port, and other parameters
+5. **Create QuicConnection**: Pass send callback function (send data through socket)
+6. **Set Event Callbacks**: Set callbacks for connection, response, and disconnection
+7. **Start Handshake**: Call `StartHandshake()` to initiate QUIC handshake
+8. **Event Loop**:
+   - Receive UDP data and call `ProcessReceivedData()`
+   - Periodically call `OnTimerTick()` to drive timers
+   - Wait for handshake completion
+9. **Send Request**: After handshake completes, call `SendRequest()` to send HTTP/3 request
+10. **Wait for Response**: Wait for response callback in event loop
+11. **Cleanup Resources**: Close connection and socket
 
-## 输出示例
+## Output Example
 
 ```
 I (3993) QUIC_DEMO: === QUIC/HTTP3 WiFi Test Start ===
@@ -487,47 +487,46 @@ I (4263) QUIC_DEMO: === Test PASSED ===
 I (4263) QUIC_DEMO: HTTP Status: 200
 ```
 
-## API 参考
+## API Reference
 
-主要 API 接口：
+Main API interfaces:
 
-- `QuicConnection`: QUIC 连接主类
-  - `StartHandshake()`: 开始 QUIC 握手
-  - `SendRequest(method, path)`: 发送 HTTP/3 请求
-  - `ProcessReceivedData(data, len)`: 处理接收到的 UDP 数据
-  - `OnTimerTick(ms)`: 驱动定时器（需要定期调用）
-  - `GetStats()`: 获取连接统计信息
-  - `Close()`: 关闭连接
+- `QuicConnection`: Main QUIC connection class
+  - `StartHandshake()`: Start QUIC handshake
+  - `SendRequest(method, path)`: Send HTTP/3 request
+  - `ProcessReceivedData(data, len)`: Process received UDP data
+  - `OnTimerTick(ms)`: Drive timers (needs to be called periodically)
+  - `GetStats()`: Get connection statistics
+  - `Close()`: Close connection
 
-- `QuicConfig`: 连接配置
-  - `hostname`: 目标主机名（用于 SNI）
-  - `port`: 目标端口
-  - `handshake_timeout_ms`: 握手超时时间
-  - `idle_timeout_ms`: 空闲超时时间
+- `QuicConfig`: Connection configuration
+  - `hostname`: Target hostname (for SNI)
+  - `port`: Target port
+  - `handshake_timeout_ms`: Handshake timeout
+  - `idle_timeout_ms`: Idle timeout
 
-- 事件回调：
-  - `SetOnConnected(callback)`: 连接建立回调
-  - `SetOnResponse(callback)`: HTTP/3 响应回调
-  - `SetOnDisconnected(callback)`: 断开连接回调
+- Event callbacks:
+  - `SetOnConnected(callback)`: Connection established callback
+  - `SetOnResponse(callback)`: HTTP/3 response callback
+  - `SetOnDisconnected(callback)`: Disconnection callback
 
-详细 API 文档请参考头文件注释。
+For detailed API documentation, please refer to header file comments.
 
-## 注意事项
+## Notes
 
-1. **任务堆栈大小**：调用 QUIC/HTTP3 库的任务堆栈需要设置为至少 **8KB**。如果使用 `app_main()` 任务，需要在 `sdkconfig` 中设置 `CONFIG_ESP_MAIN_TASK_STACK_SIZE` 至少为 8192 字节，或者创建独立任务时使用 `xTaskCreate()` 并指定至少 8192 字节的堆栈大小
-2. **事件循环**：必须定期调用 `OnTimerTick()`（建议每 10-50ms）以驱动内部定时器
-3. **非阻塞 I/O**：UDP socket 应设置为非阻塞模式
-4. **数据接收**：需要在事件循环中持续接收 UDP 数据并调用 `ProcessReceivedData()`
-5. **单线程模型**：所有操作都在调用者线程中同步执行，无需额外的线程或锁
-6. **资源清理**：使用完毕后应调用 `Close()` 关闭连接
+1. **Task Stack Size**: The task stack size for calling QUIC/HTTP3 library needs to be set to at least **8KB**. If using the `app_main()` task, set `CONFIG_ESP_MAIN_TASK_STACK_SIZE` in `sdkconfig` to at least 8192 bytes, or when creating an independent task, use `xTaskCreate()` and specify at least 8192 bytes of stack size
+2. **Event Loop**: Must periodically call `OnTimerTick()` (recommended every 10-50ms) to drive internal timers
+3. **Non-blocking I/O**: UDP socket should be set to non-blocking mode
+4. **Data Reception**: Need to continuously receive UDP data in the event loop and call `ProcessReceivedData()`
+5. **Single-threaded Model**: All operations execute synchronously in the caller's thread, no additional threads or locks required
+6. **Resource Cleanup**: Should call `Close()` to close the connection after use
 
-## 依赖
+## Dependencies
 
 - ESP-IDF v5.4+
-- mbedtls (用于 TLS 1.3)
-- lwip (用于网络栈)
+- mbedtls (for TLS 1.3)
+- lwip (for network stack)
 
-## 许可证
+## License
 
-[根据项目许可证]
-
+Apache-2.0 License
