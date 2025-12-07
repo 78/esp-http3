@@ -185,6 +185,13 @@ private:
     
     // PTO probe - send probe packets when PTO fires
     void SendPtoProbe();
+    
+    // Connection ID management
+    void RetirePeerConnectionIdsPriorTo(uint64_t retire_prior_to);
+    bool SendRetireConnectionId(uint64_t sequence_number);
+    bool SendNewConnectionId();
+    quic::ConnectionId* GetActivePeerConnectionId();
+    bool IsStatelessReset(const uint8_t* data, size_t len);
 
 private:
     // Write queue item
@@ -272,6 +279,23 @@ private:
     quic::ConnectionId dcid_;           // Destination CID (server's)
     quic::ConnectionId scid_;           // Source CID (ours)
     quic::ConnectionId initial_dcid_;   // Original DCID
+    
+    // Multi-CID support: Peer's connection IDs (sequence -> CID info)
+    struct PeerConnectionIdInfo {
+        quic::ConnectionId cid;
+        uint8_t stateless_reset_token[16];
+        bool retired = false;
+    };
+    std::map<uint64_t, PeerConnectionIdInfo> peer_connection_ids_;
+    uint64_t peer_retire_prior_to_ = 0;
+    
+    // Our alternative connection IDs (sequence -> CID info)
+    struct LocalConnectionIdInfo {
+        quic::ConnectionId cid;
+        uint8_t stateless_reset_token[16];
+    };
+    std::map<uint64_t, LocalConnectionIdInfo> local_connection_ids_;
+    uint64_t local_cid_sequence_ = 0;  // Next sequence number for NEW_CONNECTION_ID
     
     // Crypto manager (replaces scattered crypto state)
     CryptoManager crypto_;
@@ -767,14 +791,13 @@ bool QuicConnection::Impl::Process1RttPacket(uint8_t* data, size_t len) {
     
     if (payload_len == 0) {
         // Check if this is a Stateless Reset (RFC 9000 Section 10.3)
-        // Stateless Reset: at least 21 bytes, last 16 bytes are reset token
-        if (len >= 21 && peer_params_.stateless_reset_token_present) {
-            const uint8_t* token_in_packet = data + len - 16;
-            if (std::memcmp(token_in_packet, peer_params_.stateless_reset_token, 16) == 0) {
-                ESP_LOGW(TAG, "Received Stateless Reset from server - connection was closed by peer");
-                Close(0, "stateless reset received");
-                return false;
-            }
+        // Uses IsStatelessReset() which checks all known reset tokens from:
+        // - Transport parameters (initial handshake)
+        // - NEW_CONNECTION_ID frames (additional CIDs)
+        if (IsStatelessReset(data, len)) {
+            ESP_LOGW(TAG, "Received Stateless Reset from server - connection was closed by peer");
+            Close(0, "stateless reset received");
+            return false;
         }
         
         // Track consecutive decrypt failures - likely means server closed connection
@@ -1398,6 +1421,9 @@ void QuicConnection::Impl::ProcessHandshakeDoneFrame() {
         // Send SETTINGS
         h3_handler_->SendSettings();
         h3_initialized_ = true;
+        
+        // Send our first alternative connection ID (like Python version)
+        SendNewConnectionId();
     }
     
     if (on_connected_) {
@@ -2462,6 +2488,23 @@ void QuicConnection::Impl::SetupFrameProcessorCallbacks() {
     frame_processor_.SetOnStopSending([this](const StopSendingData& data) {
         stop_sending_streams_.insert(data.stream_id);
     });
+    
+    // RETIRE_CONNECTION_ID frame callback
+    // Peer is retiring one of our connection IDs
+    frame_processor_.SetOnRetireConnectionId([this](uint64_t sequence_number) {
+        // Remove the retired connection ID from our list
+        auto it = local_connection_ids_.find(sequence_number);
+        if (it != local_connection_ids_.end()) {
+            if (config_.enable_debug) {
+                ESP_LOGI(TAG, "Peer retired our connection ID seq=%llu", 
+                         (unsigned long long)sequence_number);
+            }
+            local_connection_ids_.erase(it);
+            
+            // Optionally send a new connection ID to replace the retired one
+            SendNewConnectionId();
+        }
+    });
 }
 
 //=============================================================================
@@ -2553,11 +2596,163 @@ void QuicConnection::Impl::OnFrameHandshakeDone() {
 }
 
 void QuicConnection::Impl::OnFrameNewConnectionId(const NewConnectionIdData& data) {
-    // Store new connection ID for potential migration (not implemented in v1)
     if (config_.enable_debug) {
-        ESP_LOGI(TAG, "NEW_CONNECTION_ID: seq=%llu, cid_len=%zu",
-                 (unsigned long long)data.sequence_number, data.connection_id.length);
+        ESP_LOGI(TAG, "NEW_CONNECTION_ID: seq=%llu, retire_prior=%llu, cid_len=%zu",
+                 (unsigned long long)data.sequence_number,
+                 (unsigned long long)data.retire_prior_to,
+                 data.connection_id.length);
     }
+    
+    // Store the new peer connection ID
+    PeerConnectionIdInfo info;
+    info.cid = data.connection_id;
+    std::memcpy(info.stateless_reset_token, data.stateless_reset_token, 16);
+    info.retired = false;
+    
+    peer_connection_ids_[data.sequence_number] = info;
+    
+    // Handle retire_prior_to - retire old connection IDs
+    if (data.retire_prior_to > peer_retire_prior_to_) {
+        peer_retire_prior_to_ = data.retire_prior_to;
+        RetirePeerConnectionIdsPriorTo(data.retire_prior_to);
+    }
+}
+
+//=============================================================================
+// Connection ID Management
+//=============================================================================
+
+void QuicConnection::Impl::RetirePeerConnectionIdsPriorTo(uint64_t retire_prior_to) {
+    for (auto& [seq, info] : peer_connection_ids_) {
+        if (seq < retire_prior_to && !info.retired) {
+            info.retired = true;
+            SendRetireConnectionId(seq);
+            
+            if (config_.enable_debug) {
+                ESP_LOGI(TAG, "Retiring peer connection ID seq=%llu", (unsigned long long)seq);
+            }
+        }
+    }
+}
+
+bool QuicConnection::Impl::SendRetireConnectionId(uint64_t sequence_number) {
+    if (!crypto_.HasApplicationKeys()) {
+        return false;
+    }
+    
+    // Build RETIRE_CONNECTION_ID frame
+    quic::BufferWriter writer(frame_buf_, sizeof(frame_buf_));
+    if (!quic::BuildRetireConnectionIdFrame(&writer, sequence_number)) {
+        return false;
+    }
+    
+    // Build 1-RTT packet
+    uint64_t pn = app_tracker_.AllocatePacketNumber();
+    size_t packet_len = quic::Build1RttPacket(dcid_, pn, false, crypto_.GetKeyPhase() != 0,
+                                               frame_buf_, writer.Offset(),
+                                               crypto_.GetClientAppSecrets(),
+                                               packet_buf_, sizeof(packet_buf_));
+    
+    if (packet_len == 0) {
+        return false;
+    }
+    
+    if (config_.enable_debug) {
+        ESP_LOGI(TAG, "Sending RETIRE_CONNECTION_ID seq=%llu", (unsigned long long)sequence_number);
+    }
+    
+    app_tracker_.OnPacketSent(pn, current_time_us_, packet_len, true);
+    return SendPacket(packet_buf_, packet_len);
+}
+
+bool QuicConnection::Impl::SendNewConnectionId() {
+    if (!crypto_.HasApplicationKeys()) {
+        return false;
+    }
+    
+    // Generate a new connection ID
+    uint64_t seq = ++local_cid_sequence_;
+    LocalConnectionIdInfo info;
+    
+    // Generate random CID (8 bytes)
+    for (size_t i = 0; i < 8; i += 4) {
+        uint32_t random_word = esp_random();
+        size_t copy_len = std::min(size_t(4), 8 - i);
+        std::memcpy(info.cid.data.data() + i, &random_word, copy_len);
+    }
+    info.cid.length = 8;
+    
+    // Generate random stateless reset token (16 bytes)
+    for (size_t i = 0; i < 16; i += 4) {
+        uint32_t random_word = esp_random();
+        size_t copy_len = std::min(size_t(4), 16 - i);
+        std::memcpy(info.stateless_reset_token + i, &random_word, copy_len);
+    }
+    
+    // Store it
+    local_connection_ids_[seq] = info;
+    
+    // Build NEW_CONNECTION_ID frame
+    quic::BufferWriter writer(frame_buf_, sizeof(frame_buf_));
+    if (!quic::BuildNewConnectionIdFrame(&writer, seq, 0, info.cid, info.stateless_reset_token)) {
+        return false;
+    }
+    
+    // Build 1-RTT packet
+    uint64_t pn = app_tracker_.AllocatePacketNumber();
+    size_t packet_len = quic::Build1RttPacket(dcid_, pn, false, crypto_.GetKeyPhase() != 0,
+                                               frame_buf_, writer.Offset(),
+                                               crypto_.GetClientAppSecrets(),
+                                               packet_buf_, sizeof(packet_buf_));
+    
+    if (packet_len == 0) {
+        return false;
+    }
+    
+    if (config_.enable_debug) {
+        ESP_LOGI(TAG, "Sending NEW_CONNECTION_ID seq=%llu, cid=%02x%02x%02x%02x...",
+                 (unsigned long long)seq,
+                 info.cid.data[0], info.cid.data[1], info.cid.data[2], info.cid.data[3]);
+    }
+    
+    app_tracker_.OnPacketSent(pn, current_time_us_, packet_len, true);
+    return SendPacket(packet_buf_, packet_len);
+}
+
+quic::ConnectionId* QuicConnection::Impl::GetActivePeerConnectionId() {
+    // Return the first non-retired peer connection ID, or dcid_ if none available
+    for (auto& [seq, info] : peer_connection_ids_) {
+        if (!info.retired) {
+            return &info.cid;
+        }
+    }
+    return &dcid_;
+}
+
+bool QuicConnection::Impl::IsStatelessReset(const uint8_t* data, size_t len) {
+    // Stateless Reset must be at least 21 bytes (1 byte header + 4 bytes random + 16 bytes token)
+    if (len < 21) {
+        return false;
+    }
+    
+    // Check the last 16 bytes against known stateless reset tokens
+    const uint8_t* token_in_packet = data + len - 16;
+    
+    // Check against peer's tokens from NEW_CONNECTION_ID
+    for (const auto& [seq, info] : peer_connection_ids_) {
+        if (std::memcmp(token_in_packet, info.stateless_reset_token, 16) == 0) {
+            return true;
+        }
+    }
+    
+    // Also check against the stateless_reset_token from transport parameters
+    if (peer_params_.stateless_reset_token_present) {
+        if (std::memcmp(token_in_packet, peer_params_.stateless_reset_token, 16) == 0) {
+            return true;
+        }
+    }
+    
+    return false;
 }
 
 void QuicConnection::Impl::OnFramePathChallenge(const uint8_t* data) {
