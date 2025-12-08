@@ -141,6 +141,8 @@ void LossDetector::OnPacketSent(uint64_t pn, uint64_t sent_time_us,
         // Also reset PTO count if it has been a long time since last activity,
         // indicating this is a new request burst after idle period
         bool should_reset_pto = (last_ack_eliciting_time_us_ == 0);
+        bool should_reset_rtt = false;
+        
         if (!should_reset_pto && sent_time_us > last_ack_eliciting_time_us_) {
             // If more than 2x PTO has elapsed since last ACK-eliciting packet,
             // consider this a new request and reset PTO count
@@ -149,11 +151,31 @@ void LossDetector::OnPacketSent(uint64_t pn, uint64_t sent_time_us,
             if (elapsed > pto_threshold) {
                 should_reset_pto = true;
             }
+            // If idle for more than 10 seconds, also reset RTT to initial values
+            // to avoid using stale/polluted RTT estimates from previous bad network conditions
+            constexpr uint64_t kIdleRttResetThresholdUs = 10 * 1000 * 1000;  // 10 seconds
+            if (elapsed > kIdleRttResetThresholdUs) {
+                should_reset_rtt = true;
+            }
         }
         
         if (should_reset_pto) {
             pto_count_ = 0;
+            // If no previous ACK-eliciting packets (fresh start after idle),
+            // also consider resetting RTT if current estimates are unreasonably high
+            if (last_ack_eliciting_time_us_ == 0) {
+                // Check if RTT is unreasonably high (> 5 seconds)
+                constexpr uint64_t kMaxReasonableRttUs = 5 * 1000 * 1000;  // 5 seconds
+                if (rtt_.GetSmoothedRtt() > kMaxReasonableRttUs) {
+                    should_reset_rtt = true;
+                }
+            }
         }
+        
+        if (should_reset_rtt) {
+            rtt_.Reset();
+        }
+        
         last_ack_eliciting_time_us_ = sent_time_us;
         cc_.OnPacketSent(bytes);
     }

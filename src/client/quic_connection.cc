@@ -151,7 +151,21 @@ private:
     // Packet sending
     bool SendPacket(const uint8_t* data, size_t len);
     bool SendAckIfNeeded(quic::PacketType pkt_type);
-    bool SendPendingFrames();
+    
+    // Frame aggregation - build packet with multiple frames
+    size_t BuildAggregatedPacket(quic::BufferWriter* frame_writer, 
+                                  uint64_t stream_id = UINT64_MAX,
+                                  const uint8_t* stream_data = nullptr,
+                                  size_t stream_len = 0,
+                                  uint64_t stream_offset = 0,
+                                  bool fin = false);
+    bool FlushPendingFrames();
+    void QueueMaxDataUpdate();
+    void QueueMaxStreamDataUpdate(uint64_t stream_id);
+    
+    // Batch mode for aggregating multiple STREAM frames into one packet
+    void BeginBatch();
+    bool EndBatch();
     
     // QUIC stream sending for H3
     bool SendStreamData(uint64_t stream_id, const uint8_t* data, 
@@ -406,6 +420,49 @@ private:
     uint8_t packet_buf_[1500];       // For building outgoing packets
     uint8_t payload_buf_[1500];      // For decrypted payloads
     uint8_t frame_buf_[1500];        // For building frames
+    
+    // Frame aggregation - pending control frames to be sent with next packet
+    struct PendingFrames {
+        bool need_max_data = false;                    // Need to send MAX_DATA
+        std::set<uint64_t> need_max_stream_data;       // Streams needing MAX_STREAM_DATA
+        bool need_ping = false;                        // Need to send PING
+        
+        void Clear() {
+            need_max_data = false;
+            need_max_stream_data.clear();
+            need_ping = false;
+        }
+        
+        bool HasPending() const {
+            return need_max_data || !need_max_stream_data.empty() || need_ping;
+        }
+    };
+    PendingFrames pending_frames_;
+    
+    // Maximum payload size for a single packet (considering headers and encryption overhead)
+    static constexpr size_t kMaxPacketPayload = 1200;
+    
+    // Batch mode - aggregate multiple STREAM frames into one packet
+    struct BatchState {
+        bool active = false;
+        quic::BufferWriter* writer = nullptr;
+        
+        // Track stream frames for retransmission (each stream's frame info)
+        struct StreamFrameInfo {
+            uint64_t stream_id;
+            size_t frame_start;   // Offset within batch buffer where frame starts
+            size_t frame_len;     // Length of frame
+        };
+        std::vector<StreamFrameInfo> stream_frames;
+        
+        void Reset() {
+            active = false;
+            writer = nullptr;
+            stream_frames.clear();
+        }
+    };
+    BatchState batch_state_;
+    uint8_t batch_frames_[1500];  // Buffer for batch mode frames
 };
 
 //=============================================================================
@@ -590,6 +647,10 @@ bool QuicConnection::Impl::SendInitialPacket(bool is_retransmit) {
         return false;
     }
     
+    if (config_.enable_debug && !is_retransmit) {
+        ESP_LOGI(TAG, "[SendFrame] CRYPTO (ClientHello) in Initial packet, len=%zu", ch_len);
+    }
+    
     // Build Initial packet
     uint64_t pn = initial_tracker_.AllocatePacketNumber();
     size_t packet_len = quic::BuildInitialPacket(dcid_, scid_,
@@ -622,13 +683,15 @@ void QuicConnection::Impl::ProcessReceivedData(uint8_t* data, size_t len) {
         return;
     }
     
-    // Record start time for performance measurement
-    uint64_t start_time_us = quic::GetCurrentTimeUs();
-    
-    current_time_us_ = start_time_us;
+    current_time_us_ = quic::GetCurrentTimeUs();
     time_since_last_activity_us_ = 0;
     packets_received_++;
     bytes_received_ += len;
+    
+    // Debug log for received packet
+    if (config_.enable_debug) {
+        ESP_LOGI(TAG, "[RecvPacket] len=%zu bytes", len);
+    }
     
     // Process coalesced packets in a loop (data is mutable, no copy needed)
     size_t offset = 0;
@@ -695,14 +758,6 @@ void QuicConnection::Impl::ProcessReceivedData(uint8_t* data, size_t len) {
         if (offset < len) {
             ESP_LOGD(TAG, "Processing coalesced packet at offset %zu", offset);
         }
-    }
-    
-    // Calculate and print elapsed time
-    if (config_.enable_debug) {
-        uint64_t end_time_us = quic::GetCurrentTimeUs();
-        uint64_t elapsed_us = end_time_us - start_time_us;
-        ESP_LOGI(TAG, "[PERF] ProcessReceivedData took %llu us (%.3f ms), packet size: %zu bytes", 
-                elapsed_us, elapsed_us / 1000.0f, len);
     }
 }
 
@@ -898,12 +953,12 @@ void QuicConnection::Impl::ProcessFrames(const uint8_t* data, size_t len,
         } else if (frame_type == 0x01) {
             // PING - no action needed
             if (config_.enable_debug) {
-                ESP_LOGI(TAG, "[%s] Frame: PING", pkt_type_str);
+                ESP_LOGI(TAG, "[RecvFrame] [%s] Frame: PING", pkt_type_str);
             }
         } else if (frame_type == 0x02 || frame_type == 0x03) {
             // ACK or ACK_ECN
             if (config_.enable_debug) {
-                ESP_LOGI(TAG, "[%s] Frame: ACK%s", pkt_type_str, 
+                ESP_LOGI(TAG, "[RecvFrame] [%s] Frame: ACK%s", pkt_type_str, 
                          frame_type == 0x03 ? "_ECN" : "");
             }
             reader.Seek(reader.Offset() - 1);  // Back up to include frame type
@@ -915,7 +970,7 @@ void QuicConnection::Impl::ProcessFrames(const uint8_t* data, size_t len,
                 reader.ReadVarint(&error_code) && 
                 reader.ReadVarint(&final_size)) {
                 if (config_.enable_debug) {
-                    ESP_LOGI(TAG, "[%s] Frame: RESET_STREAM stream=%llu, error=%llu, final_size=%llu", 
+                    ESP_LOGI(TAG, "[RecvFrame] [%s] Frame: RESET_STREAM stream=%llu, error=%llu, final_size=%llu", 
                              pkt_type_str, (unsigned long long)stream_id, 
                              (unsigned long long)error_code, (unsigned long long)final_size);
                 }
@@ -929,7 +984,7 @@ void QuicConnection::Impl::ProcessFrames(const uint8_t* data, size_t len,
             uint64_t stream_id, error_code;
             if (reader.ReadVarint(&stream_id) && reader.ReadVarint(&error_code)) {
                 if (config_.enable_debug) {
-                    ESP_LOGI(TAG, "[%s] Frame: STOP_SENDING stream=%llu, error=%llu", 
+                    ESP_LOGI(TAG, "[RecvFrame] [%s] Frame: STOP_SENDING stream=%llu, error=%llu", 
                              pkt_type_str, (unsigned long long)stream_id, 
                              (unsigned long long)error_code);
                 }
@@ -941,25 +996,25 @@ void QuicConnection::Impl::ProcessFrames(const uint8_t* data, size_t len,
         } else if (frame_type == 0x06) {
             // CRYPTO
             if (config_.enable_debug) {
-                ESP_LOGI(TAG, "[%s] Frame: CRYPTO", pkt_type_str);
+                ESP_LOGI(TAG, "[RecvFrame] [%s] Frame: CRYPTO", pkt_type_str);
             }
             ProcessCryptoFrame(&reader, pkt_type);
         } else if (frame_type >= 0x08 && frame_type <= 0x0f) {
             // STREAM
             if (config_.enable_debug) {
-                ESP_LOGI(TAG, "[%s] Frame: STREAM (type=0x%02x)", pkt_type_str, frame_type);
+                ESP_LOGI(TAG, "[RecvFrame] [%s] Frame: STREAM (type=0x%02x)", pkt_type_str, frame_type);
             }
             ProcessStreamFrame(&reader, frame_type);
         } else if (frame_type == 0x10) {
             // MAX_DATA
             if (config_.enable_debug) {
-                ESP_LOGI(TAG, "[%s] Frame: MAX_DATA", pkt_type_str);
+                ESP_LOGI(TAG, "[RecvFrame] [%s] Frame: MAX_DATA", pkt_type_str);
             }
             ProcessMaxDataFrame(&reader);
         } else if (frame_type == 0x11) {
             // MAX_STREAM_DATA
             if (config_.enable_debug) {
-                ESP_LOGI(TAG, "[%s] Frame: MAX_STREAM_DATA", pkt_type_str);
+                ESP_LOGI(TAG, "[RecvFrame] [%s] Frame: MAX_STREAM_DATA", pkt_type_str);
             }
             ProcessMaxStreamDataFrame(&reader);
         } else if (frame_type == 0x12 || frame_type == 0x13) {
@@ -968,7 +1023,7 @@ void QuicConnection::Impl::ProcessFrames(const uint8_t* data, size_t len,
             uint64_t max_streams;
             if (reader.ReadVarint(&max_streams)) {
                 if (config_.enable_debug) {
-                    ESP_LOGI(TAG, "[%s] Frame: MAX_STREAMS_%s, limit=%llu", pkt_type_str,
+                    ESP_LOGI(TAG, "[RecvFrame] [%s] Frame: MAX_STREAMS_%s, limit=%llu", pkt_type_str,
                              frame_type == 0x12 ? "BIDI" : "UNI", 
                              (unsigned long long)max_streams);
                 }
@@ -978,7 +1033,7 @@ void QuicConnection::Impl::ProcessFrames(const uint8_t* data, size_t len,
             uint64_t limit;
             if (reader.ReadVarint(&limit)) {
                 if (config_.enable_debug) {
-                    ESP_LOGI(TAG, "[%s] Frame: DATA_BLOCKED at limit=%llu", pkt_type_str,
+                    ESP_LOGI(TAG, "[RecvFrame] [%s] Frame: DATA_BLOCKED at limit=%llu", pkt_type_str,
                              (unsigned long long)limit);
                 }
                 // Send MAX_DATA to unblock the peer
@@ -989,7 +1044,7 @@ void QuicConnection::Impl::ProcessFrames(const uint8_t* data, size_t len,
             uint64_t stream_id, limit;
             if (reader.ReadVarint(&stream_id) && reader.ReadVarint(&limit)) {
                 if (config_.enable_debug) {
-                    ESP_LOGI(TAG, "[%s] Frame: STREAM_DATA_BLOCKED stream=%llu, limit=%llu", 
+                    ESP_LOGI(TAG, "[RecvFrame] [%s] Frame: STREAM_DATA_BLOCKED stream=%llu, limit=%llu", 
                              pkt_type_str, (unsigned long long)stream_id, 
                              (unsigned long long)limit);
                 }
@@ -1001,7 +1056,7 @@ void QuicConnection::Impl::ProcessFrames(const uint8_t* data, size_t len,
             uint64_t limit;
             if (reader.ReadVarint(&limit)) {
                 if (config_.enable_debug) {
-                    ESP_LOGI(TAG, "[%s] Frame: STREAMS_BLOCKED_%s at limit=%llu", pkt_type_str,
+                    ESP_LOGI(TAG, "[RecvFrame] [%s] Frame: STREAMS_BLOCKED_%s at limit=%llu", pkt_type_str,
                              frame_type == 0x16 ? "BIDI" : "UNI",
                              (unsigned long long)limit);
                 }
@@ -1009,31 +1064,31 @@ void QuicConnection::Impl::ProcessFrames(const uint8_t* data, size_t len,
         } else if (frame_type == 0x18) {
             // NEW_CONNECTION_ID
             if (config_.enable_debug) {
-                ESP_LOGI(TAG, "[%s] Frame: NEW_CONNECTION_ID", pkt_type_str);
+                ESP_LOGI(TAG, "[RecvFrame] [%s] Frame: NEW_CONNECTION_ID", pkt_type_str);
             }
             ProcessNewConnectionIdFrame(&reader);
         } else if (frame_type == 0x1c) {
             // CONNECTION_CLOSE
             if (config_.enable_debug) {
-                ESP_LOGI(TAG, "[%s] Frame: CONNECTION_CLOSE", pkt_type_str);
+                ESP_LOGI(TAG, "[RecvFrame] [%s] Frame: CONNECTION_CLOSE", pkt_type_str);
             }
             ProcessConnectionCloseFrame(&reader, false);
         } else if (frame_type == 0x1d) {
             // APPLICATION_CLOSE
             if (config_.enable_debug) {
-                ESP_LOGI(TAG, "[%s] Frame: APPLICATION_CLOSE", pkt_type_str);
+                ESP_LOGI(TAG, "[RecvFrame] [%s] Frame: APPLICATION_CLOSE", pkt_type_str);
             }
             ProcessConnectionCloseFrame(&reader, true);
         } else if (frame_type == 0x1e) {
             // HANDSHAKE_DONE
             if (config_.enable_debug) {
-                ESP_LOGI(TAG, "[%s] Frame: HANDSHAKE_DONE", pkt_type_str);
+                ESP_LOGI(TAG, "[RecvFrame] [%s] Frame: HANDSHAKE_DONE", pkt_type_str);
             }
             ProcessHandshakeDoneFrame();
         } else {
             // Unknown frame - try to skip
             if (config_.enable_debug) {
-                ESP_LOGW(TAG, "[%s] Unknown frame type: 0x%02x, remaining=%zu", 
+                ESP_LOGW(TAG, "[RecvFrame] [%s] Unknown frame type: 0x%02x, remaining=%zu", 
                          pkt_type_str, frame_type, reader.Remaining());
             }
             // For now, just break
@@ -1376,9 +1431,22 @@ bool QuicConnection::Impl::SendClientFinished() {
     // Update transcript with our Finished
     crypto_.UpdateTranscript(finished_msg, finished_len);
     
-    // Build CRYPTO frame
-    uint8_t frames[64];
+    // Build frames: ACK (if needed) + CRYPTO
+    // Piggybacking ACK reduces the number of packets during handshake
+    uint8_t frames[128];
     quic::BufferWriter writer(frames, sizeof(frames));
+    
+    // Add Handshake ACK if we have pending acknowledgments
+    if (handshake_ack_mgr_.HasPendingAck()) {
+        if (handshake_ack_mgr_.BuildAckFrame(&writer, current_time_us_)) {
+            handshake_ack_mgr_.OnAckSent();
+            if (config_.enable_debug) {
+                ESP_LOGD(TAG, "SendClientFinished: piggybacked Handshake ACK");
+            }
+        }
+    }
+    
+    // Add CRYPTO frame with Client Finished
     if (!quic::BuildCryptoFrame(&writer, 0, finished_msg, finished_len)) {
         ESP_LOGW(TAG, "BuildCryptoFrame failed");
         return false;
@@ -1398,8 +1466,10 @@ bool QuicConnection::Impl::SendClientFinished() {
         return false;
     }
     
-    ESP_LOGD(TAG, "Sending Client Finished in Handshake packet, PN=%llu, len=%zu",
-             (unsigned long long)pn, packet_len);
+    if (config_.enable_debug) {
+        ESP_LOGI(TAG, "[SendFrame] CRYPTO (Client Finished) in Handshake packet, PN=%llu, len=%zu",
+                 (unsigned long long)pn, packet_len);
+    }
     
     handshake_tracker_.OnPacketSent(pn, current_time_us_, packet_len, true);
     loss_detector_.OnPacketSent(pn, current_time_us_, packet_len, true);
@@ -1472,12 +1542,20 @@ void QuicConnection::Impl::ProcessHandshakeDoneFrame() {
             }
         });
         
-        // Send SETTINGS
-        h3_handler_->SendSettings();
-        h3_initialized_ = true;
+        // Use batch mode to aggregate H3 initialization + NEW_CONNECTION_ID
+        // into a single packet (reduces 5 packets to 1)
+        BeginBatch();
         
-        // Send our first alternative connection ID (like Python version)
+        // Send SETTINGS (creates control stream + QPACK streams, all go into batch)
+        h3_handler_->SendSettings();
+        
+        // Send our first alternative connection ID (also goes into batch)
         SendNewConnectionId();
+        
+        // Send all accumulated frames in one packet
+        EndBatch();
+        
+        h3_initialized_ = true;
     }
     
     if (on_connected_) {
@@ -1528,13 +1606,13 @@ void QuicConnection::Impl::ProcessStreamFrame(quic::BufferReader* reader,
         ESP_LOGW(TAG, "  No H3 handler set, stream data dropped!");
     }
     
-    // Check if we should send flow control updates proactively
-    // This prevents the peer from becoming blocked
+    // Queue flow control updates to be sent with next outgoing packet
+    // This reduces packet count and piggybacks control frames on data packets
     if (flow_controller_.ShouldSendMaxData()) {
-        SendMaxDataFrame();
+        QueueMaxDataUpdate();
     }
     if (flow_controller_.ShouldSendMaxStreamData(stream_data.stream_id)) {
-        SendMaxStreamDataFrame(stream_data.stream_id);
+        QueueMaxStreamDataUpdate(stream_data.stream_id);
     }
 }
 
@@ -1607,7 +1685,7 @@ bool QuicConnection::Impl::SendMaxDataFrame() {
     }
     
     if (config_.enable_debug) {
-        ESP_LOGI(TAG, "Sending MAX_DATA frame to increase flow control window");
+        ESP_LOGI(TAG, "[SendFrame] MAX_DATA frame to increase flow control window");
     }
     
     app_tracker_.OnPacketSent(pn, current_time_us_, packet_len, false);
@@ -1640,7 +1718,7 @@ bool QuicConnection::Impl::SendMaxStreamDataFrame(uint64_t stream_id) {
     }
     
     if (config_.enable_debug) {
-        ESP_LOGI(TAG, "Sending MAX_STREAM_DATA for stream %llu", 
+        ESP_LOGI(TAG, "[SendFrame] MAX_STREAM_DATA for stream %llu", 
                  (unsigned long long)stream_id);
     }
     
@@ -1649,10 +1727,13 @@ bool QuicConnection::Impl::SendMaxStreamDataFrame(uint64_t stream_id) {
 }
 
 void QuicConnection::Impl::CheckAndSendFlowControlUpdates() {
-    // Check connection-level flow control
+    // Check connection-level flow control and queue update if needed
     if (flow_controller_.ShouldSendMaxData()) {
-        SendMaxDataFrame();
+        QueueMaxDataUpdate();
     }
+    
+    // Flush any pending frames (ACK + control frames)
+    FlushPendingFrames();
 }
 
 //=============================================================================
@@ -1665,7 +1746,7 @@ bool QuicConnection::Impl::SendPacket(const uint8_t* data, size_t len) {
     }
     
     if (config_.enable_debug) {
-        ESP_LOGI(TAG, "Sending packet, len=%zu", len);
+        ESP_LOGI(TAG, "[SendPacket] len=%zu bytes", len);
     }
     int result = send_cb_(data, len);
     if (result > 0) {
@@ -1745,11 +1826,269 @@ bool QuicConnection::Impl::SendAckIfNeeded(quic::PacketType pkt_type) {
     ack_mgr->OnAckSent();
     
     if (config_.enable_debug) {
-        ESP_LOGI(TAG, "Sending ACK packet, PN=%llu, len=%zu", 
+        ESP_LOGI(TAG, "[SendFrame] ACK packet, PN=%llu, len=%zu", 
                  (unsigned long long)pn, packet_len);
     }
     
     return SendPacket(packet.data(), packet_len);
+}
+
+//=============================================================================
+// Frame Aggregation
+//=============================================================================
+
+void QuicConnection::Impl::QueueMaxDataUpdate() {
+    pending_frames_.need_max_data = true;
+}
+
+void QuicConnection::Impl::QueueMaxStreamDataUpdate(uint64_t stream_id) {
+    pending_frames_.need_max_stream_data.insert(stream_id);
+}
+
+size_t QuicConnection::Impl::BuildAggregatedPacket(quic::BufferWriter* frame_writer,
+                                                    uint64_t stream_id,
+                                                    const uint8_t* stream_data,
+                                                    size_t stream_len,
+                                                    uint64_t stream_offset,
+                                                    bool fin) {
+    // This function aggregates multiple frames into one packet payload:
+    // 1. ACK frame (if needed, highest priority for timely acknowledgment)
+    // 2. MAX_DATA frame (if queued)
+    // 3. MAX_STREAM_DATA frames (if queued)
+    // 4. STREAM frame (if provided)
+    //
+    // Returns the total frame payload size written to frame_writer
+    
+    size_t initial_offset = frame_writer->Offset();
+    
+    // 1. Add ACK frame if needed (ACK frames are not retransmittable)
+    if (app_ack_mgr_.ShouldSendAck(current_time_us_)) {
+        if (app_ack_mgr_.BuildAckFrame(frame_writer, current_time_us_)) {
+            app_ack_mgr_.OnAckSent();
+            if (config_.enable_debug) {
+                ESP_LOGI(TAG, "[SendFrame] ACK (in aggregated packet)");
+            }
+        }
+    }
+    
+    // 2. Add MAX_DATA frame if needed
+    if (pending_frames_.need_max_data) {
+        if (flow_controller_.BuildMaxDataFrame(frame_writer)) {
+            pending_frames_.need_max_data = false;
+            if (config_.enable_debug) {
+                ESP_LOGI(TAG, "[SendFrame] MAX_DATA (in aggregated packet)");
+            }
+        }
+    }
+    
+    // 3. Add MAX_STREAM_DATA frames (limit to avoid oversized packets)
+    size_t max_stream_data_count = 0;
+    const size_t kMaxStreamDataFramesPerPacket = 4;  // Limit to prevent packet bloat
+    
+    for (auto it = pending_frames_.need_max_stream_data.begin();
+         it != pending_frames_.need_max_stream_data.end() && 
+         max_stream_data_count < kMaxStreamDataFramesPerPacket; ) {
+        
+        uint64_t sid = *it;
+        StreamFlowState* state = flow_controller_.GetStreamState(sid);
+        if (state) {
+            // Build MAX_STREAM_DATA frame directly
+            uint64_t new_max = state->recv_offset + config_.max_stream_data;
+            if (new_max > state->recv_max_sent) {
+                if (quic::BuildMaxStreamDataFrame(frame_writer, sid, new_max)) {
+                    state->recv_max_sent = new_max;
+                    it = pending_frames_.need_max_stream_data.erase(it);
+                    max_stream_data_count++;
+                    if (config_.enable_debug) {
+                        ESP_LOGI(TAG, "[SendFrame] MAX_STREAM_DATA stream=%llu (in aggregated packet)",
+                                 (unsigned long long)sid);
+                    }
+                    continue;
+                }
+            }
+        }
+        it = pending_frames_.need_max_stream_data.erase(it);
+    }
+    
+    // 4. Add STREAM frame if provided
+    if (stream_data != nullptr && stream_len > 0) {
+        if (!quic::BuildStreamFrame(frame_writer, stream_id, stream_offset, 
+                                     stream_data, stream_len, fin)) {
+            ESP_LOGW(TAG, "BuildAggregatedPacket: failed to add STREAM frame");
+        }
+    } else if (stream_id != UINT64_MAX && fin) {
+        // FIN-only frame (no data)
+        if (!quic::BuildStreamFrame(frame_writer, stream_id, stream_offset, 
+                                     nullptr, 0, true)) {
+            ESP_LOGW(TAG, "BuildAggregatedPacket: failed to add FIN-only STREAM frame");
+        }
+    }
+    
+    return frame_writer->Offset() - initial_offset;
+}
+
+bool QuicConnection::Impl::FlushPendingFrames() {
+    if (!crypto_.HasApplicationKeys()) {
+        return false;
+    }
+    
+    // Check if there are any pending frames to send
+    if (!pending_frames_.HasPending() && !app_ack_mgr_.ShouldSendAck(current_time_us_)) {
+        return true;  // Nothing to send, that's okay
+    }
+    
+    current_time_us_ = quic::GetCurrentTimeUs();
+    
+    // Build aggregated frames
+    quic::BufferWriter writer(frame_buf_, sizeof(frame_buf_));
+    size_t frame_len = BuildAggregatedPacket(&writer);
+    
+    if (frame_len == 0) {
+        return true;  // No frames were added
+    }
+    
+    // Build 1-RTT packet
+    uint64_t pn = app_tracker_.AllocatePacketNumber();
+    size_t packet_len = quic::Build1RttPacket(dcid_, pn, false, crypto_.GetKeyPhase() != 0,
+                                               frame_buf_, writer.Offset(),
+                                               crypto_.GetClientAppSecrets(),
+                                               packet_buf_, sizeof(packet_buf_));
+    
+    if (packet_len == 0) {
+        return false;
+    }
+    
+    // Track as non-ack-eliciting if only contains ACK/MAX_DATA/MAX_STREAM_DATA
+    // (these control frames don't need retransmission tracking)
+    app_tracker_.OnPacketSent(pn, current_time_us_, packet_len, false);
+    
+    if (config_.enable_debug) {
+        ESP_LOGI(TAG, "FlushPendingFrames: sent aggregated control packet, PN=%llu, len=%zu",
+                 (unsigned long long)pn, packet_len);
+    }
+    
+    return SendPacket(packet_buf_, packet_len);
+}
+
+//=============================================================================
+// Batch Mode - Aggregate multiple STREAM frames into one packet
+//=============================================================================
+
+void QuicConnection::Impl::BeginBatch() {
+    if (batch_state_.active) {
+        ESP_LOGW(TAG, "BeginBatch called while batch already active");
+        return;
+    }
+    
+    batch_state_.Reset();
+    batch_state_.active = true;
+    batch_state_.writer = new quic::BufferWriter(batch_frames_, sizeof(batch_frames_));
+    
+    // Add ACK frame if needed (will be at the beginning of packet)
+    if (app_ack_mgr_.ShouldSendAck(current_time_us_)) {
+        if (app_ack_mgr_.BuildAckFrame(batch_state_.writer, current_time_us_)) {
+            app_ack_mgr_.OnAckSent();
+            if (config_.enable_debug) {
+                ESP_LOGD(TAG, "BeginBatch: added ACK frame");
+            }
+        }
+    }
+    
+    // Add pending MAX_DATA if needed
+    if (pending_frames_.need_max_data) {
+        if (flow_controller_.BuildMaxDataFrame(batch_state_.writer)) {
+            pending_frames_.need_max_data = false;
+            if (config_.enable_debug) {
+                ESP_LOGD(TAG, "BeginBatch: added MAX_DATA frame");
+            }
+        }
+    }
+    
+    // Add pending MAX_STREAM_DATA frames
+    for (auto it = pending_frames_.need_max_stream_data.begin();
+         it != pending_frames_.need_max_stream_data.end(); ) {
+        
+        uint64_t sid = *it;
+        StreamFlowState* state = flow_controller_.GetStreamState(sid);
+        if (state) {
+            uint64_t new_max = state->recv_offset + config_.max_stream_data;
+            if (new_max > state->recv_max_sent) {
+                if (quic::BuildMaxStreamDataFrame(batch_state_.writer, sid, new_max)) {
+                    state->recv_max_sent = new_max;
+                    it = pending_frames_.need_max_stream_data.erase(it);
+                    continue;
+                }
+            }
+        }
+        it = pending_frames_.need_max_stream_data.erase(it);
+    }
+    
+    if (config_.enable_debug) {
+        ESP_LOGD(TAG, "BeginBatch: started, control frames offset=%zu", 
+                 batch_state_.writer->Offset());
+    }
+}
+
+bool QuicConnection::Impl::EndBatch() {
+    if (!batch_state_.active) {
+        ESP_LOGW(TAG, "EndBatch called without active batch");
+        return false;
+    }
+    
+    if (!batch_state_.writer || batch_state_.writer->Offset() == 0) {
+        // Nothing to send
+        delete batch_state_.writer;
+        batch_state_.Reset();
+        return true;
+    }
+    
+    // Build 1-RTT packet with all accumulated frames
+    uint64_t pn = app_tracker_.AllocatePacketNumber();
+    size_t packet_len = quic::Build1RttPacket(dcid_, pn, false, crypto_.GetKeyPhase() != 0,
+                                               batch_frames_, batch_state_.writer->Offset(),
+                                               crypto_.GetClientAppSecrets(),
+                                               packet_buf_, sizeof(packet_buf_));
+    
+    if (packet_len == 0) {
+        ESP_LOGE(TAG, "EndBatch: Build1RttPacket failed");
+        delete batch_state_.writer;
+        batch_state_.Reset();
+        return false;
+    }
+    
+    // Track the packet - if it has STREAM frames, it's ack-eliciting
+    bool has_stream_frames = !batch_state_.stream_frames.empty();
+    
+    if (has_stream_frames) {
+        // For retransmission, we need to save STREAM frame data
+        // Build a combined frames buffer for all STREAM frames
+        std::vector<uint8_t> stream_frames_copy;
+        for (const auto& info : batch_state_.stream_frames) {
+            stream_frames_copy.insert(stream_frames_copy.end(),
+                                       batch_frames_ + info.frame_start,
+                                       batch_frames_ + info.frame_start + info.frame_len);
+        }
+        
+        // Use first stream's ID for tracking (simplified, could be improved)
+        uint64_t primary_stream_id = batch_state_.stream_frames[0].stream_id;
+        app_tracker_.OnPacketSent(pn, current_time_us_, packet_len, true, 
+                                   std::move(stream_frames_copy), primary_stream_id);
+        loss_detector_.OnPacketSent(pn, current_time_us_, packet_len, true);
+    } else {
+        app_tracker_.OnPacketSent(pn, current_time_us_, packet_len, false);
+    }
+    
+    if (config_.enable_debug) {
+        ESP_LOGI(TAG, "EndBatch: sent packet PN=%llu, len=%zu, %zu stream frames",
+                 (unsigned long long)pn, packet_len, batch_state_.stream_frames.size());
+    }
+    
+    bool ok = SendPacket(packet_buf_, packet_len);
+    
+    delete batch_state_.writer;
+    batch_state_.Reset();
+    
+    return ok;
 }
 
 bool QuicConnection::Impl::SendStreamData(uint64_t stream_id,
@@ -1776,17 +2115,102 @@ bool QuicConnection::Impl::SendStreamData(uint64_t stream_id,
     // Get current send offset for this stream
     uint64_t offset = stream_state ? stream_state->send_offset : 0;
     
-    // Build STREAM frame with correct offset (use pre-allocated member buffer)
+    //=========================================================================
+    // Batch Mode: accumulate STREAM frames, send later in EndBatch()
+    //=========================================================================
+    if (batch_state_.active && batch_state_.writer) {
+        size_t frame_start = batch_state_.writer->Offset();
+        
+        // Build STREAM frame into batch buffer
+        if (!quic::BuildStreamFrame(batch_state_.writer, stream_id, offset, data, len, fin)) {
+            ESP_LOGE(TAG, "SendStreamData(batch): BuildStreamFrame failed");
+            return false;
+        }
+        
+        size_t frame_len = batch_state_.writer->Offset() - frame_start;
+        
+        // Track this frame for retransmission
+        batch_state_.stream_frames.push_back({stream_id, frame_start, frame_len});
+        
+        // Update flow control
+        flow_controller_.OnStreamBytesSent(stream_id, len);
+        
+        if (config_.enable_debug) {
+            ESP_LOGD(TAG, "SendStreamData(batch): stream=%llu, offset=%llu, len=%zu, fin=%d",
+                     (unsigned long long)stream_id, (unsigned long long)offset, len, fin ? 1 : 0);
+        }
+        
+        return true;  // Frame buffered, will be sent in EndBatch()
+    }
+    
+    //=========================================================================
+    // Normal Mode: build aggregated packet and send immediately
+    //=========================================================================
     quic::BufferWriter writer(frame_buf_, sizeof(frame_buf_));
     
+    // First, add ACK and pending control frames (non-retransmittable)
+    // Add ACK frame if needed
+    if (app_ack_mgr_.ShouldSendAck(current_time_us_)) {
+        if (app_ack_mgr_.BuildAckFrame(&writer, current_time_us_)) {
+            app_ack_mgr_.OnAckSent();
+            if (config_.enable_debug) {
+                ESP_LOGD(TAG, "SendStreamData: piggybacked ACK frame");
+            }
+        }
+    }
+    
+    // Add MAX_DATA if queued
+    if (pending_frames_.need_max_data) {
+        if (flow_controller_.BuildMaxDataFrame(&writer)) {
+            pending_frames_.need_max_data = false;
+            if (config_.enable_debug) {
+                ESP_LOGD(TAG, "SendStreamData: piggybacked MAX_DATA frame");
+            }
+        }
+    }
+    
+    // Add some MAX_STREAM_DATA frames if queued (limit to avoid bloat)
+    size_t max_stream_data_count = 0;
+    const size_t kMaxStreamDataFramesPerPacket = 2;  // Conservative limit when sending data
+    
+    for (auto it = pending_frames_.need_max_stream_data.begin();
+         it != pending_frames_.need_max_stream_data.end() && 
+         max_stream_data_count < kMaxStreamDataFramesPerPacket; ) {
+        
+        uint64_t sid = *it;
+        StreamFlowState* state = flow_controller_.GetStreamState(sid);
+        if (state) {
+            uint64_t new_max = state->recv_offset + config_.max_stream_data;
+            if (new_max > state->recv_max_sent) {
+                if (quic::BuildMaxStreamDataFrame(&writer, sid, new_max)) {
+                    state->recv_max_sent = new_max;
+                    it = pending_frames_.need_max_stream_data.erase(it);
+                    max_stream_data_count++;
+                    if (config_.enable_debug) {
+                        ESP_LOGD(TAG, "SendStreamData: piggybacked MAX_STREAM_DATA for stream %llu",
+                                 (unsigned long long)sid);
+                    }
+                    continue;
+                }
+            }
+        }
+        it = pending_frames_.need_max_stream_data.erase(it);
+    }
+    
+    // Mark where STREAM frame starts (for retransmission tracking)
+    size_t stream_frame_start = writer.Offset();
+    
+    // Now add the STREAM frame
     if (!quic::BuildStreamFrame(&writer, stream_id, offset, data, len, fin)) {
         return false;
     }
     
-    // Save frame data for potential retransmission
-    std::vector<uint8_t> frame_copy(frame_buf_, frame_buf_ + writer.Offset());
+    // Save ONLY the STREAM frame data for retransmission (not ACK/control frames)
+    size_t stream_frame_len = writer.Offset() - stream_frame_start;
+    std::vector<uint8_t> frame_copy(frame_buf_ + stream_frame_start, 
+                                     frame_buf_ + stream_frame_start + stream_frame_len);
     
-    // Build 1-RTT packet
+    // Build 1-RTT packet with all aggregated frames
     uint64_t pn = app_tracker_.AllocatePacketNumber();
     size_t packet_len = quic::Build1RttPacket(dcid_, pn, false, crypto_.GetKeyPhase() != 0,
                                                frame_buf_, writer.Offset(),
@@ -1797,7 +2221,7 @@ bool QuicConnection::Impl::SendStreamData(uint64_t stream_id,
         return false;
     }
     
-    // Track sent packet with frame data and stream_id for retransmission
+    // Track sent packet with STREAM frame data for retransmission
     app_tracker_.OnPacketSent(pn, current_time_us_, packet_len, true, std::move(frame_copy), stream_id);
     loss_detector_.OnPacketSent(pn, current_time_us_, packet_len, true);
     
@@ -1902,13 +2326,14 @@ uint32_t QuicConnection::Impl::OnTimerTick(uint32_t elapsed_ms) {
         }
     }
     
-    // Check if delayed ACKs need to be sent (RFC 9002 max_ack_delay timer)
+    // Check if delayed ACKs or pending control frames need to be sent
     if (handshake_complete_) {
-        if (app_ack_mgr_.ShouldSendAck(current_time_us_)) {
-            SendAckIfNeeded(quic::PacketType::k1Rtt);
+        // Use FlushPendingFrames to aggregate ACK + MAX_DATA + MAX_STREAM_DATA
+        if (app_ack_mgr_.ShouldSendAck(current_time_us_) || pending_frames_.HasPending()) {
+            FlushPendingFrames();
         }
     } else {
-        // During handshake, check Initial and Handshake ACKs
+        // During handshake, check Initial and Handshake ACKs separately
         if (initial_ack_mgr_.ShouldSendAck(current_time_us_)) {
             SendAckIfNeeded(quic::PacketType::kInitial);
         }
@@ -2776,12 +3201,12 @@ void QuicConnection::Impl::OnFrameStream(uint64_t stream_id, uint64_t offset,
         h3_handler_->OnStreamData(stream_id, offset, data, len, fin);
     }
     
-    // Check if we should send flow control updates
+    // Queue flow control updates to be piggybacked on next outgoing packet
     if (flow_controller_.ShouldSendMaxData()) {
-        SendMaxDataFrame();
+        QueueMaxDataUpdate();
     }
     if (flow_controller_.ShouldSendMaxStreamData(stream_id)) {
-        SendMaxStreamDataFrame(stream_id);
+        QueueMaxStreamDataUpdate(stream_id);
     }
 }
 
@@ -2916,7 +3341,26 @@ bool QuicConnection::Impl::SendNewConnectionId() {
     // Store it
     local_connection_ids_[seq] = info;
     
-    // Build NEW_CONNECTION_ID frame
+    if (config_.enable_debug) {
+        ESP_LOGI(TAG, "Sending NEW_CONNECTION_ID seq=%llu, cid=%02x%02x%02x%02x...",
+                 (unsigned long long)seq,
+                 info.cid.data[0], info.cid.data[1], info.cid.data[2], info.cid.data[3]);
+    }
+    
+    //=========================================================================
+    // Batch Mode: add frame to batch buffer
+    //=========================================================================
+    if (batch_state_.active && batch_state_.writer) {
+        if (!quic::BuildNewConnectionIdFrame(batch_state_.writer, seq, 0, 
+                                              info.cid, info.stateless_reset_token)) {
+            return false;
+        }
+        return true;  // Frame buffered, will be sent in EndBatch()
+    }
+    
+    //=========================================================================
+    // Normal Mode: build and send immediately
+    //=========================================================================
     quic::BufferWriter writer(frame_buf_, sizeof(frame_buf_));
     if (!quic::BuildNewConnectionIdFrame(&writer, seq, 0, info.cid, info.stateless_reset_token)) {
         return false;
@@ -2931,12 +3375,6 @@ bool QuicConnection::Impl::SendNewConnectionId() {
     
     if (packet_len == 0) {
         return false;
-    }
-    
-    if (config_.enable_debug) {
-        ESP_LOGI(TAG, "Sending NEW_CONNECTION_ID seq=%llu, cid=%02x%02x%02x%02x...",
-                 (unsigned long long)seq,
-                 info.cid.data[0], info.cid.data[1], info.cid.data[2], info.cid.data[3]);
     }
     
     app_tracker_.OnPacketSent(pn, current_time_us_, packet_len, true);
