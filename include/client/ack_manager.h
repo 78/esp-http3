@@ -136,6 +136,10 @@ struct SentPacketInfo {
     bool acknowledged = false;
     bool lost = false;
     
+    // Stream ID for this packet (0 = no stream data, e.g. control frames)
+    // Used for cleaning up frames when stream is reset/cancelled
+    uint64_t stream_id = 0;
+    
     // Frames in this packet (for retransmission)
     std::vector<uint8_t> frames;
 };
@@ -156,10 +160,12 @@ public:
      * @param sent_bytes Bytes sent
      * @param ack_eliciting True if packet is ack-eliciting
      * @param frames Frames in the packet (for potential retransmission)
+     * @param stream_id Stream ID (0 for control frames without stream data)
      */
     void OnPacketSent(uint64_t pn, uint64_t sent_time_us, 
                       size_t sent_bytes, bool ack_eliciting,
-                      std::vector<uint8_t> frames = {});
+                      std::vector<uint8_t> frames = {},
+                      uint64_t stream_id = 0);
     
     /**
      * @brief Process received ACK frame
@@ -218,6 +224,17 @@ public:
      * @brief Get RTT sample from last ACK (0 if none)
      */
     uint64_t GetLatestRttUs() const { return latest_rtt_us_; }
+    
+    /**
+     * @brief Clear frame data for all unacked packets belonging to a stream
+     * 
+     * When a stream is reset/cancelled, we no longer need to retransmit its data.
+     * This clears the frame data to prevent unnecessary retransmissions.
+     * 
+     * @param stream_id Stream ID to clear
+     * @return Number of packets affected
+     */
+    size_t ClearStreamFrames(uint64_t stream_id);
 
 private:
     std::vector<SentPacketInfo> sent_packets_;

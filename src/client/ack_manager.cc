@@ -225,13 +225,15 @@ void SentPacketTracker::Reset() {
 
 void SentPacketTracker::OnPacketSent(uint64_t pn, uint64_t sent_time_us,
                                       size_t sent_bytes, bool ack_eliciting,
-                                      std::vector<uint8_t> frames) {
+                                      std::vector<uint8_t> frames,
+                                      uint64_t stream_id) {
     SentPacketInfo info;
     info.packet_number = pn;
     info.sent_time_us = sent_time_us;
     info.sent_bytes = sent_bytes;
     info.ack_eliciting = ack_eliciting;
     info.in_flight = ack_eliciting;
+    info.stream_id = stream_id;
     info.frames = std::move(frames);
     
     sent_packets_.push_back(std::move(info));
@@ -327,6 +329,20 @@ void SentPacketTracker::PruneOldPackets() {
                            return p.acknowledged || p.lost;
                        }),
         sent_packets_.end());
+}
+
+size_t SentPacketTracker::ClearStreamFrames(uint64_t stream_id) {
+    size_t count = 0;
+    for (auto& pkt : sent_packets_) {
+        // Only clear unacked, in-flight packets belonging to this stream
+        if (!pkt.acknowledged && !pkt.lost && pkt.in_flight &&
+            pkt.stream_id == stream_id && !pkt.frames.empty()) {
+            // Clear frame data - packet will still be tracked but won't be retransmitted
+            std::vector<uint8_t>().swap(pkt.frames);
+            count++;
+        }
+    }
+    return count;
 }
 
 } // namespace esp_http3

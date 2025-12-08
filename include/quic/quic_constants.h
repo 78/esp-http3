@@ -121,7 +121,7 @@ namespace transport_param {
 namespace defaults {
     // For embedded devices: BDP = 2Mbps × 200ms = 50KB, use 2×BDP = ~64KB
     constexpr uint32_t kMaxIdleTimeoutMs = 60000;
-    constexpr uint32_t kInitialMaxData = 1024*1024;
+    constexpr uint32_t kInitialMaxData = 256*1024;
     constexpr uint32_t kInitialMaxStreamDataBidiLocal = kInitialMaxData;
     constexpr uint32_t kInitialMaxStreamDataBidiRemote = kInitialMaxData;
     constexpr uint32_t kInitialMaxStreamDataUni = kInitialMaxData;

@@ -208,6 +208,10 @@ private:
     quic::ConnectionId* GetActivePeerConnectionId();
     bool IsStatelessReset(const uint8_t* data, size_t len);
     
+    // Check if payload contains ACK-eliciting frames (RFC 9002)
+    // Non-ACK-eliciting: PADDING (0x00), ACK (0x02-0x03), CONNECTION_CLOSE (0x1c-0x1d)
+    bool HasAckElicitingFrames(const uint8_t* payload, size_t len);
+    
     // Connection migration helpers
     quic::ConnectionId* SelectNewPeerConnectionId();
     void CompleteMigration(bool success);
@@ -762,8 +766,10 @@ size_t QuicConnection::Impl::ProcessInitialPacket(uint8_t* data, size_t len) {
     // Update DCID from SCID in response
     dcid_ = info.long_header.scid;
     
-    // Record received packet
-    initial_ack_mgr_.OnPacketReceived(info.packet_number, current_time_us_);
+    // Only record packet for ACK generation if it contains ACK-eliciting frames (RFC 9002)
+    if (HasAckElicitingFrames(payload_buf_, payload_len)) {
+        initial_ack_mgr_.OnPacketReceived(info.packet_number, current_time_us_);
+    }
     
     // Process frames
     ProcessFrames(payload_buf_, payload_len, quic::PacketType::kInitial);
@@ -797,7 +803,11 @@ size_t QuicConnection::Impl::ProcessHandshakePacket(uint8_t* data, size_t len) {
                  (unsigned long long)info.packet_number, payload_len, info.packet_size);
     }
     
-    handshake_ack_mgr_.OnPacketReceived(info.packet_number, current_time_us_);
+    // Only record packet for ACK generation if it contains ACK-eliciting frames (RFC 9002)
+    if (HasAckElicitingFrames(payload_buf_, payload_len)) {
+        handshake_ack_mgr_.OnPacketReceived(info.packet_number, current_time_us_);
+    }
+    
     ProcessFrames(payload_buf_, payload_len, quic::PacketType::kHandshake);
     
     return info.packet_size;  // Return consumed bytes for coalesced packet handling
@@ -854,7 +864,11 @@ bool QuicConnection::Impl::Process1RttPacket(uint8_t* data, size_t len) {
                  (unsigned long long)info.packet_number, payload_len);
     }
     
-    app_ack_mgr_.OnPacketReceived(info.packet_number, current_time_us_);
+    // Only record packet for ACK generation if it contains ACK-eliciting frames (RFC 9002)
+    if (HasAckElicitingFrames(payload_buf_, payload_len)) {
+        app_ack_mgr_.OnPacketReceived(info.packet_number, current_time_us_);
+    }
+    
     ProcessFrames(payload_buf_, payload_len, quic::PacketType::k1Rtt);
     
     return true;
@@ -1066,12 +1080,23 @@ void QuicConnection::Impl::ProcessAckFrame(quic::BufferReader* reader,
                            current_time_us_,
                            &newly_acked);
     
-    // Update loss detector with RTT
+    // Update loss detector with RTT and detect lost packets
     // Note: Decode peer's ACK delay using peer's ack_delay_exponent (from transport params)
+    uint64_t decoded_ack_delay = ack_data.ack_delay << peer_params_.ack_delay_exponent;
+    
     if (tracker->GetLatestRttUs() > 0) {
         loss_detector_.GetRttEstimator().OnRttSample(
             tracker->GetLatestRttUs(),
-            ack_data.ack_delay << peer_params_.ack_delay_exponent);
+            decoded_ack_delay);
+    }
+    
+    // Reset PTO count and detect lost packets (critical for proper timeout behavior)
+    loss_detector_.OnAckReceived(ack_data.largest_ack, decoded_ack_delay,
+                                  current_time_us_, tracker);
+    
+    // Try to send blocked data after ACK frees up congestion window
+    if (newly_acked > 0 && pkt_type == quic::PacketType::k1Rtt) {
+        ProcessWriteQueue();
     }
 }
 
@@ -1639,7 +1664,9 @@ bool QuicConnection::Impl::SendPacket(const uint8_t* data, size_t len) {
         return false;
     }
     
-    ESP_LOGI(TAG, "Sending packet, len=%zu", len);
+    if (config_.enable_debug) {
+        ESP_LOGI(TAG, "Sending packet, len=%zu", len);
+    }
     int result = send_cb_(data, len);
     if (result > 0) {
         packets_sent_++;
@@ -1732,6 +1759,9 @@ bool QuicConnection::Impl::SendStreamData(uint64_t stream_id,
         return false;
     }
     
+    // Update current time for accurate PTO calculation
+    current_time_us_ = quic::GetCurrentTimeUs();
+    
     // Get or create stream flow state to track offset
     StreamFlowState* stream_state = flow_controller_.GetStreamState(stream_id);
     if (!stream_state) {
@@ -1767,8 +1797,8 @@ bool QuicConnection::Impl::SendStreamData(uint64_t stream_id,
         return false;
     }
     
-    // Track sent packet with frame data for retransmission
-    app_tracker_.OnPacketSent(pn, current_time_us_, packet_len, true, std::move(frame_copy));
+    // Track sent packet with frame data and stream_id for retransmission
+    app_tracker_.OnPacketSent(pn, current_time_us_, packet_len, true, std::move(frame_copy), stream_id);
     loss_detector_.OnPacketSent(pn, current_time_us_, packet_len, true);
     
     // Update flow control
@@ -2051,6 +2081,9 @@ bool QuicConnection::Impl::ResetStream(int stream_id, uint64_t error_code) {
         return false;
     }
     
+    // Update current time for accurate PTO calculation
+    current_time_us_ = quic::GetCurrentTimeUs();
+    
     uint64_t sid = static_cast<uint64_t>(stream_id);
     
     // Check if stream was already reset
@@ -2081,6 +2114,14 @@ bool QuicConnection::Impl::ResetStream(int stream_id, uint64_t error_code) {
         if (config_.enable_debug) {
             ESP_LOGI(TAG, "ResetStream: cleaned up write queue for stream %d", stream_id);
         }
+    }
+    
+    // Clear frame data for unacked packets belonging to this stream
+    // This prevents unnecessary retransmissions of data that will be ignored by peer
+    size_t cleared = app_tracker_.ClearStreamFrames(sid);
+    if (config_.enable_debug && cleared > 0) {
+        ESP_LOGI(TAG, "ResetStream: cleared frames from %zu unacked packets for stream %d",
+                 cleared, stream_id);
     }
     
     // Build both RESET_STREAM and STOP_SENDING frames in the same packet
@@ -2312,13 +2353,14 @@ void QuicConnection::Impl::RetransmitLostPackets(const std::vector<SentPacketInf
     
     for (auto* pkt : lost_packets) {
         if (pkt->frames.empty()) {
-            // No frame data saved, skip (e.g., ACK-only packets)
+            // No frame data saved, skip (e.g., ACK-only packets or cleared stream frames)
             continue;
         }
         
         if (config_.enable_debug) {
-            ESP_LOGI(TAG, "Retransmitting lost packet PN=%llu (%zu bytes of frames)",
-                     (unsigned long long)pkt->packet_number, pkt->frames.size());
+            ESP_LOGI(TAG, "Retransmitting lost packet PN=%llu (%zu bytes of frames, stream=%llu)",
+                     (unsigned long long)pkt->packet_number, pkt->frames.size(),
+                     (unsigned long long)pkt->stream_id);
         }
         
         // Build new 1-RTT packet with the same frames
@@ -2336,8 +2378,9 @@ void QuicConnection::Impl::RetransmitLostPackets(const std::vector<SentPacketInf
         // Copy frames for the new packet (in case it also gets lost)
         std::vector<uint8_t> frame_copy = pkt->frames;
         
-        // Track the new packet
-        app_tracker_.OnPacketSent(new_pn, current_time_us_, packet_len, true, std::move(frame_copy));
+        // Track the new packet with same stream_id
+        app_tracker_.OnPacketSent(new_pn, current_time_us_, packet_len, true, 
+                                  std::move(frame_copy), pkt->stream_id);
         loss_detector_.OnPacketSent(new_pn, current_time_us_, packet_len, true);
         
         SendPacket(packet_buf_, packet_len);
@@ -2388,8 +2431,9 @@ void QuicConnection::Impl::SendPtoProbe() {
     if (oldest_with_data) {
         // Retransmit the oldest unacked packet with frame data
         if (config_.enable_debug) {
-            ESP_LOGI(TAG, "PTO probe: retransmitting PN=%llu",
-                     (unsigned long long)oldest_with_data->packet_number);
+            ESP_LOGI(TAG, "PTO probe: retransmitting PN=%llu (stream=%llu)",
+                     (unsigned long long)oldest_with_data->packet_number,
+                     (unsigned long long)oldest_with_data->stream_id);
         }
         
         uint64_t new_pn = app_tracker_.AllocatePacketNumber();
@@ -2401,7 +2445,8 @@ void QuicConnection::Impl::SendPtoProbe() {
         
         if (packet_len > 0) {
             std::vector<uint8_t> frame_copy = oldest_with_data->frames;
-            app_tracker_.OnPacketSent(new_pn, current_time_us_, packet_len, true, std::move(frame_copy));
+            app_tracker_.OnPacketSent(new_pn, current_time_us_, packet_len, true, 
+                                      std::move(frame_copy), oldest_with_data->stream_id);
             loss_detector_.OnPacketSent(new_pn, current_time_us_, packet_len, true);
             SendPacket(packet_buf_, packet_len);
         }
@@ -2538,6 +2583,58 @@ void QuicConnection::Impl::GenerateRandom(uint8_t* buf, size_t len) {
         size_t copy_len = remaining < 4 ? remaining : 4;
         memcpy(buf + i, &random_word, copy_len);
     }
+}
+
+bool QuicConnection::Impl::HasAckElicitingFrames(const uint8_t* payload, size_t len) {
+    // RFC 9002: Only ACK-eliciting packets should trigger sending ACK
+    // Non-ACK-eliciting frames: PADDING (0x00), ACK (0x02-0x03), CONNECTION_CLOSE (0x1c-0x1d)
+    quic::BufferReader reader(payload, len);
+    
+    while (reader.Remaining() > 0) {
+        uint8_t frame_type;
+        if (!reader.ReadUint8(&frame_type)) break;
+        
+        // Check if this frame is ACK-eliciting
+        if (frame_type != 0x00 && frame_type != 0x02 && frame_type != 0x03 &&
+            frame_type != 0x1c && frame_type != 0x1d) {
+            return true;  // Found an ACK-eliciting frame
+        }
+        
+        // Skip non-ACK-eliciting frame content to continue scanning
+        if (frame_type == 0x00) {
+            // PADDING - single byte, already consumed
+            continue;
+        } else if (frame_type == 0x02 || frame_type == 0x03) {
+            // ACK frame - skip its content
+            uint64_t largest_ack, ack_delay, ack_range_count, first_range;
+            if (!reader.ReadVarint(&largest_ack) || !reader.ReadVarint(&ack_delay) ||
+                !reader.ReadVarint(&ack_range_count) || !reader.ReadVarint(&first_range)) {
+                break;
+            }
+            for (uint64_t i = 0; i < ack_range_count; i++) {
+                uint64_t gap, range;
+                if (!reader.ReadVarint(&gap) || !reader.ReadVarint(&range)) break;
+            }
+            if (frame_type == 0x03) {
+                // ACK_ECN has 3 additional varints
+                uint64_t ect0, ect1, ecn_ce;
+                reader.ReadVarint(&ect0);
+                reader.ReadVarint(&ect1);
+                reader.ReadVarint(&ecn_ce);
+            }
+        } else if (frame_type == 0x1c || frame_type == 0x1d) {
+            // CONNECTION_CLOSE frame - skip its content
+            uint64_t error_code, frame_type_field, reason_len;
+            if (!reader.ReadVarint(&error_code)) break;
+            if (frame_type == 0x1c) {
+                if (!reader.ReadVarint(&frame_type_field)) break;
+            }
+            if (!reader.ReadVarint(&reason_len)) break;
+            reader.Seek(reader.Offset() + reason_len);
+        }
+    }
+    
+    return false;  // No ACK-eliciting frames found
 }
 
 //=============================================================================

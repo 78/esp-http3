@@ -134,6 +134,26 @@ void LossDetector::Reset() {
 void LossDetector::OnPacketSent(uint64_t pn, uint64_t sent_time_us, 
                                  size_t bytes, bool ack_eliciting) {
     if (ack_eliciting) {
+        // RFC 9002: Reset PTO count when sending new ACK-eliciting data
+        // after all previous ACK-eliciting data has been acknowledged
+        // (indicated by last_ack_eliciting_time_us_ == 0)
+        // 
+        // Also reset PTO count if it has been a long time since last activity,
+        // indicating this is a new request burst after idle period
+        bool should_reset_pto = (last_ack_eliciting_time_us_ == 0);
+        if (!should_reset_pto && sent_time_us > last_ack_eliciting_time_us_) {
+            // If more than 2x PTO has elapsed since last ACK-eliciting packet,
+            // consider this a new request and reset PTO count
+            uint64_t elapsed = sent_time_us - last_ack_eliciting_time_us_;
+            uint64_t pto_threshold = 2 * GetPtoTimeout();
+            if (elapsed > pto_threshold) {
+                should_reset_pto = true;
+            }
+        }
+        
+        if (should_reset_pto) {
+            pto_count_ = 0;
+        }
         last_ack_eliciting_time_us_ = sent_time_us;
         cc_.OnPacketSent(bytes);
     }
@@ -202,7 +222,8 @@ void LossDetector::OnAckReceived(uint64_t largest_acked, uint64_t ack_delay_us,
     
     for (auto* pkt : remaining_unacked) {
         // Only consider ACK-eliciting packets that are still in flight
-        if (pkt->ack_eliciting && pkt->in_flight && !pkt->lost) {
+        // Also check if frames are not empty (cleared frames = cancelled stream)
+        if (pkt->ack_eliciting && pkt->in_flight && !pkt->lost && !pkt->frames.empty()) {
             if (earliest_ack_eliciting_time == 0 || 
                 pkt->sent_time_us < earliest_ack_eliciting_time) {
                 earliest_ack_eliciting_time = pkt->sent_time_us;
@@ -211,7 +232,12 @@ void LossDetector::OnAckReceived(uint64_t largest_acked, uint64_t ack_delay_us,
     }
     
     // Update or clear PTO timer
+    // If no more ACK-eliciting packets in flight, clear PTO state completely
+    if (earliest_ack_eliciting_time == 0) {
+        ClearPtoTimer();
+    } else {
     last_ack_eliciting_time_us_ = earliest_ack_eliciting_time;
+    }
 }
 
 bool LossDetector::OnTimerTick(uint64_t current_time_us) {
