@@ -183,8 +183,14 @@ private:
     // Retransmission - resend lost packets
     void RetransmitLostPackets(const std::vector<SentPacketInfo*>& lost_packets);
     
-    // PTO probe - send probe packets when PTO fires
+    // PTO handler - dispatches to appropriate probe based on connection state
+    void HandlePto();
+    
+    // PTO probe - send probe packets when PTO fires (1-RTT space)
     void SendPtoProbe();
+    
+    // Handshake PTO - retransmit Handshake packets (e.g., Client Finished)
+    void SendHandshakePtoProbe();
     
     // Connection ID management
     void RetirePeerConnectionIdsPriorTo(uint64_t retire_prior_to);
@@ -420,7 +426,7 @@ QuicConnection::Impl::Impl(SendCallback send_cb, const QuicConfig& config)
     });
     
     loss_detector_.SetOnPto([this]() {
-        SendPtoProbe();
+        HandlePto();
     });
 }
 
@@ -1793,18 +1799,8 @@ uint32_t QuicConnection::Impl::OnTimerTick(uint32_t elapsed_ms) {
         }
     }
     
-    // Check PTO for handshake or application data
-    if (loss_detector_.OnTimerTick(current_time_us_)) {
-        if (state_ == ConnectionState::kHandshakeInProgress) {
-            // PTO fired during handshake - retransmit Initial
-            if (config_.enable_debug) {
-                ESP_LOGI(TAG, "PTO fired, retransmitting Initial");
-            }
-            SendInitialPacket(true);  // Mark as retransmit to avoid updating transcript hash
-        }
-        // Note: For connected state, the PTO callback (SendPtoProbe) is already invoked
-        // by loss_detector_.OnTimerTick() via the on_pto_ callback set in constructor
-    }
+    // Check PTO - all PTO handling is done via on_pto_ callback (HandlePto)
+    loss_detector_.OnTimerTick(current_time_us_);
     
     // Calculate precise time until next PTO (considering exponential backoff)
     uint64_t time_until_pto_us = loss_detector_.GetTimeUntilNextPto(current_time_us_);
@@ -1832,13 +1828,23 @@ uint32_t QuicConnection::Impl::OnTimerTick(uint32_t elapsed_ms) {
     }
     
     // Calculate time until next ACK deadline
-    uint64_t ack_deadline_us = app_ack_mgr_.GetAckDeadlineUs();
-    if (ack_deadline_us > 0 && ack_deadline_us > current_time_us_) {
-        uint64_t time_until_ack_us = ack_deadline_us - current_time_us_;
-        uint32_t ack_deadline_ms = static_cast<uint32_t>((time_until_ack_us + 999) / 1000);
-        if (ack_deadline_ms < next_timer_ms) {
-            next_timer_ms = ack_deadline_ms;
+    // Use the appropriate ACK manager based on handshake state
+    auto update_timer_from_ack_deadline = [&](uint64_t deadline_us) {
+        if (deadline_us > 0 && deadline_us > current_time_us_) {
+            uint64_t time_until_ack_us = deadline_us - current_time_us_;
+            uint32_t ack_deadline_ms = static_cast<uint32_t>((time_until_ack_us + 999) / 1000);
+            if (ack_deadline_ms < next_timer_ms) {
+                next_timer_ms = ack_deadline_ms;
+            }
         }
+    };
+    
+    if (handshake_complete_) {
+        update_timer_from_ack_deadline(app_ack_mgr_.GetAckDeadlineUs());
+    } else {
+        // During handshake, check Initial and Handshake ACK deadlines
+        update_timer_from_ack_deadline(initial_ack_mgr_.GetAckDeadlineUs());
+        update_timer_from_ack_deadline(handshake_ack_mgr_.GetAckDeadlineUs());
     }
     
     // Process write queues (send queued data respecting flow control)
@@ -2278,6 +2284,25 @@ void QuicConnection::Impl::RetransmitLostPackets(const std::vector<SentPacketInf
     }
 }
 
+void QuicConnection::Impl::HandlePto() {
+    // Dispatch PTO handling based on connection state
+    if (state_ == ConnectionState::kHandshakeInProgress) {
+        // Handshake in progress - retransmit Initial packet
+        if (config_.enable_debug) {
+            ESP_LOGI(TAG, "PTO fired, retransmitting Initial");
+        }
+        SendInitialPacket(true);  // Mark as retransmit to avoid updating transcript hash
+    } else if (state_ == ConnectionState::kConnected) {
+        if (!handshake_complete_) {
+            // Client Finished sent but HANDSHAKE_DONE not received yet
+            SendHandshakePtoProbe();
+        } else {
+            // Normal 1-RTT operation
+            SendPtoProbe();
+        }
+    }
+}
+
 void QuicConnection::Impl::SendPtoProbe() {
     if (!crypto_.HasApplicationKeys()) {
         return;
@@ -2350,6 +2375,48 @@ void QuicConnection::Impl::SendPtoProbe() {
             loss_detector_.OnPacketSent(pn, current_time_us_, packet_len, true);
             SendPacket(packet_buf_, packet_len);
         }
+    }
+}
+
+void QuicConnection::Impl::SendHandshakePtoProbe() {
+    // Retransmit Handshake packets (e.g., Client Finished) when PTO fires
+    // after sending Client Finished but before receiving HANDSHAKE_DONE
+    auto unacked = handshake_tracker_.GetUnackedPackets();
+    if (unacked.empty()) {
+        return;
+    }
+    
+    if (config_.enable_debug) {
+        ESP_LOGI(TAG, "PTO fired, retransmitting Handshake packets (%zu unacked)", 
+                 unacked.size());
+    }
+    
+    // Find and retransmit one packet with frame data
+    for (auto* pkt : unacked) {
+        if (pkt->frames.empty()) {
+            continue;
+        }
+        
+        uint64_t new_pn = handshake_tracker_.AllocatePacketNumber();
+        size_t packet_len = quic::BuildHandshakePacket(
+            dcid_, scid_, new_pn,
+            pkt->frames.data(), pkt->frames.size(),
+            crypto_.GetClientHandshakeSecrets(),
+            packet_buf_, sizeof(packet_buf_));
+        
+        if (packet_len > 0) {
+            std::vector<uint8_t> frame_copy = pkt->frames;
+            handshake_tracker_.OnPacketSent(new_pn, current_time_us_, 
+                                            packet_len, true, std::move(frame_copy));
+            loss_detector_.OnPacketSent(new_pn, current_time_us_, packet_len, true);
+            SendPacket(packet_buf_, packet_len);
+            
+            if (config_.enable_debug) {
+                ESP_LOGI(TAG, "Retransmitted Handshake packet, new PN=%llu", 
+                         (unsigned long long)new_pn);
+            }
+        }
+        break;  // Only retransmit one packet per PTO
     }
 }
 
