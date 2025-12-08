@@ -193,6 +193,25 @@ void LossDetector::OnAckReceived(uint64_t largest_acked, uint64_t ack_delay_us,
     if (!lost_packets.empty() && on_loss_) {
         on_loss_(lost_packets);
     }
+    
+    // RFC 9002: Update PTO timer based on the earliest unacked ACK-eliciting packet
+    // After processing ACK, find the earliest remaining unacked ACK-eliciting packet
+    // to set the correct PTO base time
+    auto remaining_unacked = tracker->GetUnackedPackets();
+    uint64_t earliest_ack_eliciting_time = 0;
+    
+    for (auto* pkt : remaining_unacked) {
+        // Only consider ACK-eliciting packets that are still in flight
+        if (pkt->ack_eliciting && pkt->in_flight && !pkt->lost) {
+            if (earliest_ack_eliciting_time == 0 || 
+                pkt->sent_time_us < earliest_ack_eliciting_time) {
+                earliest_ack_eliciting_time = pkt->sent_time_us;
+            }
+        }
+    }
+    
+    // Update or clear PTO timer
+    last_ack_eliciting_time_us_ = earliest_ack_eliciting_time;
 }
 
 bool LossDetector::OnTimerTick(uint64_t current_time_us) {
