@@ -513,6 +513,67 @@ public:
     uint32_t GetPathValidationRtt() const;
     
     //=========================================================================
+    // Connection Migration
+    //=========================================================================
+    
+    /**
+     * @brief Initiate connection migration to a new network path
+     * 
+     * This method triggers an active connection migration, which involves:
+     * 1. Selecting a new peer connection ID
+     * 2. Sending PATH_CHALLENGE on the new path
+     * 3. Waiting for PATH_RESPONSE to validate the path
+     * 
+     * Use this when the local network changes (e.g., WiFi to cellular).
+     * The current connection state and streams are preserved.
+     * 
+     * Prerequisites:
+     * - Connection must be established (IsConnected() returns true)
+     * - Server must not have disabled migration (IsMigrationAllowed() returns true)
+     * - At least one peer connection ID must be available
+     * 
+     * @return true if migration was initiated, false on failure
+     * 
+     * @note Migration result is reported via OnMigrationComplete callback.
+     *       On failure, the connection automatically rolls back to the old path.
+     */
+    bool MigrateConnection();
+    
+    /**
+     * @brief Check if connection migration is allowed
+     * 
+     * Returns false if the server sent disable_active_migration transport parameter.
+     * 
+     * @return true if migration is allowed by the server
+     */
+    bool IsMigrationAllowed() const;
+    
+    /**
+     * @brief Check if migration is currently in progress
+     * 
+     * @return true if migration is in progress (waiting for path validation)
+     */
+    bool IsMigrationInProgress() const;
+    
+    /**
+     * @brief Get number of available peer connection IDs for migration
+     * 
+     * At least one connection ID is needed to migrate. If this returns 0,
+     * migration cannot be performed until the server provides more IDs.
+     * 
+     * @return Number of non-retired peer connection IDs available
+     */
+    size_t GetAvailablePeerConnectionIdCount() const;
+    
+    /**
+     * @brief Set callback for migration completion
+     * 
+     * @param cb Callback function (success: true if migration succeeded)
+     */
+    using OnMigrationCompleteCallback = std::function<void(bool success)>;
+    void SetOnMigrationComplete(OnMigrationCompleteCallback cb);
+    
+    //=========================================================================
     // DATAGRAM (RFC 9221)
     //=========================================================================
     

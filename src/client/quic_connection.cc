@@ -95,6 +95,15 @@ public:
     bool IsPathValidated() const { return path_validated_; }
     uint32_t GetPathValidationRtt() const { return path_validation_rtt_ms_; }
     
+    // Connection Migration
+    bool MigrateConnection();
+    bool IsMigrationAllowed() const { return !peer_params_.disable_active_migration; }
+    bool IsMigrationInProgress() const { return migration_in_progress_; }
+    size_t GetAvailablePeerConnectionIdCount() const;
+    
+    using OnMigrationCompleteCallback = std::function<void(bool success)>;
+    void SetOnMigrationComplete(OnMigrationCompleteCallback cb) { on_migration_complete_ = std::move(cb); }
+    
     // DATAGRAM
     bool CanSendDatagram(size_t size) const;
     bool SendDatagram(const uint8_t* data, size_t len);
@@ -198,6 +207,11 @@ private:
     bool SendNewConnectionId();
     quic::ConnectionId* GetActivePeerConnectionId();
     bool IsStatelessReset(const uint8_t* data, size_t len);
+    
+    // Connection migration helpers
+    quic::ConnectionId* SelectNewPeerConnectionId();
+    void CompleteMigration(bool success);
+    void SendMigrationPathChallenge();
 
 private:
     // Write queue item
@@ -370,6 +384,15 @@ private:
     uint8_t path_challenge_data_[8] = {0};
     uint64_t path_challenge_sent_time_us_ = 0;
     uint32_t path_validation_rtt_ms_ = 0;
+    
+    // Connection Migration state
+    bool migration_in_progress_ = false;
+    quic::ConnectionId pre_migration_dcid_;    // DCID before migration (for rollback)
+    uint8_t migration_challenge_data_[8] = {0};
+    uint64_t migration_challenge_sent_time_us_ = 0;
+    uint32_t migration_retry_count_ = 0;
+    static constexpr uint32_t kMaxMigrationRetries = 3;
+    OnMigrationCompleteCallback on_migration_complete_;
     
     // DATAGRAM state (RFC 9221)
     uint32_t peer_max_datagram_frame_size_ = 0;
@@ -1616,6 +1639,7 @@ bool QuicConnection::Impl::SendPacket(const uint8_t* data, size_t len) {
         return false;
     }
     
+    ESP_LOGI(TAG, "Sending packet, len=%zu", len);
     int result = send_cb_(data, len);
     if (result > 0) {
         packets_sent_++;
@@ -1809,6 +1833,42 @@ uint32_t QuicConnection::Impl::OnTimerTick(uint32_t elapsed_ms) {
         uint32_t pto_ms = static_cast<uint32_t>((time_until_pto_us + 999) / 1000);
         if (pto_ms < next_timer_ms) {
             next_timer_ms = pto_ms;
+        }
+    }
+    
+    // Check connection migration timeout (3 * PTO timeout for path validation)
+    if (migration_in_progress_ && migration_challenge_sent_time_us_ > 0) {
+        // Use 3 * PTO (approximately 3 * RTT) as path validation timeout
+        uint64_t pto_timeout_us = loss_detector_.GetPtoTimeout() * 1000;  // Convert ms to us
+        uint64_t migration_timeout_us = 3 * pto_timeout_us;
+        uint64_t elapsed_us = current_time_us_ - migration_challenge_sent_time_us_;
+        
+        if (elapsed_us > migration_timeout_us) {
+            // Migration path validation timeout
+            migration_retry_count_++;
+            
+            if (migration_retry_count_ >= kMaxMigrationRetries) {
+                // Max retries reached, fail the migration
+                if (config_.enable_debug) {
+                    ESP_LOGW(TAG, "Migration failed: path validation timeout after %lu retries",
+                             (unsigned long)kMaxMigrationRetries);
+                }
+                CompleteMigration(false);
+            } else {
+                // Retry the path challenge
+                if (config_.enable_debug) {
+                    ESP_LOGI(TAG, "Migration path validation timeout, retrying (%lu/%lu)",
+                             migration_retry_count_, (unsigned long)kMaxMigrationRetries);
+                }
+                SendMigrationPathChallenge();
+            }
+        } else {
+            // Calculate time until migration timeout
+            uint64_t remaining_us = migration_timeout_us - elapsed_us;
+            uint32_t remaining_ms = static_cast<uint32_t>((remaining_us + 999) / 1000);
+            if (remaining_ms < next_timer_ms) {
+                next_timer_ms = remaining_ms;
+            }
         }
     }
     
@@ -2852,7 +2912,14 @@ void QuicConnection::Impl::OnFramePathChallenge(const uint8_t* data) {
 }
 
 void QuicConnection::Impl::OnFramePathResponse(const uint8_t* data) {
-    // Check if this matches our pending PATH_CHALLENGE
+    // Check if this matches our migration PATH_CHALLENGE
+    if (migration_in_progress_ && memcmp(data, migration_challenge_data_, 8) == 0) {
+        // Migration path validated successfully
+        CompleteMigration(true);
+        return;
+    }
+    
+    // Check if this matches our regular PATH_CHALLENGE
     if (memcmp(data, path_challenge_data_, 8) == 0) {
         path_validated_ = true;
         
@@ -2932,6 +2999,184 @@ bool QuicConnection::Impl::SendPathChallenge() {
     
     app_tracker_.OnPacketSent(pn, current_time_us_, packet_len, true);
     return SendPacket(packet_buf_, packet_len);
+}
+
+//=============================================================================
+// Connection Migration
+//=============================================================================
+
+bool QuicConnection::Impl::MigrateConnection() {
+    // Check preconditions
+    if (state_ != ConnectionState::kConnected) {
+        if (config_.enable_debug) {
+            ESP_LOGW(TAG, "Migration failed: not connected");
+        }
+        return false;
+    }
+    
+    if (!crypto_.HasApplicationKeys()) {
+        if (config_.enable_debug) {
+            ESP_LOGW(TAG, "Migration failed: no application keys");
+        }
+        return false;
+    }
+    
+    // Check if server allows migration
+    if (peer_params_.disable_active_migration) {
+        if (config_.enable_debug) {
+            ESP_LOGW(TAG, "Migration failed: server disabled active migration");
+        }
+        return false;
+    }
+    
+    // Check if migration is already in progress
+    if (migration_in_progress_) {
+        if (config_.enable_debug) {
+            ESP_LOGW(TAG, "Migration failed: migration already in progress");
+        }
+        return false;
+    }
+    
+    // Select a new peer connection ID for the new path
+    quic::ConnectionId* new_cid = SelectNewPeerConnectionId();
+    if (!new_cid) {
+        if (config_.enable_debug) {
+            ESP_LOGW(TAG, "Migration failed: no available peer connection ID");
+        }
+        return false;
+    }
+    
+    // Save current DCID for potential rollback
+    pre_migration_dcid_ = dcid_;
+    
+    // Switch to the new connection ID
+    dcid_ = *new_cid;
+    
+    // Start migration
+    migration_in_progress_ = true;
+    migration_retry_count_ = 0;
+    path_validated_ = false;  // Need to validate new path
+    
+    if (config_.enable_debug) {
+        ESP_LOGI(TAG, "Starting connection migration to new CID: %02x%02x%02x%02x...",
+                 dcid_.data[0], dcid_.data[1], dcid_.data[2], dcid_.data[3]);
+    }
+    
+    // Send PATH_CHALLENGE on the new path
+    SendMigrationPathChallenge();
+    
+    return true;
+}
+
+quic::ConnectionId* QuicConnection::Impl::SelectNewPeerConnectionId() {
+    // Find the first non-retired, unused peer connection ID that's different from current dcid_
+    for (auto& [seq, info] : peer_connection_ids_) {
+        if (!info.retired) {
+            // Skip if it's the same as current DCID
+            if (info.cid == dcid_) {
+                continue;
+            }
+            return &info.cid;
+        }
+    }
+    
+    // If no alternative CID available, return nullptr
+    return nullptr;
+}
+
+size_t QuicConnection::Impl::GetAvailablePeerConnectionIdCount() const {
+    size_t count = 0;
+    for (const auto& [seq, info] : peer_connection_ids_) {
+        if (!info.retired) {
+            count++;
+        }
+    }
+    return count;
+}
+
+void QuicConnection::Impl::SendMigrationPathChallenge() {
+    // Generate random challenge data for migration
+    GenerateRandom(migration_challenge_data_, 8);
+    migration_challenge_sent_time_us_ = current_time_us_;
+    
+    // Build PATH_CHALLENGE frame
+    quic::BufferWriter writer(frame_buf_, sizeof(frame_buf_));
+    if (!quic::BuildPathChallengeFrame(&writer, migration_challenge_data_)) {
+        CompleteMigration(false);
+        return;
+    }
+    
+    // Build 1-RTT packet with NEW destination CID
+    uint64_t pn = app_tracker_.AllocatePacketNumber();
+    size_t packet_len = quic::Build1RttPacket(dcid_, pn, false, crypto_.GetKeyPhase() != 0,
+                                               frame_buf_, writer.Offset(),
+                                               crypto_.GetClientAppSecrets(),
+                                               packet_buf_, sizeof(packet_buf_));
+    
+    if (packet_len == 0) {
+        CompleteMigration(false);
+        return;
+    }
+    
+    if (config_.enable_debug) {
+        ESP_LOGI(TAG, "Sending migration PATH_CHALLENGE (attempt %lu/%lu)",
+                 migration_retry_count_ + 1, kMaxMigrationRetries);
+    }
+    
+    app_tracker_.OnPacketSent(pn, current_time_us_, packet_len, true);
+    SendPacket(packet_buf_, packet_len);
+}
+
+void QuicConnection::Impl::CompleteMigration(bool success) {
+    if (!migration_in_progress_) {
+        return;
+    }
+    
+    migration_in_progress_ = false;
+    
+    if (success) {
+        // Migration successful
+        path_validated_ = true;
+        
+        // Calculate path RTT
+        if (migration_challenge_sent_time_us_ > 0) {
+            uint64_t rtt_us = current_time_us_ - migration_challenge_sent_time_us_;
+            path_validation_rtt_ms_ = static_cast<uint32_t>(rtt_us / 1000);
+        }
+        
+        if (config_.enable_debug) {
+            ESP_LOGI(TAG, "Connection migration completed successfully! New path RTT: %lu ms",
+                     path_validation_rtt_ms_);
+        }
+        
+        // Retire the old connection ID (optional, but good practice)
+        // The old DCID should be retired to avoid using it again
+        for (auto& [seq, info] : peer_connection_ids_) {
+            if (info.cid == pre_migration_dcid_ && !info.retired) {
+                info.retired = true;
+                SendRetireConnectionId(seq);
+                break;
+            }
+        }
+    } else {
+        // Migration failed, rollback to old DCID
+        dcid_ = pre_migration_dcid_;
+        path_validated_ = true;  // Old path is still valid
+        
+        if (config_.enable_debug) {
+            ESP_LOGW(TAG, "Connection migration failed, rolled back to previous path");
+        }
+    }
+    
+    // Clear migration state
+    migration_challenge_sent_time_us_ = 0;
+    memset(migration_challenge_data_, 0, 8);
+    migration_retry_count_ = 0;
+    
+    // Notify callback
+    if (on_migration_complete_) {
+        on_migration_complete_(success);
+    }
 }
 
 //=============================================================================
@@ -3164,6 +3409,30 @@ bool QuicConnection::IsPathValidated() const {
 
 uint32_t QuicConnection::GetPathValidationRtt() const {
     return impl_->GetPathValidationRtt();
+}
+
+//=============================================================================
+// Connection Migration Public API
+//=============================================================================
+
+bool QuicConnection::MigrateConnection() {
+    return impl_->MigrateConnection();
+}
+
+bool QuicConnection::IsMigrationAllowed() const {
+    return impl_->IsMigrationAllowed();
+}
+
+bool QuicConnection::IsMigrationInProgress() const {
+    return impl_->IsMigrationInProgress();
+}
+
+size_t QuicConnection::GetAvailablePeerConnectionIdCount() const {
+    return impl_->GetAvailablePeerConnectionIdCount();
+}
+
+void QuicConnection::SetOnMigrationComplete(OnMigrationCompleteCallback cb) {
+    impl_->SetOnMigrationComplete(std::move(cb));
 }
 
 //=============================================================================
