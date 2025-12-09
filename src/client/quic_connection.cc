@@ -151,17 +151,7 @@ private:
     // Packet sending
     bool SendPacket(const uint8_t* data, size_t len);
     bool SendAckIfNeeded(quic::PacketType pkt_type);
-    
-    // Frame aggregation - build packet with multiple frames
-    size_t BuildAggregatedPacket(quic::BufferWriter* frame_writer, 
-                                  uint64_t stream_id = UINT64_MAX,
-                                  const uint8_t* stream_data = nullptr,
-                                  size_t stream_len = 0,
-                                  uint64_t stream_offset = 0,
-                                  bool fin = false);
-    bool FlushPendingFrames();
-    void QueueMaxDataUpdate();
-    void QueueMaxStreamDataUpdate(uint64_t stream_id);
+    void SendCoalescedAcks();  // Coalesce Initial + Handshake ACKs into one UDP datagram
     
     // Batch mode for aggregating multiple STREAM frames into one packet
     void BeginBatch();
@@ -421,24 +411,6 @@ private:
     uint8_t payload_buf_[1500];      // For decrypted payloads
     uint8_t frame_buf_[1500];        // For building frames
     
-    // Frame aggregation - pending control frames to be sent with next packet
-    struct PendingFrames {
-        bool need_max_data = false;                    // Need to send MAX_DATA
-        std::set<uint64_t> need_max_stream_data;       // Streams needing MAX_STREAM_DATA
-        bool need_ping = false;                        // Need to send PING
-        
-        void Clear() {
-            need_max_data = false;
-            need_max_stream_data.clear();
-            need_ping = false;
-        }
-        
-        bool HasPending() const {
-            return need_max_data || !need_max_stream_data.empty() || need_ping;
-        }
-    };
-    PendingFrames pending_frames_;
-    
     // Maximum payload size for a single packet (considering headers and encryption overhead)
     static constexpr size_t kMaxPacketPayload = 1200;
     
@@ -690,7 +662,7 @@ void QuicConnection::Impl::ProcessReceivedData(uint8_t* data, size_t len) {
     
     // Debug log for received packet
     if (config_.enable_debug) {
-        ESP_LOGI(TAG, "[RecvPacket] len=%zu bytes", len);
+        ESP_LOGW(TAG, "[RecvPacket] len=%zu bytes", len);
     }
     
     // Process coalesced packets in a loop (data is mutable, no copy needed)
@@ -814,8 +786,17 @@ size_t QuicConnection::Impl::ProcessInitialPacket(uint8_t* data, size_t len) {
     }
     
     if (config_.enable_debug) {
-        ESP_LOGW(TAG, "Decrypted Initial packet, PN=%llu, payload=%zu bytes, packet_size=%zu",
+        ESP_LOGI(TAG, "Decrypted Initial packet, PN=%llu, payload=%zu bytes, packet_size=%zu",
                  (unsigned long long)info.packet_number, payload_len, info.packet_size);
+    }
+    
+    // If we already have Handshake keys and receive an Initial with different SCID,
+    // ignore it - this is a response to our retransmitted Initial from a different server session
+    if (crypto_.HasHandshakeKeys() && dcid_.Length() > 0 && dcid_ != info.long_header.scid) {
+        if (config_.enable_debug) {
+            ESP_LOGW(TAG, "Ignoring Initial packet with different SCID (already have Handshake keys)");
+        }
+        return info.packet_size;  // Skip this packet, continue with coalesced packets
     }
     
     // Update DCID from SCID in response
@@ -847,10 +828,22 @@ size_t QuicConnection::Impl::ProcessHandshakePacket(uint8_t* data, size_t len) {
         payload_buf_, sizeof(payload_buf_));
     
     if (payload_len == 0) {
-        if (config_.enable_debug) {
-            ESP_LOGW(TAG, "DecryptHandshakePacket failed");
+        // Decryption failed - try to skip this packet and continue with coalesced packets
+        // This can happen when we receive Handshake packets from a different server session
+        // (e.g., response to our retransmitted Initial that created a separate session)
+        quic::PacketInfo skip_info;
+        if (quic::ParsePacketHeader(data, len, 0, &skip_info) && skip_info.is_long_header) {
+            size_t hdr_len = skip_info.header_length;
+            quic::BufferReader reader(data + hdr_len, len - hdr_len);
+            uint64_t pkt_length;
+            if (reader.ReadVarint(&pkt_length)) {
+                size_t length_field_size = (len - hdr_len) - reader.Remaining();
+                size_t packet_size = hdr_len + length_field_size + pkt_length;
+                ESP_LOGD(TAG, "Skipping undecryptable Handshake packet, size=%zu", packet_size);
+                return packet_size;  // Skip this packet, continue with next
+            }
         }
-        return 0;  // Decryption failed
+        return 0;  // Can't parse, stop processing
     }
     
     if (config_.enable_debug) {
@@ -1096,7 +1089,10 @@ void QuicConnection::Impl::ProcessFrames(const uint8_t* data, size_t len,
         }
     }
     
-    SendAckIfNeeded(pkt_type);
+    // Note: ACK is NOT sent immediately here.
+    // ACK will be sent when:
+    // 1. Timer tick triggers ACK deadline (max_ack_delay or 2+ packets received)
+    // 2. Piggybacked on other outgoing packets (STREAM, etc.)
 }
 
 void QuicConnection::Impl::ProcessAckFrame(quic::BufferReader* reader,
@@ -1431,14 +1427,13 @@ bool QuicConnection::Impl::SendClientFinished() {
     // Update transcript with our Finished
     crypto_.UpdateTranscript(finished_msg, finished_len);
     
-    // Build frames: ACK (if needed) + CRYPTO
-    // Piggybacking ACK reduces the number of packets during handshake
-    uint8_t frames[128];
-    quic::BufferWriter writer(frames, sizeof(frames));
+    // Build Handshake frames first: ACK (if needed) + CRYPTO (Client Finished)
+    uint8_t hs_frames[128];
+    quic::BufferWriter hs_writer(hs_frames, sizeof(hs_frames));
     
     // Add Handshake ACK if we have pending acknowledgments
     if (handshake_ack_mgr_.HasPendingAck()) {
-        if (handshake_ack_mgr_.BuildAckFrame(&writer, current_time_us_)) {
+        if (handshake_ack_mgr_.BuildAckFrame(&hs_writer, current_time_us_)) {
             handshake_ack_mgr_.OnAckSent();
             if (config_.enable_debug) {
                 ESP_LOGD(TAG, "SendClientFinished: piggybacked Handshake ACK");
@@ -1447,24 +1442,59 @@ bool QuicConnection::Impl::SendClientFinished() {
     }
     
     // Add CRYPTO frame with Client Finished
-    if (!quic::BuildCryptoFrame(&writer, 0, finished_msg, finished_len)) {
+    if (!quic::BuildCryptoFrame(&hs_writer, 0, finished_msg, finished_len)) {
         ESP_LOGW(TAG, "BuildCryptoFrame failed");
         return false;
     }
     
-    // Build Handshake packet
-    std::vector<uint8_t> packet(512);
+    // RFC 9000 Section 12.2 + 14.1: Coalesce Initial ACK + Handshake into one datagram
+    // UDP datagrams carrying Initial packets MUST be >= 1200 bytes
+    size_t total_len = 0;
+    bool has_initial = initial_ack_mgr_.HasPendingAck();
+    
+    // 1. Build Initial ACK packet (if needed, must come first in coalesced datagram)
+    if (has_initial) {
+        uint8_t ack_frames[64];
+        quic::BufferWriter ack_writer(ack_frames, sizeof(ack_frames));
+        if (initial_ack_mgr_.BuildAckFrame(&ack_writer, current_time_us_)) {
+            uint64_t ack_pn = initial_tracker_.AllocatePacketNumber();
+            
+            size_t ack_packet_len = quic::BuildInitialPacket(dcid_, scid_,
+                                                              retry_token_.data(),
+                                                              retry_token_.size(),
+                                                              ack_pn,
+                                                              ack_frames, ack_writer.Offset(),
+                                                              crypto_.GetClientInitialSecrets(),
+                                                              packet_buf_ + total_len,
+                                                              sizeof(packet_buf_) - total_len,
+                                                              0);  // No internal padding needed
+            if (ack_packet_len > 0) {
+                initial_tracker_.OnPacketSent(ack_pn, current_time_us_, ack_packet_len, false);
+                initial_ack_mgr_.OnAckSent();
+                total_len += ack_packet_len;
+                if (config_.enable_debug) {
+                    ESP_LOGI(TAG, "[SendFrame] Initial ACK, PN=%llu, len=%zu (coalesced)",
+                             (unsigned long long)ack_pn, ack_packet_len);
+                }
+            }
+        }
+    }
+    
+    // 2. Build Handshake packet
     uint64_t pn = handshake_tracker_.AllocatePacketNumber();
     size_t packet_len = quic::BuildHandshakePacket(dcid_, scid_,
                                                     pn,
-                                                    frames, writer.Offset(),
+                                                    hs_frames, hs_writer.Offset(),
                                                     crypto_.GetClientHandshakeSecrets(),
-                                                    packet.data(), packet.size());
+                                                    packet_buf_ + total_len,
+                                                    sizeof(packet_buf_) - total_len);
     
     if (packet_len == 0) {
         ESP_LOGW(TAG, "BuildHandshakePacket failed");
         return false;
     }
+    
+    total_len += packet_len;
     
     if (config_.enable_debug) {
         ESP_LOGI(TAG, "[SendFrame] CRYPTO (Client Finished) in Handshake packet, PN=%llu, len=%zu",
@@ -1474,7 +1504,19 @@ bool QuicConnection::Impl::SendClientFinished() {
     handshake_tracker_.OnPacketSent(pn, current_time_us_, packet_len, true);
     loss_detector_.OnPacketSent(pn, current_time_us_, packet_len, true);
     
-    bool ok = SendPacket(packet.data(), packet_len);
+    // RFC 9000 Section 14.1: UDP datagrams carrying Initial packets MUST be >= 1200 bytes
+    // Pad the datagram with zeros at the end if needed
+    if (has_initial && total_len < 1200) {
+        memset(packet_buf_ + total_len, 0, 1200 - total_len);
+        total_len = 1200;
+    }
+    
+    // Send coalesced datagram (Initial ACK + Handshake)
+    if (config_.enable_debug && has_initial) {
+        ESP_LOGI(TAG, "[SendPacket] Coalesced datagram, total len=%zu", total_len);
+    }
+    
+    bool ok = SendPacket(packet_buf_, total_len);
     if (ok) {
         state_ = ConnectionState::kConnected;
     }
@@ -1582,7 +1624,9 @@ void QuicConnection::Impl::ProcessStreamFrame(quic::BufferReader* reader,
     }
     
     // Update flow control (must do this even for cancelled streams for protocol consistency)
+    // Pass offset to correctly handle out-of-order and duplicate data
     flow_controller_.OnStreamBytesReceived(stream_data.stream_id, 
+                                            stream_data.offset,
                                             stream_data.length);
     
     // Check if we've sent STOP_SENDING for this stream - if so, ignore the data
@@ -1606,13 +1650,12 @@ void QuicConnection::Impl::ProcessStreamFrame(quic::BufferReader* reader,
         ESP_LOGW(TAG, "  No H3 handler set, stream data dropped!");
     }
     
-    // Queue flow control updates to be sent with next outgoing packet
-    // This reduces packet count and piggybacks control frames on data packets
+    // Send flow control updates immediately (no queue, no piggyback)
     if (flow_controller_.ShouldSendMaxData()) {
-        QueueMaxDataUpdate();
+        SendMaxDataFrame();
     }
     if (flow_controller_.ShouldSendMaxStreamData(stream_data.stream_id)) {
-        QueueMaxStreamDataUpdate(stream_data.stream_id);
+        SendMaxStreamDataFrame(stream_data.stream_id);
     }
 }
 
@@ -1672,11 +1715,13 @@ bool QuicConnection::Impl::SendMaxDataFrame() {
         return false;
     }
     
+    size_t frame_len = writer.Offset();
+    
     // Build 1-RTT packet
     std::vector<uint8_t> packet(256);
     uint64_t pn = app_tracker_.AllocatePacketNumber();
     size_t packet_len = quic::Build1RttPacket(dcid_, pn, false, crypto_.GetKeyPhase() != 0,
-                                               frames, writer.Offset(),
+                                               frames, frame_len,
                                                crypto_.GetClientAppSecrets(),
                                                packet.data(), packet.size());
     
@@ -1685,10 +1730,16 @@ bool QuicConnection::Impl::SendMaxDataFrame() {
     }
     
     if (config_.enable_debug) {
-        ESP_LOGI(TAG, "[SendFrame] MAX_DATA frame to increase flow control window");
+        ESP_LOGW(TAG, "[SendFrame] MAX_DATA frame to increase flow control window, pn=%llu, len=%zu",
+                 (unsigned long long)pn, packet_len);
     }
     
-    app_tracker_.OnPacketSent(pn, current_time_us_, packet_len, false);
+    // MAX_DATA is ack-eliciting per RFC 9002 - must be reliably delivered
+    // to prevent flow control deadlock
+    std::vector<uint8_t> frame_copy(frames, frames + frame_len);
+    app_tracker_.OnPacketSent(pn, current_time_us_, packet_len, true, std::move(frame_copy), 0);
+    loss_detector_.OnPacketSent(pn, current_time_us_, packet_len, true);
+    
     return SendPacket(packet.data(), packet_len);
 }
 
@@ -1705,11 +1756,13 @@ bool QuicConnection::Impl::SendMaxStreamDataFrame(uint64_t stream_id) {
         return false;
     }
     
+    size_t frame_len = writer.Offset();
+    
     // Build 1-RTT packet
     std::vector<uint8_t> packet(256);
     uint64_t pn = app_tracker_.AllocatePacketNumber();
     size_t packet_len = quic::Build1RttPacket(dcid_, pn, false, crypto_.GetKeyPhase() != 0,
-                                               frames, writer.Offset(),
+                                               frames, frame_len,
                                                crypto_.GetClientAppSecrets(),
                                                packet.data(), packet.size());
     
@@ -1718,22 +1771,27 @@ bool QuicConnection::Impl::SendMaxStreamDataFrame(uint64_t stream_id) {
     }
     
     if (config_.enable_debug) {
-        ESP_LOGI(TAG, "[SendFrame] MAX_STREAM_DATA for stream %llu", 
-                 (unsigned long long)stream_id);
+        ESP_LOGW(TAG, "[SendFrame] MAX_STREAM_DATA for stream %llu, pn=%llu, len=%zu", 
+                 (unsigned long long)stream_id, (unsigned long long)pn, packet_len);
     }
     
-    app_tracker_.OnPacketSent(pn, current_time_us_, packet_len, false);
+    // MAX_STREAM_DATA is ack-eliciting per RFC 9002 - must be reliably delivered
+    // to prevent flow control deadlock
+    std::vector<uint8_t> frame_copy(frames, frames + frame_len);
+    app_tracker_.OnPacketSent(pn, current_time_us_, packet_len, true, std::move(frame_copy), stream_id);
+    loss_detector_.OnPacketSent(pn, current_time_us_, packet_len, true);
+    
     return SendPacket(packet.data(), packet_len);
 }
 
 void QuicConnection::Impl::CheckAndSendFlowControlUpdates() {
-    // Check connection-level flow control and queue update if needed
+    // Check connection-level flow control and send update immediately
     if (flow_controller_.ShouldSendMaxData()) {
-        QueueMaxDataUpdate();
+        SendMaxDataFrame();
     }
     
-    // Flush any pending frames (ACK + control frames)
-    FlushPendingFrames();
+    // Send ACK if needed
+    SendAckIfNeeded(quic::PacketType::k1Rtt);
 }
 
 //=============================================================================
@@ -1746,7 +1804,7 @@ bool QuicConnection::Impl::SendPacket(const uint8_t* data, size_t len) {
     }
     
     if (config_.enable_debug) {
-        ESP_LOGI(TAG, "[SendPacket] len=%zu bytes", len);
+        ESP_LOGW(TAG, "[SendPacket] len=%zu bytes", len);
     }
     int result = send_cb_(data, len);
     if (result > 0) {
@@ -1826,148 +1884,49 @@ bool QuicConnection::Impl::SendAckIfNeeded(quic::PacketType pkt_type) {
     ack_mgr->OnAckSent();
     
     if (config_.enable_debug) {
-        ESP_LOGI(TAG, "[SendFrame] ACK packet, PN=%llu, len=%zu", 
-                 (unsigned long long)pn, packet_len);
+        ESP_LOGI(TAG, "[SendFrame] ACK packet, type=%d, PN=%llu, len=%zu", 
+                 static_cast<int>(pkt_type), (unsigned long long)pn, packet_len);
     }
     
     return SendPacket(packet.data(), packet_len);
 }
 
-//=============================================================================
-// Frame Aggregation
-//=============================================================================
-
-void QuicConnection::Impl::QueueMaxDataUpdate() {
-    pending_frames_.need_max_data = true;
-}
-
-void QuicConnection::Impl::QueueMaxStreamDataUpdate(uint64_t stream_id) {
-    pending_frames_.need_max_stream_data.insert(stream_id);
-}
-
-size_t QuicConnection::Impl::BuildAggregatedPacket(quic::BufferWriter* frame_writer,
-                                                    uint64_t stream_id,
-                                                    const uint8_t* stream_data,
-                                                    size_t stream_len,
-                                                    uint64_t stream_offset,
-                                                    bool fin) {
-    // This function aggregates multiple frames into one packet payload:
-    // 1. ACK frame (if needed, highest priority for timely acknowledgment)
-    // 2. MAX_DATA frame (if queued)
-    // 3. MAX_STREAM_DATA frames (if queued)
-    // 4. STREAM frame (if provided)
+void QuicConnection::Impl::SendCoalescedAcks() {
+    // RFC 9000 Section 14.1: UDP datagrams carrying Initial packets MUST be at least 1200 bytes
+    // Therefore, we do NOT send standalone Initial ACK here.
+    // Initial ACK is coalesced with Client Finished in SendClientFinished().
     //
-    // Returns the total frame payload size written to frame_writer
+    // This function only sends Handshake ACK (no 1200 byte requirement).
     
-    size_t initial_offset = frame_writer->Offset();
+    if (!handshake_ack_mgr_.ShouldSendAck(current_time_us_)) {
+        return;
+    }
     
-    // 1. Add ACK frame if needed (ACK frames are not retransmittable)
-    if (app_ack_mgr_.ShouldSendAck(current_time_us_)) {
-        if (app_ack_mgr_.BuildAckFrame(frame_writer, current_time_us_)) {
-            app_ack_mgr_.OnAckSent();
-            if (config_.enable_debug) {
-                ESP_LOGI(TAG, "[SendFrame] ACK (in aggregated packet)");
-            }
+    if (!crypto_.HasHandshakeKeys()) {
+        return;
+    }
+    
+    // Build Handshake ACK packet
+    uint8_t frames[64];
+    quic::BufferWriter writer(frames, sizeof(frames));
+    if (!handshake_ack_mgr_.BuildAckFrame(&writer, current_time_us_)) {
+        return;
+    }
+    
+    uint64_t pn = handshake_tracker_.AllocatePacketNumber();
+    size_t packet_len = quic::BuildHandshakePacket(dcid_, scid_, pn,
+                                                    frames, writer.Offset(),
+                                                    crypto_.GetClientHandshakeSecrets(),
+                                                    packet_buf_, sizeof(packet_buf_));
+    if (packet_len > 0) {
+        handshake_tracker_.OnPacketSent(pn, current_time_us_, packet_len, false);
+        handshake_ack_mgr_.OnAckSent();
+        if (config_.enable_debug) {
+            ESP_LOGI(TAG, "[SendFrame] Handshake ACK, PN=%llu, len=%zu",
+                     (unsigned long long)pn, packet_len);
         }
+        SendPacket(packet_buf_, packet_len);
     }
-    
-    // 2. Add MAX_DATA frame if needed
-    if (pending_frames_.need_max_data) {
-        if (flow_controller_.BuildMaxDataFrame(frame_writer)) {
-            pending_frames_.need_max_data = false;
-            if (config_.enable_debug) {
-                ESP_LOGI(TAG, "[SendFrame] MAX_DATA (in aggregated packet)");
-            }
-        }
-    }
-    
-    // 3. Add MAX_STREAM_DATA frames (limit to avoid oversized packets)
-    size_t max_stream_data_count = 0;
-    const size_t kMaxStreamDataFramesPerPacket = 4;  // Limit to prevent packet bloat
-    
-    for (auto it = pending_frames_.need_max_stream_data.begin();
-         it != pending_frames_.need_max_stream_data.end() && 
-         max_stream_data_count < kMaxStreamDataFramesPerPacket; ) {
-        
-        uint64_t sid = *it;
-        StreamFlowState* state = flow_controller_.GetStreamState(sid);
-        if (state) {
-            // Build MAX_STREAM_DATA frame directly
-            uint64_t new_max = state->recv_offset + config_.max_stream_data;
-            if (new_max > state->recv_max_sent) {
-                if (quic::BuildMaxStreamDataFrame(frame_writer, sid, new_max)) {
-                    state->recv_max_sent = new_max;
-                    it = pending_frames_.need_max_stream_data.erase(it);
-                    max_stream_data_count++;
-                    if (config_.enable_debug) {
-                        ESP_LOGI(TAG, "[SendFrame] MAX_STREAM_DATA stream=%llu (in aggregated packet)",
-                                 (unsigned long long)sid);
-                    }
-                    continue;
-                }
-            }
-        }
-        it = pending_frames_.need_max_stream_data.erase(it);
-    }
-    
-    // 4. Add STREAM frame if provided
-    if (stream_data != nullptr && stream_len > 0) {
-        if (!quic::BuildStreamFrame(frame_writer, stream_id, stream_offset, 
-                                     stream_data, stream_len, fin)) {
-            ESP_LOGW(TAG, "BuildAggregatedPacket: failed to add STREAM frame");
-        }
-    } else if (stream_id != UINT64_MAX && fin) {
-        // FIN-only frame (no data)
-        if (!quic::BuildStreamFrame(frame_writer, stream_id, stream_offset, 
-                                     nullptr, 0, true)) {
-            ESP_LOGW(TAG, "BuildAggregatedPacket: failed to add FIN-only STREAM frame");
-        }
-    }
-    
-    return frame_writer->Offset() - initial_offset;
-}
-
-bool QuicConnection::Impl::FlushPendingFrames() {
-    if (!crypto_.HasApplicationKeys()) {
-        return false;
-    }
-    
-    // Check if there are any pending frames to send
-    if (!pending_frames_.HasPending() && !app_ack_mgr_.ShouldSendAck(current_time_us_)) {
-        return true;  // Nothing to send, that's okay
-    }
-    
-    current_time_us_ = quic::GetCurrentTimeUs();
-    
-    // Build aggregated frames
-    quic::BufferWriter writer(frame_buf_, sizeof(frame_buf_));
-    size_t frame_len = BuildAggregatedPacket(&writer);
-    
-    if (frame_len == 0) {
-        return true;  // No frames were added
-    }
-    
-    // Build 1-RTT packet
-    uint64_t pn = app_tracker_.AllocatePacketNumber();
-    size_t packet_len = quic::Build1RttPacket(dcid_, pn, false, crypto_.GetKeyPhase() != 0,
-                                               frame_buf_, writer.Offset(),
-                                               crypto_.GetClientAppSecrets(),
-                                               packet_buf_, sizeof(packet_buf_));
-    
-    if (packet_len == 0) {
-        return false;
-    }
-    
-    // Track as non-ack-eliciting if only contains ACK/MAX_DATA/MAX_STREAM_DATA
-    // (these control frames don't need retransmission tracking)
-    app_tracker_.OnPacketSent(pn, current_time_us_, packet_len, false);
-    
-    if (config_.enable_debug) {
-        ESP_LOGI(TAG, "FlushPendingFrames: sent aggregated control packet, PN=%llu, len=%zu",
-                 (unsigned long long)pn, packet_len);
-    }
-    
-    return SendPacket(packet_buf_, packet_len);
 }
 
 //=============================================================================
@@ -1992,35 +1951,6 @@ void QuicConnection::Impl::BeginBatch() {
                 ESP_LOGD(TAG, "BeginBatch: added ACK frame");
             }
         }
-    }
-    
-    // Add pending MAX_DATA if needed
-    if (pending_frames_.need_max_data) {
-        if (flow_controller_.BuildMaxDataFrame(batch_state_.writer)) {
-            pending_frames_.need_max_data = false;
-            if (config_.enable_debug) {
-                ESP_LOGD(TAG, "BeginBatch: added MAX_DATA frame");
-            }
-        }
-    }
-    
-    // Add pending MAX_STREAM_DATA frames
-    for (auto it = pending_frames_.need_max_stream_data.begin();
-         it != pending_frames_.need_max_stream_data.end(); ) {
-        
-        uint64_t sid = *it;
-        StreamFlowState* state = flow_controller_.GetStreamState(sid);
-        if (state) {
-            uint64_t new_max = state->recv_offset + config_.max_stream_data;
-            if (new_max > state->recv_max_sent) {
-                if (quic::BuildMaxStreamDataFrame(batch_state_.writer, sid, new_max)) {
-                    state->recv_max_sent = new_max;
-                    it = pending_frames_.need_max_stream_data.erase(it);
-                    continue;
-                }
-            }
-        }
-        it = pending_frames_.need_max_stream_data.erase(it);
     }
     
     if (config_.enable_debug) {
@@ -2144,7 +2074,7 @@ bool QuicConnection::Impl::SendStreamData(uint64_t stream_id,
     }
     
     //=========================================================================
-    // Normal Mode: build aggregated packet and send immediately
+    // Normal Mode: build packet with STREAM frame (optionally piggyback ACK)
     //=========================================================================
     quic::BufferWriter writer(frame_buf_, sizeof(frame_buf_));
     
@@ -2157,44 +2087,6 @@ bool QuicConnection::Impl::SendStreamData(uint64_t stream_id,
                 ESP_LOGD(TAG, "SendStreamData: piggybacked ACK frame");
             }
         }
-    }
-    
-    // Add MAX_DATA if queued
-    if (pending_frames_.need_max_data) {
-        if (flow_controller_.BuildMaxDataFrame(&writer)) {
-            pending_frames_.need_max_data = false;
-            if (config_.enable_debug) {
-                ESP_LOGD(TAG, "SendStreamData: piggybacked MAX_DATA frame");
-            }
-        }
-    }
-    
-    // Add some MAX_STREAM_DATA frames if queued (limit to avoid bloat)
-    size_t max_stream_data_count = 0;
-    const size_t kMaxStreamDataFramesPerPacket = 2;  // Conservative limit when sending data
-    
-    for (auto it = pending_frames_.need_max_stream_data.begin();
-         it != pending_frames_.need_max_stream_data.end() && 
-         max_stream_data_count < kMaxStreamDataFramesPerPacket; ) {
-        
-        uint64_t sid = *it;
-        StreamFlowState* state = flow_controller_.GetStreamState(sid);
-        if (state) {
-            uint64_t new_max = state->recv_offset + config_.max_stream_data;
-            if (new_max > state->recv_max_sent) {
-                if (quic::BuildMaxStreamDataFrame(&writer, sid, new_max)) {
-                    state->recv_max_sent = new_max;
-                    it = pending_frames_.need_max_stream_data.erase(it);
-                    max_stream_data_count++;
-                    if (config_.enable_debug) {
-                        ESP_LOGD(TAG, "SendStreamData: piggybacked MAX_STREAM_DATA for stream %llu",
-                                 (unsigned long long)sid);
-                    }
-                    continue;
-                }
-            }
-        }
-        it = pending_frames_.need_max_stream_data.erase(it);
     }
     
     // Mark where STREAM frame starts (for retransmission tracking)
@@ -2210,7 +2102,7 @@ bool QuicConnection::Impl::SendStreamData(uint64_t stream_id,
     std::vector<uint8_t> frame_copy(frame_buf_ + stream_frame_start, 
                                      frame_buf_ + stream_frame_start + stream_frame_len);
     
-    // Build 1-RTT packet with all aggregated frames
+    // Build 1-RTT packet
     uint64_t pn = app_tracker_.AllocatePacketNumber();
     size_t packet_len = quic::Build1RttPacket(dcid_, pn, false, crypto_.GetKeyPhase() != 0,
                                                frame_buf_, writer.Offset(),
@@ -2326,20 +2218,12 @@ uint32_t QuicConnection::Impl::OnTimerTick(uint32_t elapsed_ms) {
         }
     }
     
-    // Check if delayed ACKs or pending control frames need to be sent
+    // Check if delayed ACKs need to be sent
     if (handshake_complete_) {
-        // Use FlushPendingFrames to aggregate ACK + MAX_DATA + MAX_STREAM_DATA
-        if (app_ack_mgr_.ShouldSendAck(current_time_us_) || pending_frames_.HasPending()) {
-            FlushPendingFrames();
-        }
+        SendAckIfNeeded(quic::PacketType::k1Rtt);
     } else {
-        // During handshake, check Initial and Handshake ACKs separately
-        if (initial_ack_mgr_.ShouldSendAck(current_time_us_)) {
-            SendAckIfNeeded(quic::PacketType::kInitial);
-        }
-        if (handshake_ack_mgr_.ShouldSendAck(current_time_us_)) {
-            SendAckIfNeeded(quic::PacketType::kHandshake);
-        }
+        // During handshake, coalesce Initial + Handshake ACKs into one UDP datagram
+        SendCoalescedAcks();
     }
     
     // Calculate time until next ACK deadline
@@ -3193,20 +3077,20 @@ void QuicConnection::Impl::OnFrameAck(const AckFrameData& ack_data) {
 
 void QuicConnection::Impl::OnFrameStream(uint64_t stream_id, uint64_t offset,
                                           const uint8_t* data, size_t len, bool fin) {
-    // Update flow control
-    flow_controller_.OnStreamBytesReceived(stream_id, len);
+    // Update flow control - pass offset to correctly handle out-of-order/duplicate data
+    flow_controller_.OnStreamBytesReceived(stream_id, offset, len);
     
     // Pass to H3 handler
     if (h3_handler_) {
         h3_handler_->OnStreamData(stream_id, offset, data, len, fin);
     }
     
-    // Queue flow control updates to be piggybacked on next outgoing packet
+    // Send flow control updates immediately (no queue, no piggyback)
     if (flow_controller_.ShouldSendMaxData()) {
-        QueueMaxDataUpdate();
+        SendMaxDataFrame();
     }
     if (flow_controller_.ShouldSendMaxStreamData(stream_id)) {
-        QueueMaxStreamDataUpdate(stream_id);
+        SendMaxStreamDataFrame(stream_id);
     }
 }
 

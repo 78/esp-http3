@@ -62,12 +62,20 @@ void FlowController::OnBytesReceived(uint64_t bytes) {
 }
 
 bool FlowController::ShouldSendMaxData() const {
-    // Send MAX_DATA when we've consumed more than half the window
-    // Compare against the last MAX_DATA we sent (conn_recv_max_sent_),
-    // not the current limit (conn_recv_max_), to match Python implementation
+    // Check if remaining window is below threshold
+    // We should send MAX_DATA when the remaining receive window
+    // drops below half of the initial window size
     uint64_t consumed = conn_recv_offset_;
     uint64_t current_limit = conn_recv_max_sent_;
-    return consumed >= current_limit * kUpdateThreshold;
+    
+    // Calculate remaining window
+    if (consumed >= current_limit) {
+        return true;  // Window exhausted, must send immediately
+    }
+    
+    uint64_t remaining = current_limit - consumed;
+    // Send when remaining window is less than half of initial window
+    return remaining < initial_max_data_ * kUpdateThreshold;
 }
 
 bool FlowController::BuildMaxDataFrame(quic::BufferWriter* writer) {
@@ -142,7 +150,7 @@ void FlowController::OnStreamBytesSent(uint64_t stream_id, uint64_t bytes) {
     OnBytesSent(bytes);
 }
 
-void FlowController::OnStreamBytesReceived(uint64_t stream_id, uint64_t bytes) {
+void FlowController::OnStreamBytesReceived(uint64_t stream_id, uint64_t offset, uint64_t len) {
     auto it = streams_.find(stream_id);
     if (it == streams_.end()) {
         // Create stream state if it doesn't exist (e.g., server-initiated streams)
@@ -150,9 +158,18 @@ void FlowController::OnStreamBytesReceived(uint64_t stream_id, uint64_t bytes) {
         it = streams_.find(stream_id);
     }
     if (it != streams_.end()) {
-        it->second.recv_offset += bytes;
+        // Calculate the end offset of this data
+        uint64_t end_offset = offset + len;
+        
+        // Only count bytes beyond what we've already accounted for
+        // This correctly handles out-of-order and duplicate/retransmitted data
+        if (end_offset > it->second.recv_offset) {
+            uint64_t new_bytes = end_offset - it->second.recv_offset;
+            it->second.recv_offset = end_offset;  // Update to highest offset
+            OnBytesReceived(new_bytes);  // Only count truly new bytes
+        }
+        // else: duplicate/overlap data, don't count toward flow control
     }
-    OnBytesReceived(bytes);
 }
 
 bool FlowController::ShouldSendMaxStreamData(uint64_t stream_id) const {
@@ -161,12 +178,20 @@ bool FlowController::ShouldSendMaxStreamData(uint64_t stream_id) const {
         return false;
     }
     
-    // Compare against the last MAX_STREAM_DATA we sent (recv_max_sent),
-    // not the current limit (recv_max), to match Python implementation
+    // Check if remaining window is below threshold
+    // We should send MAX_STREAM_DATA when the remaining receive window
+    // drops below half of the initial window size
     uint64_t consumed = it->second.recv_offset;
     uint64_t current_limit = it->second.recv_max_sent;
-    // Use >= instead of > to trigger earlier (at exactly 50% instead of 50%+1)
-    return consumed >= current_limit * kUpdateThreshold;
+    
+    // Calculate remaining window
+    if (consumed >= current_limit) {
+        return true;  // Window exhausted, must send immediately
+    }
+    
+    uint64_t remaining = current_limit - consumed;
+    // Send when remaining window is less than half of initial window
+    return remaining < initial_max_stream_data_ * kUpdateThreshold;
 }
 
 bool FlowController::BuildMaxStreamDataFrame(quic::BufferWriter* writer, 

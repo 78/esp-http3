@@ -120,8 +120,16 @@ public:
     
     /**
      * @brief Record bytes received on stream
+     * 
+     * This function properly handles out-of-order and duplicate data by tracking
+     * the highest offset received. Only bytes beyond the previously highest offset
+     * are counted toward flow control.
+     * 
+     * @param stream_id Stream identifier
+     * @param offset Starting offset of the received data
+     * @param len Length of the received data
      */
-    void OnStreamBytesReceived(uint64_t stream_id, uint64_t bytes);
+    void OnStreamBytesReceived(uint64_t stream_id, uint64_t offset, uint64_t len);
     
     /**
      * @brief Check if we should send MAX_STREAM_DATA
