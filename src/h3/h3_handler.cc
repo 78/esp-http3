@@ -492,13 +492,36 @@ void H3Handler::HandleRequestStream(uint64_t stream_id,
         return;
     }
     
-    ESP_LOGD(TAG, "HandleRequestStream: stream=%llu, buffer_size=%zu, fin=%d",
-             (unsigned long long)stream_id, stream->recv_buffer.size(), fin ? 1 : 0);
+    ESP_LOGD(TAG, "HandleRequestStream: stream=%llu, buffer_size=%zu, pending_data=%llu, fin=%d",
+             (unsigned long long)stream_id, stream->recv_buffer.size(),
+             (unsigned long long)stream->pending_data_frame_remaining, fin ? 1 : 0);
     
     // Parse frames from buffer
     size_t offset = 0;
     int frame_count = 0;
+    
     while (offset < stream->recv_buffer.size()) {
+        // Check if we're in the middle of a large DATA frame
+        if (stream->pending_data_frame_remaining > 0) {
+            // Continue processing the pending DATA frame incrementally
+            size_t available = stream->recv_buffer.size() - offset;
+            size_t to_deliver = std::min(available, 
+                                         static_cast<size_t>(stream->pending_data_frame_remaining));
+            
+            ESP_LOGD(TAG, "  Continuing DATA frame: delivering %zu bytes, %llu remaining after",
+                     to_deliver, 
+                     (unsigned long long)(stream->pending_data_frame_remaining - to_deliver));
+            
+            if (on_stream_data_ && to_deliver > 0) {
+                on_stream_data_(stream_id, stream->recv_buffer.data() + offset, to_deliver, false);
+            }
+            
+            stream->pending_data_frame_remaining -= to_deliver;
+            offset += to_deliver;
+            continue;
+        }
+        
+        // Parse new frame header
         H3FrameHeader header;
         if (!ParseH3FrameHeader(stream->recv_buffer.data() + offset,
                                  stream->recv_buffer.size() - offset,
@@ -509,6 +532,36 @@ void H3Handler::HandleRequestStream(uint64_t stream_id,
         }
         
         size_t frame_total = header.header_size + header.length;
+        size_t available_after_header = stream->recv_buffer.size() - offset - header.header_size;
+        
+        // For DATA frames, support incremental delivery (don't wait for complete frame)
+        if (header.type == H3FrameType::kData) {
+            ESP_LOGD(TAG, "  H3 Frame: DATA (len=%llu bytes, available=%zu)", 
+                     (unsigned long long)header.length, available_after_header);
+            
+            const uint8_t* payload = stream->recv_buffer.data() + offset + header.header_size;
+            size_t to_deliver = std::min(available_after_header, 
+                                         static_cast<size_t>(header.length));
+            
+            // Deliver available data immediately
+            if (on_stream_data_ && to_deliver > 0) {
+                on_stream_data_(stream_id, payload, to_deliver, false);
+            }
+            
+            // Track remaining bytes if frame is incomplete
+            if (to_deliver < header.length) {
+                stream->pending_data_frame_remaining = header.length - to_deliver;
+                ESP_LOGD(TAG, "  DATA frame incomplete, %llu bytes remaining",
+                         (unsigned long long)stream->pending_data_frame_remaining);
+            }
+            
+            // Consume header + delivered data
+            offset += header.header_size + to_deliver;
+            frame_count++;
+            continue;
+        }
+        
+        // For non-DATA frames (HEADERS, etc.), wait for complete frame
         if (offset + frame_total > stream->recv_buffer.size()) {
             ESP_LOGD(TAG, "  Need more data for H3 frame body (need=%zu, have=%zu)",
                      frame_total, stream->recv_buffer.size() - offset);
@@ -549,17 +602,6 @@ void H3Handler::HandleRequestStream(uint64_t stream_id,
                 }
                 break;
             }
-            
-            case H3FrameType::kData:
-                ESP_LOGD(TAG, "  H3 Frame: DATA (len=%llu bytes)", (unsigned long long)header.length);
-                
-                // Notify streaming data if callback set (don't store body to save memory)
-                if (on_stream_data_) {
-                    on_stream_data_(stream_id, payload, header.length, false);
-                } else {
-                    ESP_LOGW(TAG, "  No OnStreamData callback set - body data will be discarded!");
-                }
-                break;
                 
             default:
                 ESP_LOGW(TAG, "  H3 Frame: Unknown type 0x%02x (len=%llu)", 

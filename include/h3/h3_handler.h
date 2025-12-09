@@ -74,6 +74,9 @@ struct H3Stream {
     uint64_t fin_offset = UINT64_MAX;      // Final offset if FIN received
     size_t parsed_offset = 0;              // Offset of parsed H3 frames
     
+    // Incremental DATA frame processing (for large downloads)
+    uint64_t pending_data_frame_remaining = 0;  // Remaining bytes in current DATA frame
+    
     // Send data
     std::vector<uint8_t> send_buffer;
     size_t send_offset = 0;
