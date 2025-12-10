@@ -3,7 +3,7 @@
  * @brief QUIC Frame Processor Implementation
  */
 
-#include "client/frame_processor.h"
+#include "core/frame_processor.h"
 #include "quic/quic_frame.h"
 
 #include <esp_log.h>

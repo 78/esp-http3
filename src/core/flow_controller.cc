@@ -3,7 +3,7 @@
  * @brief Flow Control Implementation
  */
 
-#include "client/flow_controller.h"
+#include "core/flow_controller.h"
 #include "quic/quic_frame.h"
 
 #include <algorithm>
@@ -29,6 +29,7 @@ void FlowController::Reset() {
     conn_send_offset_ = 0;
     conn_send_max_ = 0;
     conn_recv_offset_ = 0;
+    conn_recv_consumed_ = 0;
     conn_recv_max_ = quic::defaults::kInitialMaxData;
     conn_recv_max_sent_ = quic::defaults::kInitialMaxData;
     streams_.clear();
@@ -61,14 +62,21 @@ void FlowController::OnBytesReceived(uint64_t bytes) {
     conn_recv_offset_ += bytes;
 }
 
+void FlowController::OnBytesConsumed(uint64_t bytes) {
+    conn_recv_consumed_ += bytes;
+    // Don't let consumed exceed received
+    if (conn_recv_consumed_ > conn_recv_offset_) {
+        conn_recv_consumed_ = conn_recv_offset_;
+    }
+}
+
 bool FlowController::ShouldSendMaxData() const {
-    // Check if remaining window is below threshold
-    // We should send MAX_DATA when the remaining receive window
-    // drops below half of the initial window size
-    uint64_t consumed = conn_recv_offset_;
+    // Use consumed bytes (not received bytes) for backpressure support
+    // This allows upper layer to control flow by delaying consumption acknowledgment
+    uint64_t consumed = conn_recv_consumed_;
     uint64_t current_limit = conn_recv_max_sent_;
     
-    // Calculate remaining window
+    // Calculate remaining window based on consumed bytes
     if (consumed >= current_limit) {
         return true;  // Window exhausted, must send immediately
     }
@@ -172,19 +180,31 @@ void FlowController::OnStreamBytesReceived(uint64_t stream_id, uint64_t offset, 
     }
 }
 
+void FlowController::OnStreamBytesConsumed(uint64_t stream_id, uint64_t bytes) {
+    auto it = streams_.find(stream_id);
+    if (it != streams_.end()) {
+        it->second.recv_consumed += bytes;
+        // Don't let consumed exceed received
+        if (it->second.recv_consumed > it->second.recv_offset) {
+            it->second.recv_consumed = it->second.recv_offset;
+        }
+        // Also update connection-level consumed count
+        OnBytesConsumed(bytes);
+    }
+}
+
 bool FlowController::ShouldSendMaxStreamData(uint64_t stream_id) const {
     auto it = streams_.find(stream_id);
     if (it == streams_.end()) {
         return false;
     }
     
-    // Check if remaining window is below threshold
-    // We should send MAX_STREAM_DATA when the remaining receive window
-    // drops below half of the initial window size
-    uint64_t consumed = it->second.recv_offset;
+    // Use consumed bytes (not received bytes) for backpressure support
+    // This allows upper layer to control flow by delaying consumption acknowledgment
+    uint64_t consumed = it->second.recv_consumed;
     uint64_t current_limit = it->second.recv_max_sent;
     
-    // Calculate remaining window
+    // Calculate remaining window based on consumed bytes
     if (consumed >= current_limit) {
         return true;  // Window exhausted, must send immediately
     }

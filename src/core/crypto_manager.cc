@@ -3,7 +3,7 @@
  * @brief QUIC Crypto Manager Implementation
  */
 
-#include "client/crypto_manager.h"
+#include "core/crypto_manager.h"
 #include "quic/quic_crypto.h"
 
 #include <cstring>

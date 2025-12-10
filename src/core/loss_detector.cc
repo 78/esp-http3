@@ -3,7 +3,7 @@
  * @brief Loss Detection Implementation
  */
 
-#include "client/loss_detector.h"
+#include "core/loss_detector.h"
 
 #include <algorithm>
 #include <cmath>

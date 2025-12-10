@@ -68,7 +68,9 @@
 
 #pragma once
 
-#include "client/quic_connection.h"
+#include "core/quic_connection.h"
+#include "client/power_lock.h"
+#include "client/http3_client.h"
 
 // Re-export main types for convenience
 namespace esp_http3 {

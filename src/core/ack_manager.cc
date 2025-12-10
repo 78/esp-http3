@@ -8,10 +8,11 @@
  * - Multi-range ACK support
  */
 
-#include "client/ack_manager.h"
+#include "core/ack_manager.h"
 #include "quic/quic_frame.h"
 
 #include <algorithm>
+#include <esp_log.h>
 
 namespace esp_http3 {
 
@@ -150,6 +151,7 @@ bool AckManager::BuildAckFrame(quic::BufferWriter* writer, uint64_t current_time
     std::vector<std::pair<uint64_t, uint64_t>> ranges = GetAckRanges(received_packets_);
     
     if (ranges.empty()) {
+        ESP_LOGW("AckManager", "BuildAckFrame: GetAckRanges returned empty");
         return false;
     }
     
@@ -181,10 +183,11 @@ bool AckManager::BuildAckFrame(quic::BufferWriter* writer, uint64_t current_time
     }
     
     return quic::BuildAckFrame(writer,
-                               static_cast<uint64_t>(largest_received_),
-                               encoded_ack_delay,
-                               first_ack_range,
-                               ack_ranges);
+        static_cast<uint64_t>(largest_received_),
+        encoded_ack_delay,
+        first_ack_range,
+        ack_ranges);
+
 }
 
 void AckManager::OnAckSent() {

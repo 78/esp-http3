@@ -7,12 +7,12 @@
  * - FrameProcessor: Parses and dispatches incoming frames
  */
 
-#include "client/quic_connection.h"
-#include "client/ack_manager.h"
-#include "client/flow_controller.h"
-#include "client/loss_detector.h"
-#include "client/crypto_manager.h"
-#include "client/frame_processor.h"
+#include "core/quic_connection.h"
+#include "core/ack_manager.h"
+#include "core/flow_controller.h"
+#include "core/loss_detector.h"
+#include "core/crypto_manager.h"
+#include "core/frame_processor.h"
 #include "h3/h3_handler.h"
 #include "quic/quic_crypto.h"
 #include "quic/quic_aead.h"
@@ -56,7 +56,7 @@ public:
     int OpenStream(const std::string& method,
                    const std::string& path,
                    const std::vector<std::pair<std::string, std::string>>& headers);
-    bool WriteStream(int stream_id, const uint8_t* data, size_t len);
+    ssize_t WriteStream(int stream_id, const uint8_t* data, size_t len);
     bool FinishStream(int stream_id);
     bool ResetStream(int stream_id, uint64_t error_code);
     
@@ -74,12 +74,25 @@ public:
                stop_sending_streams_.find(sid) != stop_sending_streams_.end();
     }
     
+    void AcknowledgeStreamData(int stream_id, size_t bytes) {
+        uint64_t sid = static_cast<uint64_t>(stream_id);
+        flow_controller_.OnStreamBytesConsumed(sid, bytes);
+        
+        // Check if we should send flow control updates (backpressure released)
+        if (flow_controller_.ShouldSendMaxStreamData(sid)) {
+            SendMaxStreamDataFrame(sid);
+        }
+        if (flow_controller_.ShouldSendMaxData()) {
+            SendMaxDataFrame();
+        }
+    }
+    
     void SetOnConnected(OnConnectedCallback cb) { on_connected_ = std::move(cb); }
     void SetOnDisconnected(OnDisconnectedCallback cb) { on_disconnected_ = std::move(cb); }
     void SetOnResponse(OnResponseCallback cb) { on_response_ = std::move(cb); }
     void SetOnStreamData(OnStreamDataCallback cb) { on_stream_data_ = std::move(cb); }
-    void SetOnWriteComplete(OnWriteCompleteCallback cb) { on_write_complete_ = std::move(cb); }
-    void SetOnWriteError(OnWriteErrorCallback cb) { on_write_error_ = std::move(cb); }
+    void SetOnStreamWritable(OnStreamWritableCallback cb) { on_stream_writable_ = std::move(cb); }
+    void SetOnWritable(OnWritableCallback cb) { on_writable_ = std::move(cb); }
     
     // DATAGRAM callback type (same as public API)
     using OnDatagramCallback = QuicConnection::OnDatagramCallback;
@@ -109,16 +122,6 @@ public:
     bool SendDatagram(const uint8_t* data, size_t len);
     size_t GetMaxDatagramSize() const;
     bool IsDatagramAvailable() const;
-    
-    // Queued write API
-    // Queue data for sending (supports PSRAM and read-only data)
-    // @param data Pointer to data (can be read-only)
-    // @param size Size of data in bytes
-    // @param deleter Optional deleter function to free memory (nullptr for read-only data)
-    bool QueueWrite(int stream_id, const uint8_t* data, size_t size, std::function<void()> deleter = nullptr);
-    bool QueueFinish(int stream_id);
-    size_t GetQueuedBytes(int stream_id) const;
-    bool IsQueueEmpty(int stream_id) const;
     
     QuicConnection::Stats GetStats() const;
 
@@ -187,8 +190,8 @@ private:
     void OnFramePathResponse(const uint8_t* data);
     void OnFrameDatagram(const uint8_t* data, size_t len);
     
-    // Write queue processing
-    void ProcessWriteQueue();
+    // Notify upper layer that connection/streams are writable
+    void NotifyWritable();
     
     // Stream cleanup - releases memory associated with a completed stream
     void CleanupStream(uint64_t stream_id);
@@ -222,68 +225,6 @@ private:
     void SendMigrationPathChallenge();
 
 private:
-    // Write queue item
-    struct WriteQueueItem {
-        const uint8_t* data = nullptr;  // Pointer to data (can be read-only)
-        size_t size = 0;                 // Total size of data
-        size_t offset = 0;               // Current send offset within data
-        bool finish = false;             // If true, this is a FIN marker (data is nullptr)
-        std::function<void()> deleter;    // Optional deleter for freeing memory (null for read-only data)
-        
-        // Default constructor (required for std::vector)
-        WriteQueueItem() = default;
-        
-        // Constructor for data items
-        WriteQueueItem(const uint8_t* d, size_t s, std::function<void()> del = nullptr)
-            : data(d), size(s), offset(0), finish(false), deleter(std::move(del)) {}
-        
-        // Constructor for FIN marker
-        WriteQueueItem(bool fin) : data(nullptr), size(0), offset(0), finish(fin), deleter(nullptr) {}
-        
-        ~WriteQueueItem() {
-            if (deleter) {
-                deleter();
-            }
-        }
-        
-        // Move constructor
-        WriteQueueItem(WriteQueueItem&& other) noexcept
-            : data(other.data), size(other.size), offset(other.offset), 
-              finish(other.finish), deleter(std::move(other.deleter)) {
-            other.data = nullptr;
-            other.size = 0;
-            other.deleter = nullptr;
-        }
-        
-        // Move assignment
-        WriteQueueItem& operator=(WriteQueueItem&& other) noexcept {
-            if (this != &other) {
-                if (deleter) deleter();
-                data = other.data;
-                size = other.size;
-                offset = other.offset;
-                finish = other.finish;
-                deleter = std::move(other.deleter);
-                other.data = nullptr;
-                other.size = 0;
-                other.deleter = nullptr;
-            }
-            return *this;
-        }
-        
-        // Disable copy
-        WriteQueueItem(const WriteQueueItem&) = delete;
-        WriteQueueItem& operator=(const WriteQueueItem&) = delete;
-    };
-    
-    // Per-stream write queue
-    struct StreamWriteQueue {
-        std::vector<WriteQueueItem> items;
-        size_t total_bytes = 0;     // Total bytes queued
-        size_t sent_bytes = 0;      // Total bytes sent
-        bool finish_queued = false; // FIN is queued
-        bool finish_sent = false;   // FIN has been sent
-    };
     SendCallback send_cb_;
     QuicConfig config_;
     ConnectionState state_ = ConnectionState::kIdle;
@@ -293,11 +234,8 @@ private:
     OnDisconnectedCallback on_disconnected_;
     OnResponseCallback on_response_;
     OnStreamDataCallback on_stream_data_;
-    OnWriteCompleteCallback on_write_complete_;
-    OnWriteErrorCallback on_write_error_;
-    
-    // Write queues (stream_id -> queue)
-    std::map<int, StreamWriteQueue> write_queues_;
+    OnStreamWritableCallback on_stream_writable_;
+    OnWritableCallback on_writable_;
     
     // Track reset streams
     std::set<uint64_t> reset_streams_;
@@ -1145,9 +1083,9 @@ void QuicConnection::Impl::ProcessAckFrame(quic::BufferReader* reader,
     loss_detector_.OnAckReceived(ack_data.largest_ack, decoded_ack_delay,
                                   current_time_us_, tracker);
     
-    // Try to send blocked data after ACK frees up congestion window
+    // ACK frees up congestion window, notify upper layer
     if (newly_acked > 0 && pkt_type == quic::PacketType::k1Rtt) {
-        ProcessWriteQueue();
+        NotifyWritable();
     }
 }
 
@@ -1839,10 +1777,11 @@ bool QuicConnection::Impl::SendAckIfNeeded(quic::PacketType pkt_type) {
         return true;
     }
     
-    // Build ACK frame
-    uint8_t frames[64];
-    quic::BufferWriter writer(frames, sizeof(frames));
+    // Build ACK frame - use larger buffer for multi-range ACKs (packet loss scenarios)
+    std::vector<uint8_t> frames(256);
+    quic::BufferWriter writer(frames.data(), frames.size());
     if (!ack_mgr->BuildAckFrame(&writer, current_time_us_)) {
+        ESP_LOGE(TAG, "SendAckIfNeeded: BuildAckFrame FAILED");
         return false;
     }
     
@@ -1857,20 +1796,20 @@ bool QuicConnection::Impl::SendAckIfNeeded(quic::PacketType pkt_type) {
                                                    retry_token_.data(),
                                                    retry_token_.size(),
                                                    pn,
-                                                   frames, writer.Offset(),
+                                                   frames.data(), writer.Offset(),
                                                    crypto_.GetClientInitialSecrets(),
                                                    packet.data(), packet.size(),
                                                    0);  // No padding for ACK-only
             break;
         case quic::PacketType::kHandshake:
             packet_len = quic::BuildHandshakePacket(dcid_, scid_, pn,
-                                                     frames, writer.Offset(),
+                                                     frames.data(), writer.Offset(),
                                                      crypto_.GetClientHandshakeSecrets(),
                                                      packet.data(), packet.size());
             break;
         default:
             packet_len = quic::Build1RttPacket(dcid_, pn, false, crypto_.GetKeyPhase() != 0,
-                                                frames, writer.Offset(),
+                                                frames.data(), writer.Offset(),
                                                 crypto_.GetClientAppSecrets(),
                                                 packet.data(), packet.size());
             break;
@@ -2246,12 +2185,8 @@ uint32_t QuicConnection::Impl::OnTimerTick(uint32_t elapsed_ms) {
         update_timer_from_ack_deadline(handshake_ack_mgr_.GetAckDeadlineUs());
     }
     
-    // Process write queues (send queued data respecting flow control)
-    // Note: ProcessWriteQueue is also called immediately when MAX_DATA/MAX_STREAM_DATA
-    // frames are received, so no polling needed here - just process any remaining data
-    if (IsConnected()) {
-        ProcessWriteQueue();
-    }
+    // Note: Write queue processing is now handled by Http3Manager.
+    // This timer tick only handles QUIC-level operations.
     
     // Ensure we don't return 0 (which would mean immediate re-trigger)
     // and cap at maximum wait time
@@ -2341,39 +2276,41 @@ int QuicConnection::Impl::OpenStream(
     return static_cast<int>(stream_id);
 }
 
-bool QuicConnection::Impl::WriteStream(int stream_id, 
-                                        const uint8_t* data, size_t len) {
+ssize_t QuicConnection::Impl::WriteStream(int stream_id, 
+                                           const uint8_t* data, size_t len) {
     if (!IsConnected()) {
         ESP_LOGE(TAG, "WriteStream failed: not connected");
-        return false;
+        return -1;  // Error
     }
     
     // Check flow control before building frame
     size_t sendable = GetSendableBytes(stream_id);
+    size_t actual_len = len;
     if (sendable < len) {
-        ESP_LOGW(TAG, "WriteStream: flow control limit: sendable=%zu, requested=%zu", sendable, len);
-        // Still try to send what we can
-        len = sendable;
-        if (len == 0) {
-            ESP_LOGW(TAG, "WriteStream: flow control blocked");
-            return false;
+        ESP_LOGD(TAG, "WriteStream: flow control limit: sendable=%zu, requested=%zu", sendable, len);
+        actual_len = sendable;
+        if (actual_len == 0) {
+            ESP_LOGD(TAG, "WriteStream: flow control blocked");
+            return 0;  // Blocked, no bytes sent
         }
     }
     
     // Build DATA frame (use payload_buf_ as temp buffer, SendStreamData uses frame_buf_)
-    size_t frame_len = h3::BuildDataFrame(data, len, payload_buf_, sizeof(payload_buf_));
+    size_t frame_len = h3::BuildDataFrame(data, actual_len, payload_buf_, sizeof(payload_buf_));
     if (frame_len == 0) {
         ESP_LOGE(TAG, "WriteStream failed: BuildDataFrame returned 0 (len=%zu, buf_size=%zu)", 
-                 len, sizeof(payload_buf_));
-        return false;
+                 actual_len, sizeof(payload_buf_));
+        return -1;  // Error
     }
     
     bool result = SendStreamData(static_cast<uint64_t>(stream_id), payload_buf_, frame_len, false);
     if (!result) {
         ESP_LOGE(TAG, "WriteStream failed: SendStreamData returned false (stream_id=%d, frame_len=%zu)", 
                  stream_id, frame_len);
+        return -1;  // Error
     }
-    return result;
+    
+    return static_cast<ssize_t>(actual_len);  // Return bytes of payload written
 }
 
 bool QuicConnection::Impl::FinishStream(int stream_id) {
@@ -2406,23 +2343,6 @@ bool QuicConnection::Impl::ResetStream(int stream_id, uint64_t error_code) {
     StreamFlowState* stream_state = flow_controller_.GetStreamState(sid);
     if (stream_state) {
         final_size = stream_state->send_offset;
-    }
-    
-    // Clean up write queue for this stream
-    auto it = write_queues_.find(stream_id);
-    if (it != write_queues_.end()) {
-        auto& queue = it->second;
-        // Call deleters for queued items
-        for (auto& item : queue.items) {
-            if (item.deleter) {
-                item.deleter();
-            }
-        }
-        write_queues_.erase(it);
-        
-        if (config_.enable_debug) {
-            ESP_LOGI(TAG, "ResetStream: cleaned up write queue for stream %d", stream_id);
-        }
     }
     
     // Clear frame data for unacked packets belonging to this stream
@@ -2474,161 +2394,12 @@ bool QuicConnection::Impl::ResetStream(int stream_id, uint64_t error_code) {
 }
 
 //=============================================================================
-// Queued Write API
+// Writable Notification
 //=============================================================================
 
-bool QuicConnection::Impl::QueueWrite(int stream_id, 
-                                       const uint8_t* data, 
-                                       size_t size,
-                                       std::function<void()> deleter) {
-    if (!data || size == 0) {
-        return false;
-    }
-    
-    auto& queue = write_queues_[stream_id];
-    if (queue.finish_queued) {
-        ESP_LOGE(TAG, "QueueWrite: stream %d already has FIN queued", stream_id);
-        return false;
-    }
-    
-    queue.items.emplace_back(data, size, std::move(deleter));
-    queue.total_bytes += size;
-    
-    if (config_.enable_debug) {
-        ESP_LOGI(TAG, "QueueWrite: stream %d, queued %zu bytes, total pending: %zu",
-                 stream_id, size, queue.total_bytes - queue.sent_bytes);
-    }
-    
-    return true;
-}
-
-bool QuicConnection::Impl::QueueFinish(int stream_id) {
-    auto& queue = write_queues_[stream_id];
-    
-    if (queue.finish_queued) {
-        ESP_LOGW(TAG, "QueueFinish: stream %d already has FIN queued", stream_id);
-        return false;
-    }
-    
-    queue.items.emplace_back(true);  // FIN marker
-    queue.finish_queued = true;
-    
-    if (config_.enable_debug) {
-        ESP_LOGI(TAG, "QueueFinish: stream %d, FIN queued", stream_id);
-    }
-    
-    return true;
-}
-
-size_t QuicConnection::Impl::GetQueuedBytes(int stream_id) const {
-    auto it = write_queues_.find(stream_id);
-    if (it == write_queues_.end()) {
-        return 0;
-    }
-    return it->second.total_bytes - it->second.sent_bytes;
-}
-
-bool QuicConnection::Impl::IsQueueEmpty(int stream_id) const {
-    auto it = write_queues_.find(stream_id);
-    if (it == write_queues_.end()) {
-        return true;
-    }
-    const auto& queue = it->second;
-    return queue.items.empty() && (!queue.finish_queued || queue.finish_sent);
-}
-
-void QuicConnection::Impl::ProcessWriteQueue() {
-    // Process each stream's write queue
-    for (auto it = write_queues_.begin(); it != write_queues_.end(); ) {
-        int stream_id = it->first;
-        auto& queue = it->second;
-        
-        // Check if stream was reset
-        if (IsStreamReset(stream_id)) {
-            // Notify error and remove queue
-            if (on_write_error_) {
-                on_write_error_(stream_id, 1, "stream reset by peer");
-            }
-            it = write_queues_.erase(it);
-            
-            // Clean up stream resources
-            CleanupStream(static_cast<uint64_t>(stream_id));
-            continue;
-        }
-        
-        // Process items in this stream's queue
-        while (!queue.items.empty()) {
-            auto& item = queue.items.front();
-            
-            // Handle FIN marker
-            if (item.finish) {
-                if (FinishStream(stream_id)) {
-                    queue.finish_sent = true;
-                    queue.items.erase(queue.items.begin());
-                    
-                    // Notify completion
-                    if (on_write_complete_) {
-                        on_write_complete_(stream_id, queue.sent_bytes);
-                    }
-                    
-                    if (config_.enable_debug) {
-                        ESP_LOGI(TAG, "ProcessWriteQueue: stream %d finished, total %zu bytes",
-                                 stream_id, queue.sent_bytes);
-                    }
-                    
-                    // Remove completed queue from write_queues_
-                    it = write_queues_.erase(it);
-                    goto next_stream;
-                } else {
-                    // FinishStream failed, try again later
-                    break;
-                }
-            }
-            
-            // Get available flow control window
-            size_t sendable = GetSendableBytes(stream_id);
-            if (sendable == 0) {
-                // Flow control blocked, try next stream
-                break;
-            }
-            
-            // Calculate how much to send
-            size_t remaining = item.size - item.offset;
-            
-            // Use a reasonable chunk size (similar to WriteStream's payload_buf_ limit)
-            const size_t MAX_CHUNK = 1200;
-            size_t chunk_size = std::min({MAX_CHUNK, sendable, remaining});
-            
-            // Send the chunk
-            if (!WriteStream(stream_id, item.data + item.offset, chunk_size)) {
-                // Write failed, notify error
-                if (on_write_error_) {
-                    on_write_error_(stream_id, 2, "WriteStream failed");
-                }
-                // Remove this stream's queue
-                it = write_queues_.erase(it);
-                
-                // Clean up stream resources
-                CleanupStream(static_cast<uint64_t>(stream_id));
-                
-                goto next_stream;  // Use goto to break out of inner loop and skip ++it
-            }
-            
-            item.offset += chunk_size;
-            queue.sent_bytes += chunk_size;
-            
-            // Check if this item is complete
-            if (item.offset >= item.size) {
-                queue.items.erase(queue.items.begin());
-            }
-            
-            // Only send one chunk per tick to allow other streams and avoid blocking
-            // (Remove this break if you want to send more aggressively)
-            break;
-        }
-        
-        ++it;
-        next_stream:;
+void QuicConnection::Impl::NotifyWritable() {
+    if (on_writable_) {
+        on_writable_();
     }
 }
 
@@ -3068,10 +2839,9 @@ void QuicConnection::Impl::OnFrameAck(const AckFrameData& ack_data) {
     loss_detector_.OnAckReceived(ack_data.largest_ack, decoded_ack_delay,
                                   current_time_us_, &app_tracker_);
     
-    // ACK frees up congestion window (bytes_in_flight decreases, cwnd may increase
-    // during slow start), try to send blocked data immediately
+    // ACK frees up congestion window, notify upper layer
     if (newly_acked > 0) {
-        ProcessWriteQueue();
+        NotifyWritable();
     }
 }
 
@@ -3096,14 +2866,17 @@ void QuicConnection::Impl::OnFrameStream(uint64_t stream_id, uint64_t offset,
 
 void QuicConnection::Impl::OnFrameMaxData(uint64_t max_data) {
     flow_controller_.OnMaxDataReceived(max_data);
-    // Flow control window updated, immediately try to send blocked data
-    ProcessWriteQueue();
+    // Flow control window updated, notify upper layer
+    NotifyWritable();
 }
 
 void QuicConnection::Impl::OnFrameMaxStreamData(uint64_t stream_id, uint64_t max_data) {
     flow_controller_.OnMaxStreamDataReceived(stream_id, max_data);
-    // Flow control window updated, immediately try to send blocked data
-    ProcessWriteQueue();
+    
+    // Notify upper layer that this stream is now writable
+    if (on_stream_writable_) {
+        on_stream_writable_(static_cast<int>(stream_id));
+    }
 }
 
 void QuicConnection::Impl::OnFrameDataBlocked(uint64_t limit) {
@@ -3722,7 +3495,7 @@ int QuicConnection::OpenStream(
     return impl_->OpenStream(method, path, headers);
 }
 
-bool QuicConnection::WriteStream(int stream_id, const uint8_t* data, size_t len) {
+ssize_t QuicConnection::WriteStream(int stream_id, const uint8_t* data, size_t len) {
     return impl_->WriteStream(stream_id, data, len);
 }
 
@@ -3754,6 +3527,10 @@ bool QuicConnection::IsStreamReset(int stream_id) const {
     return impl_->IsStreamReset(stream_id);
 }
 
+void QuicConnection::AcknowledgeStreamData(int stream_id, size_t bytes) {
+    impl_->AcknowledgeStreamData(stream_id, bytes);
+}
+
 void QuicConnection::SetOnConnected(OnConnectedCallback cb) {
     impl_->SetOnConnected(std::move(cb));
 }
@@ -3770,28 +3547,12 @@ void QuicConnection::SetOnStreamData(OnStreamDataCallback cb) {
     impl_->SetOnStreamData(std::move(cb));
 }
 
-void QuicConnection::SetOnWriteComplete(OnWriteCompleteCallback cb) {
-    impl_->SetOnWriteComplete(std::move(cb));
+void QuicConnection::SetOnStreamWritable(OnStreamWritableCallback cb) {
+    impl_->SetOnStreamWritable(std::move(cb));
 }
 
-void QuicConnection::SetOnWriteError(OnWriteErrorCallback cb) {
-    impl_->SetOnWriteError(std::move(cb));
-}
-
-bool QuicConnection::QueueWrite(int stream_id, const uint8_t* data, size_t size, std::function<void()> deleter) {
-    return impl_->QueueWrite(stream_id, data, size, std::move(deleter));
-}
-
-bool QuicConnection::QueueFinish(int stream_id) {
-    return impl_->QueueFinish(stream_id);
-}
-
-size_t QuicConnection::GetQueuedBytes(int stream_id) const {
-    return impl_->GetQueuedBytes(stream_id);
-}
-
-bool QuicConnection::IsQueueEmpty(int stream_id) const {
-    return impl_->IsQueueEmpty(stream_id);
+void QuicConnection::SetOnWritable(OnWritableCallback cb) {
+    impl_->SetOnWritable(std::move(cb));
 }
 
 QuicConnection::Stats QuicConnection::GetStats() const {

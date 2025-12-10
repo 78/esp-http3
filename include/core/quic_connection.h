@@ -116,12 +116,13 @@ using OnResponseCallback = std::function<void(int stream_id, const H3Response& r
 using OnStreamDataCallback = std::function<void(int stream_id, const uint8_t* data, 
                                                   size_t len, bool fin)>;
 
-/// Called when queued write completes (all data sent for a stream)
-using OnWriteCompleteCallback = std::function<void(int stream_id, size_t total_bytes)>;
+/// Called when a stream becomes writable (flow control window available)
+/// This is called when MAX_STREAM_DATA is received for the stream.
+using OnStreamWritableCallback = std::function<void(int stream_id)>;
 
-/// Called when queued write fails (stream reset or connection error)
-using OnWriteErrorCallback = std::function<void(int stream_id, int error_code, 
-                                                  const std::string& reason)>;
+/// Called when connection becomes writable (MAX_DATA received or ACK frees congestion window)
+/// Upper layer should retry any blocked writes.
+using OnWritableCallback = std::function<void()>;
 
 //=============================================================================
 // QuicConnection Class
@@ -273,11 +274,14 @@ public:
      * @param stream_id Stream ID from OpenStream()
      * @param data Data to send
      * @param len Length of data
-     * @return true on success, false on failure
+     * @return Number of bytes written (may be less than len if flow-control limited)
+     *         0 if flow-control blocked (no bytes could be sent)
+     *         -1 on error (stream doesn't exist or connection error)
      * 
-     * @note This is the low-level API. Consider using QueueWrite() for simpler usage.
+     * @note Caller should retry with remaining data when flow control allows.
+     *       Use GetSendableBytes() to check available window before calling.
      */
-    bool WriteStream(int stream_id, const uint8_t* data, size_t len);
+    ssize_t WriteStream(int stream_id, const uint8_t* data, size_t len);
     
     /**
      * @brief Finish writing to a stream (send FIN)
@@ -299,84 +303,6 @@ public:
      * @return true on success, false if stream doesn't exist or already closed
      */
     bool ResetStream(int stream_id, uint64_t error_code = 0x10c);
-    
-    //=========================================================================
-    // Queued Write API (Recommended for large uploads)
-    // 
-    // These methods queue data for sending and automatically handle:
-    // - Flow control (waiting for window updates)
-    // - Chunking (splitting large data into packets)
-    // - Progress tracking (via callbacks)
-    // 
-    // Data is sent during OnTimerTick() calls.
-    //=========================================================================
-    
-    /**
-     * @brief Queue data for writing to a stream
-     * 
-     * The data will be sent automatically during OnTimerTick() calls,
-     * respecting flow control limits.
-     * 
-     * @param stream_id Stream ID from OpenStream()
-     * @param data Pointer to data (can be read-only or PSRAM-allocated)
-     * @param size Size of data in bytes
-     * @param deleter Optional deleter function to free memory when done (nullptr for read-only data)
-     * @return true if queued successfully, false if stream doesn't exist
-     * 
-     * @note Call QueueFinish() after all data is queued to send FIN.
-     * @note The data pointer must remain valid until the deleter is called (or until sending completes for read-only data).
-     * 
-     * Example with read-only data:
-     * @code
-     *   const uint8_t* audio_data = GetAudioData();
-     *   size_t audio_size = GetAudioSize();
-     *   conn->QueueWrite(stream_id, audio_data, audio_size);  // No deleter needed
-     *   conn->QueueFinish(stream_id);
-     * @endcode
-     * 
-     * Example with PSRAM-allocated data:
-     * @code
-     *   uint8_t* audio = (uint8_t*)heap_caps_malloc(size, MALLOC_CAP_SPIRAM);
-     *   memcpy(audio, source_data, size);
-     *   conn->QueueWrite(stream_id, audio, size, [audio]() { heap_caps_free(audio); });
-     *   conn->QueueFinish(stream_id);
-     * @endcode
-     */
-    bool QueueWrite(int stream_id, const uint8_t* data, size_t size, std::function<void()> deleter = nullptr);
-    
-    /**
-     * @brief Queue a FIN to finish the stream
-     * 
-     * After all queued data is sent, a FIN will be sent to close the stream.
-     * 
-     * @param stream_id Stream ID from OpenStream()
-     * @return true if queued successfully
-     */
-    bool QueueFinish(int stream_id);
-    
-    /**
-     * @brief Get pending bytes in the write queue for a stream
-     * 
-     * @param stream_id Stream ID
-     * @return Number of bytes waiting to be sent (0 if queue is empty)
-     */
-    size_t GetQueuedBytes(int stream_id) const;
-    
-    /**
-     * @brief Check if all queued data has been sent for a stream
-     * 
-     * @param stream_id Stream ID
-     * @return true if queue is empty and no pending writes
-     */
-    bool IsQueueEmpty(int stream_id) const;
-    
-    /**
-     * @brief Get response for a stream (if available)
-     * 
-     * @param stream_id Stream ID
-     * @return Pointer to response, or nullptr if not available
-     */
-    const H3Response* GetResponse(int stream_id) const;
     
     //=========================================================================
     // Flow Control (borrowed from Python version)
@@ -424,6 +350,20 @@ public:
      */
     bool IsStreamReset(int stream_id) const;
     
+    /**
+     * @brief Acknowledge that bytes have been consumed by upper layer
+     * 
+     * This is used for receive-side flow control with backpressure support.
+     * MAX_STREAM_DATA is only sent based on consumed bytes, allowing the
+     * upper layer to control the receive rate by delaying this call.
+     * 
+     * Call this when data has been read from the receive buffer and processed.
+     * 
+     * @param stream_id Stream ID
+     * @param bytes Number of bytes consumed
+     */
+    void AcknowledgeStreamData(int stream_id, size_t bytes);
+    
     //=========================================================================
     // Callback Registration
     //=========================================================================
@@ -433,11 +373,11 @@ public:
     void SetOnResponse(OnResponseCallback cb);
     void SetOnStreamData(OnStreamDataCallback cb);
     
-    /// Set callback for queued write completion
-    void SetOnWriteComplete(OnWriteCompleteCallback cb);
+    /// Set callback for stream becoming writable (MAX_STREAM_DATA received)
+    void SetOnStreamWritable(OnStreamWritableCallback cb);
     
-    /// Set callback for queued write errors
-    void SetOnWriteError(OnWriteErrorCallback cb);
+    /// Set callback for connection becoming writable (MAX_DATA or ACK frees window)
+    void SetOnWritable(OnWritableCallback cb);
     
     //=========================================================================
     // Statistics
