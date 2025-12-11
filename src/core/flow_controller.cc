@@ -87,15 +87,18 @@ bool FlowController::ShouldSendMaxData() const {
 }
 
 bool FlowController::BuildMaxDataFrame(quic::BufferWriter* writer) {
-    // Calculate new limit matching Python implementation:
-    // new_limit = max(current_limit + initial_max_data, consumed + initial_max_data)
-    uint64_t consumed = conn_recv_offset_;
+    // Calculate new limit based on consumed bytes for proper backpressure
+    // New limit = consumed + buffer_size, prevents receiving more than we can handle
+    uint64_t consumed = conn_recv_consumed_;
     uint64_t current_limit = conn_recv_max_sent_;
     
-    uint64_t new_limit = std::max(
-        current_limit + initial_max_data_,
-        consumed + initial_max_data_
-    );
+    // New limit is strictly based on consumed bytes + one window size
+    uint64_t new_limit = consumed + initial_max_data_;
+    
+    // Don't send if new limit is not larger than current
+    if (new_limit <= current_limit) {
+        return false;
+    }
     
     if (!quic::BuildMaxDataFrame(writer, new_limit)) {
         return false;
@@ -221,15 +224,20 @@ bool FlowController::BuildMaxStreamDataFrame(quic::BufferWriter* writer,
         return false;
     }
     
-    // Calculate new limit matching Python implementation:
-    // new_limit = max(current_limit + initial_max_stream_data, consumed + initial_max_stream_data)
-    uint64_t consumed = it->second.recv_offset;
+    // Calculate new limit based on consumed bytes for proper backpressure
+    // New limit = consumed + buffer_size, so server can only send what we can buffer
+    // This prevents buffer overflow when there's unconsumed data in the buffer
+    uint64_t consumed = it->second.recv_consumed;
     uint64_t current_limit = it->second.recv_max_sent;
     
-    uint64_t new_limit = std::max(
-        current_limit + initial_max_stream_data_,
-        consumed + initial_max_stream_data_
-    );
+    // New limit is strictly based on consumed bytes + one buffer size
+    // This ensures: (new_limit - recv_offset) + (recv_offset - consumed) <= buffer_size
+    uint64_t new_limit = consumed + initial_max_stream_data_;
+    
+    // Don't send if new limit is not larger than current
+    if (new_limit <= current_limit) {
+        return false;
+    }
     
     if (!quic::BuildMaxStreamDataFrame(writer, stream_id, new_limit)) {
         return false;

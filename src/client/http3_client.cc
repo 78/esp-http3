@@ -357,8 +357,9 @@ void Http3Stream::OnData(const uint8_t* data, size_t length, bool finished) {
         }
         
         if (bytes_to_copy < length) {
-            ESP_LOGW(TAG, "Stream %d: receive buffer full, dropped %zu bytes", 
-                     stream_id_, length - bytes_to_copy);
+            ESP_LOGW(TAG, "Stream %d: receive buffer full! dropped=%zu, buf_size=%zu, used=%zu, space=%zu", 
+                     stream_id_, length - bytes_to_copy,
+                     receive_buffer_size_, receive_count_, space);
         }
     }
     
@@ -516,6 +517,16 @@ bool Http3Client::EnsureConnected(uint32_t timeout_ms) {
     quic_config.idle_timeout_ms = config_.idle_timeout_ms;
     quic_config.response_timeout_ms = config_.request_timeout_ms;
     quic_config.enable_debug = config_.enable_debug;
+    
+    // Set flow control limits to match receive buffer size
+    // This ensures QUIC layer won't receive more data than app layer can buffer
+    // Use default if receive_buffer_size is 0 or too small
+    size_t effective_buffer_size = config_.receive_buffer_size;
+    if (effective_buffer_size < 16 * 1024) {
+        effective_buffer_size = 64 * 1024;  // Default to 64KB
+    }
+    quic_config.max_stream_data = static_cast<uint32_t>(effective_buffer_size);
+    quic_config.max_data = static_cast<uint32_t>(effective_buffer_size * 4);  // Allow 4 concurrent streams
     
     // Create QUIC connection
     connection_ = std::make_unique<esp_http3::QuicConnection>(
