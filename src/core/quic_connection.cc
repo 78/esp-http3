@@ -103,6 +103,10 @@ public:
     uint8_t GetKeyPhase() const { return crypto_.GetKeyPhase(); }
     uint32_t GetKeyUpdateGeneration() const { return crypto_.GetKeyUpdateGeneration(); }
     
+    // Keypair access (for caching)
+    const uint8_t* GetCryptoPublicKey() const { return crypto_.GetPublicKey(); }
+    const uint8_t* GetCryptoPrivateKey() const { return crypto_.GetPrivateKey(); }
+    
     // Path Validation
     bool SendPathChallenge();
     bool IsPathValidated() const { return path_validated_; }
@@ -150,7 +154,7 @@ private:
     void ProcessMaxStreamDataFrame(quic::BufferReader* reader);
     void ProcessHandshakeDoneFrame();
     void ProcessNewConnectionIdFrame(quic::BufferReader* reader);
-    
+
     // Packet sending
     bool SendPacket(const uint8_t* data, size_t len);
     bool SendAckIfNeeded(quic::PacketType pkt_type);
@@ -448,14 +452,26 @@ bool QuicConnection::Impl::StartHandshake() {
     GenerateRandom(dcid_.data.data(), 8);
     dcid_.length = 8;
     initial_dcid_ = dcid_;
-    
+
     // Set local SCID in transport params
     local_params_.initial_source_connection_id = scid_;
-    
-    // Generate X25519 key pair using CryptoManager
-    if (!crypto_.GenerateKeyPair()) {
-        state_ = ConnectionState::kFailed;
-        return false;
+
+    // Use external keypair if provided (for faster reconnection)
+    // Otherwise generate new keypair
+    if (config_.external_private_key && config_.external_public_key) {
+        if (!crypto_.SetKeyPair(config_.external_private_key, 
+                                config_.external_public_key)) {
+            state_ = ConnectionState::kFailed;
+            return false;
+        }
+        // Still need fresh client_random for each connection (security requirement)
+        crypto_.GenerateClientRandom();
+    } else {
+        // Generate new X25519 key pair using CryptoManager
+        if (!crypto_.GenerateKeyPair()) {
+            state_ = ConnectionState::kFailed;
+            return false;
+        }
     }
     
     // Derive initial secrets using CryptoManager
@@ -1632,7 +1648,15 @@ void QuicConnection::Impl::ProcessNewConnectionIdFrame(quic::BufferReader* reade
     uint8_t token[16];
     
     if (quic::ParseNewConnectionIdFrame(reader, &seq, &retire, &cid, token)) {
-        // Store new connection ID for migration (not implemented in v1)
+        // Create NewConnectionIdData structure for the callback
+        NewConnectionIdData data;
+        data.sequence_number = seq;
+        data.retire_prior_to = retire;
+        data.connection_id = cid;
+        std::memcpy(data.stateless_reset_token, token, 16);
+        
+        // Call the frame handler callback
+        OnFrameNewConnectionId(data);
     }
 }
 
@@ -3060,6 +3084,8 @@ bool QuicConnection::Impl::IsStatelessReset(const uint8_t* data, size_t len) {
     // Check against peer's tokens from NEW_CONNECTION_ID
     for (const auto& [seq, info] : peer_connection_ids_) {
         if (std::memcmp(token_in_packet, info.stateless_reset_token, 16) == 0) {
+            ESP_LOGW(TAG, "Stateless Reset matched token from NEW_CONNECTION_ID seq=%llu",
+                     (unsigned long long)seq);
             return true;
         }
     }
@@ -3067,6 +3093,7 @@ bool QuicConnection::Impl::IsStatelessReset(const uint8_t* data, size_t len) {
     // Also check against the stateless_reset_token from transport parameters
     if (peer_params_.stateless_reset_token_present) {
         if (std::memcmp(token_in_packet, peer_params_.stateless_reset_token, 16) == 0) {
+            ESP_LOGW(TAG, "Stateless Reset matched token from transport parameters");
             return true;
         }
     }
@@ -3573,6 +3600,22 @@ uint8_t QuicConnection::GetKeyPhase() const {
 
 uint32_t QuicConnection::GetKeyUpdateGeneration() const {
     return impl_->GetKeyUpdateGeneration();
+}
+
+bool QuicConnection::GetPublicKey(uint8_t* out) const {
+    if (!out || !impl_) return false;
+    const uint8_t* key = impl_->GetCryptoPublicKey();
+    if (!key) return false;
+    memcpy(out, key, 32);
+    return true;
+}
+
+bool QuicConnection::GetPrivateKey(uint8_t* out) const {
+    if (!out || !impl_) return false;
+    const uint8_t* key = impl_->GetCryptoPrivateKey();
+    if (!key) return false;
+    memcpy(out, key, 32);
+    return true;
 }
 
 //=============================================================================

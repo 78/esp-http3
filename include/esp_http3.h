@@ -76,7 +76,6 @@
 namespace esp_http3 {
 
 // Version information
-constexpr const char* kVersion = "1.0.0";
 constexpr uint32_t kQuicVersion = 0x00000001;  // QUIC v1
 
 } // namespace esp_http3

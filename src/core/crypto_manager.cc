@@ -10,6 +10,7 @@
 #include <random>
 #include <esp_log.h>
 #include <esp_random.h>
+#include <esp_timer.h>
 
 namespace esp_http3 {
 
@@ -80,6 +81,33 @@ bool CryptoManager::GenerateKeyPair() {
         return false;
     }
     
+    // Generate client random
+    GenerateClientRandom();
+    
+    if (debug_) {
+        ESP_LOGI(TAG, "Generated X25519 key pair and client random");
+    }
+    
+    return true;
+}
+
+bool CryptoManager::SetKeyPair(const uint8_t* private_key, const uint8_t* public_key) {
+    if (!private_key || !public_key) {
+        ESP_LOGE(TAG, "SetKeyPair: null pointer");
+        return false;
+    }
+    
+    memcpy(x25519_private_key_, private_key, 32);
+    memcpy(x25519_public_key_, public_key, 32);
+    
+    if (debug_) {
+        ESP_LOGI(TAG, "Set external X25519 key pair (reusing cached keypair)");
+    }
+    
+    return true;
+}
+
+void CryptoManager::GenerateClientRandom() {
     // Generate client random using ESP-IDF hardware random number generator
     // This avoids stack allocation (~2.5KB for std::mt19937) and is more efficient
     for (size_t i = 0; i < sizeof(client_random_); i += 4) {
@@ -88,12 +116,16 @@ bool CryptoManager::GenerateKeyPair() {
         size_t copy_len = remaining < 4 ? remaining : 4;
         memcpy(client_random_ + i, &random_word, copy_len);
     }
-    
-    if (debug_) {
-        ESP_LOGI(TAG, "Generated X25519 key pair and client random");
+}
+
+bool CryptoManager::HasKeyPair() const {
+    // Check if public key is non-zero (simple heuristic)
+    for (size_t i = 0; i < 32; i++) {
+        if (x25519_public_key_[i] != 0) {
+            return true;
+        }
     }
-    
-    return true;
+    return false;
 }
 
 //=============================================================================
@@ -152,6 +184,8 @@ void CryptoManager::GetTranscriptHash(uint8_t* out) const {
 bool CryptoManager::DeriveHandshakeSecrets(const uint8_t* server_public_key,
                                             const uint8_t* server_hello,
                                             size_t sh_len) {
+    uint64_t start_time_us = quic::GetCurrentTimeUs();
+
     // Compute ECDH shared secret
     uint8_t shared_secret[32];
     if (!quic::X25519ECDH(x25519_private_key_, server_public_key, shared_secret)) {
@@ -179,7 +213,10 @@ bool CryptoManager::DeriveHandshakeSecrets(const uint8_t* server_public_key,
     level_ = CryptoLevel::kHandshake;
     
     if (debug_) {
-        ESP_LOGI(TAG, "Derived Handshake secrets");
+        uint64_t end_time_us = quic::GetCurrentTimeUs();
+        uint64_t elapsed_us = end_time_us - start_time_us;
+        ESP_LOGI(TAG, "Derived Handshake secrets took %llu us (%.3f ms)", 
+                elapsed_us, elapsed_us / 1000.0f);
     }
     
     // Notify callback

@@ -528,6 +528,13 @@ bool Http3Client::EnsureConnected(uint32_t timeout_ms) {
     quic_config.max_stream_data = static_cast<uint32_t>(effective_buffer_size);
     quic_config.max_data = static_cast<uint32_t>(effective_buffer_size * 4);  // Allow 4 concurrent streams
     
+    // Pass cached keypair if available (speeds up reconnection by ~100ms)
+    if (config_.cache_keypair && has_cached_keypair_) {
+        quic_config.external_private_key = cached_private_key_;
+        quic_config.external_public_key = cached_public_key_;
+        ESP_LOGI(TAG, "Reusing cached X25519 keypair for faster reconnection");
+    }
+    
     // Create QUIC connection
     connection_ = std::make_unique<esp_http3::QuicConnection>(
         [this](const uint8_t* data, size_t length) -> int {
@@ -603,6 +610,18 @@ bool Http3Client::EnsureConnected(uint32_t timeout_ms) {
     
     if (bits & EVENT_CONNECTED) {
         ESP_LOGI(TAG, "QUIC connection established");
+        
+        // Cache keypair for future reconnections (if enabled and not already cached)
+        if (config_.cache_keypair && !has_cached_keypair_) {
+            std::lock_guard<std::mutex> conn_lock(connection_mutex_);
+            if (connection_ && 
+                connection_->GetPrivateKey(cached_private_key_) &&
+                connection_->GetPublicKey(cached_public_key_)) {
+                has_cached_keypair_ = true;
+                ESP_LOGI(TAG, "Cached X25519 keypair for future reconnections");
+            }
+        }
+        
         return true;
     }
     

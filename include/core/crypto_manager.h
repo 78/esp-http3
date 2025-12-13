@@ -119,9 +119,39 @@ public:
     bool GenerateKeyPair();
     
     /**
+     * @brief Set external X25519 key pair (for keypair reuse across connections)
+     * 
+     * Allows reusing a previously generated key pair to speed up reconnection.
+     * The client_random will still be regenerated for each connection.
+     * 
+     * @param private_key X25519 private key (32 bytes)
+     * @param public_key X25519 public key (32 bytes)
+     * @return true if keys are valid
+     */
+    bool SetKeyPair(const uint8_t* private_key, const uint8_t* public_key);
+    
+    /**
+     * @brief Generate only client random (when reusing keypair)
+     * 
+     * Called when SetKeyPair() was used to reuse an existing keypair.
+     * client_random must be fresh for each connection for security.
+     */
+    void GenerateClientRandom();
+    
+    /**
+     * @brief Check if key pair is already set
+     */
+    bool HasKeyPair() const;
+    
+    /**
      * @brief Get public key for ClientHello
      */
     const uint8_t* GetPublicKey() const { return x25519_public_key_; }
+    
+    /**
+     * @brief Get private key (for caching)
+     */
+    const uint8_t* GetPrivateKey() const { return x25519_private_key_; }
     
     /**
      * @brief Get client random for ClientHello

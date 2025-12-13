@@ -245,6 +245,12 @@ struct Http3ClientConfig {
     // Buffer sizes
     size_t receive_buffer_size = 64 * 1024;  // Per-stream receive buffer
     
+    // Keypair caching for faster reconnection
+    // When enabled, the X25519 keypair is cached and reused across connections.
+    // This speeds up reconnection after idle timeout (saves ~100ms of key generation).
+    // client_random is still regenerated each connection for security.
+    bool cache_keypair = true;
+    
     // Debug logging
     bool enable_debug = false;
 };
@@ -494,5 +500,10 @@ private:
     
     // Connection mutex
     mutable std::mutex connection_mutex_;
+    
+    // Cached X25519 keypair for faster reconnection
+    bool has_cached_keypair_ = false;
+    uint8_t cached_private_key_[32] = {0};
+    uint8_t cached_public_key_[32] = {0};
 };
 

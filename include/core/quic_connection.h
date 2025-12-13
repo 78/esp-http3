@@ -79,6 +79,12 @@ struct QuicConfig {
     bool enable_datagram = false;           ///< Enable DATAGRAM frame support
     uint32_t max_datagram_frame_size = 65535;  ///< Max DATAGRAM frame size (0 = disabled)
     
+    // External X25519 keypair (for reuse across connections to speed up reconnection)
+    // If both are non-null, the keypair will be reused instead of generating new one.
+    // client_random is still regenerated each connection for security.
+    const uint8_t* external_private_key = nullptr;  ///< External X25519 private key (32 bytes)
+    const uint8_t* external_public_key = nullptr;   ///< External X25519 public key (32 bytes)
+    
     // Debug
     bool enable_debug = false;              ///< Enable debug logging
 };
@@ -425,6 +431,20 @@ public:
      * @brief Get key update generation count
      */
     uint32_t GetKeyUpdateGeneration() const;
+    
+    /**
+     * @brief Get X25519 public key (for caching)
+     * @param out Buffer to receive public key (32 bytes)
+     * @return true if key is available
+     */
+    bool GetPublicKey(uint8_t* out) const;
+    
+    /**
+     * @brief Get X25519 private key (for caching)
+     * @param out Buffer to receive private key (32 bytes)
+     * @return true if key is available
+     */
+    bool GetPrivateKey(uint8_t* out) const;
     
     //=========================================================================
     // Path Validation
