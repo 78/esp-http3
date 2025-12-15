@@ -463,6 +463,17 @@ bool Http3Client::IsConnected() const {
     return connected_;
 }
 
+std::string Http3Client::GetLastError() const {
+    std::lock_guard<std::mutex> lock(error_mutex_);
+    return last_error_;
+}
+
+// Helper method to set last error with thread safety
+void Http3Client::SetLastError(const std::string& error) {
+    std::lock_guard<std::mutex> lock(error_mutex_);
+    last_error_ = error;
+}
+
 bool Http3Client::EnsureConnected(uint32_t timeout_ms) {
     if (IsConnected()) {
         return true;
@@ -579,6 +590,7 @@ bool Http3Client::EnsureConnected(uint32_t timeout_ms) {
     // Start background tasks
     if (!event_loop_task_) {
         if (!StartBackgroundTasks()) {
+            SetLastError("Failed to start background tasks");
             ESP_LOGE(TAG, "Failed to start background tasks");
             connection_.reset();
             CloseSocket();
@@ -589,6 +601,7 @@ bool Http3Client::EnsureConnected(uint32_t timeout_ms) {
     // Start handshake
     ESP_LOGI(TAG, "Starting QUIC handshake...");
     if (!connection_->StartHandshake()) {
+        SetLastError("Failed to start QUIC handshake");
         ESP_LOGE(TAG, "Failed to start handshake");
         StopBackgroundTasks();
         connection_.reset();
@@ -626,8 +639,10 @@ bool Http3Client::EnsureConnected(uint32_t timeout_ms) {
     }
     
     if (bits & EVENT_DISCONNECTED) {
+        SetLastError("QUIC connection failed");
         ESP_LOGE(TAG, "Connection failed");
     } else {
+        SetLastError("Connection timeout");
         ESP_LOGE(TAG, "Connection timeout");
     }
     
@@ -1075,6 +1090,7 @@ bool Http3Client::CreateSocket() {
     // DNS lookup
     struct hostent* host_entry = gethostbyname(config_.hostname.c_str());
     if (!host_entry) {
+        SetLastError("DNS lookup failed for " + config_.hostname);
         ESP_LOGE(TAG, "DNS lookup failed for %s", config_.hostname.c_str());
         return false;
     }
@@ -1087,6 +1103,7 @@ bool Http3Client::CreateSocket() {
     // Create UDP socket
     udp_socket_ = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     if (udp_socket_ < 0) {
+        SetLastError("Failed to create UDP socket");
         ESP_LOGE(TAG, "Failed to create socket: %d", errno);
         return false;
     }
@@ -1100,6 +1117,7 @@ bool Http3Client::CreateSocket() {
     
     if (connect(udp_socket_, reinterpret_cast<struct sockaddr*>(&server_address), 
                 sizeof(server_address)) < 0) {
+        SetLastError("Failed to connect UDP socket to " + config_.hostname);
         ESP_LOGE(TAG, "Failed to connect socket: %d", errno);
         close(udp_socket_);
         udp_socket_ = -1;

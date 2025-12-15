@@ -312,6 +312,12 @@ public:
     bool IsConnected() const;
     
     /**
+     * Get the last error message from the client
+     * @return Error message string, empty if no error
+     */
+    std::string GetLastError() const;
+    
+    /**
      * Disconnect from server
      */
     void Disconnect();
@@ -491,6 +497,9 @@ private:
     // Called when stream becomes writable
     void OnStreamWritable(int stream_id);
     
+    // Helper to set last error message
+    void SetLastError(const std::string& error);
+    
     // Legacy event bits (still used for simple signaling)
     static constexpr uint32_t EVENT_UDP_DATA = (1 << 0);
     static constexpr uint32_t EVENT_WAKE = (1 << 1);
@@ -500,6 +509,10 @@ private:
     
     // Connection mutex
     mutable std::mutex connection_mutex_;
+    
+    // Last error message
+    mutable std::mutex error_mutex_;
+    std::string last_error_;
     
     // Cached X25519 keypair for faster reconnection
     bool has_cached_keypair_ = false;
