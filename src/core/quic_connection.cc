@@ -93,6 +93,7 @@ public:
     void SetOnStreamData(OnStreamDataCallback cb) { on_stream_data_ = std::move(cb); }
     void SetOnStreamWritable(OnStreamWritableCallback cb) { on_stream_writable_ = std::move(cb); }
     void SetOnWritable(OnWritableCallback cb) { on_writable_ = std::move(cb); }
+    void SetOnSessionTicket(OnSessionTicketCallback cb) { on_session_ticket_ = std::move(cb); }
     
     // DATAGRAM callback type (same as public API)
     using OnDatagramCallback = QuicConnection::OnDatagramCallback;
@@ -142,6 +143,7 @@ private:
     bool ProcessCertificate(const uint8_t* data, size_t len);
     bool ProcessCertificateVerify(const uint8_t* data, size_t len);
     bool ProcessServerFinished(const uint8_t* data, size_t len);
+    bool ProcessNewSessionTicket(const uint8_t* data, size_t len);
     bool SendClientFinished();
     
     // Frame processing
@@ -240,6 +242,7 @@ private:
     OnStreamDataCallback on_stream_data_;
     OnStreamWritableCallback on_stream_writable_;
     OnWritableCallback on_writable_;
+    OnSessionTicketCallback on_session_ticket_;
     
     // Track reset streams
     std::set<uint64_t> reset_streams_;
@@ -298,13 +301,16 @@ private:
     // Crypto data buffers (for reassembly)
     std::vector<uint8_t> initial_crypto_buffer_;
     std::vector<uint8_t> handshake_crypto_buffer_;
+    std::vector<uint8_t> app_crypto_buffer_;  // For 1-RTT CRYPTO (NewSessionTicket)
     size_t initial_crypto_offset_ = 0;
     size_t handshake_crypto_offset_ = 0;
+    size_t app_crypto_offset_ = 0;
     
     // Out-of-order CRYPTO data cache: offset -> data
     // Used to buffer CRYPTO frames that arrive before their expected offset
     std::map<uint64_t, std::vector<uint8_t>> initial_crypto_cache_;
     std::map<uint64_t, std::vector<uint8_t>> handshake_crypto_cache_;
+    std::map<uint64_t, std::vector<uint8_t>> app_crypto_cache_;
     
     // Timers
     uint64_t time_since_last_activity_us_ = 0;
@@ -328,6 +334,8 @@ private:
     // Flags
     bool handshake_complete_ = false;
     bool h3_initialized_ = false;
+    bool using_psk_ = false;              // Using PSK for resumption
+    bool psk_accepted_ = false;           // Server accepted our PSK
     
     // Path Validation state
     bool path_validated_ = true;
@@ -549,12 +557,64 @@ void QuicConnection::Impl::Close(int error_code, const std::string& reason) {
 //=============================================================================
 
 bool QuicConnection::Impl::SendInitialPacket(bool is_retransmit) {
-    // Build ClientHello (use payload_buf_ temporarily)
-    size_t ch_len = tls::BuildClientHello(config_.hostname,
-                                           crypto_.GetClientRandom(),
-                                           crypto_.GetPublicKey(),
-                                           local_params_,
-                                           payload_buf_, sizeof(payload_buf_));
+    size_t ch_len = 0;
+    
+    // Check if we have a session ticket for PSK resumption
+    if (!config_.session_ticket.empty() && config_.psk.size() == 32) {
+        // Calculate ticket age
+        uint64_t current_time_ms = static_cast<uint64_t>(current_time_us_ / 1000);
+        uint32_t ticket_age_ms = 0;
+        if (current_time_ms > config_.ticket_received_time_ms) {
+            ticket_age_ms = static_cast<uint32_t>(current_time_ms - config_.ticket_received_time_ms);
+        }
+        
+        // Check if ticket has expired (lifetime is in seconds, convert to ms)
+        // Note: ticket_lifetime of 0 means unknown/unlimited
+        bool ticket_expired = false;
+        if (config_.ticket_lifetime > 0) {
+            uint64_t ticket_lifetime_ms = static_cast<uint64_t>(config_.ticket_lifetime) * 1000;
+            if (ticket_age_ms >= ticket_lifetime_ms) {
+                ticket_expired = true;
+                ESP_LOGW(TAG, "Session ticket expired (age=%lu ms, lifetime=%lu s), using full handshake",
+                         (unsigned long)ticket_age_ms, (unsigned long)config_.ticket_lifetime);
+            }
+        }
+        
+        if (!ticket_expired) {
+            // Build ClientHello with PSK
+            tls::PskParameters psk_params;
+            psk_params.identity.ticket = config_.session_ticket;
+            std::memcpy(psk_params.psk, config_.psk.data(), 32);
+            psk_params.valid = true;
+            
+            // Calculate obfuscated ticket age
+            // obfuscated_ticket_age = (current_time - received_time) + ticket_age_add
+            psk_params.identity.obfuscated_ticket_age = ticket_age_ms + config_.ticket_age_add;
+            
+            ch_len = tls::BuildClientHelloWithPsk(config_.hostname,
+                                                   crypto_.GetClientRandom(),
+                                                   crypto_.GetPublicKey(),
+                                                   local_params_,
+                                                   psk_params,
+                                                   payload_buf_, sizeof(payload_buf_));
+            if (ch_len > 0) {
+                using_psk_ = true;
+                ESP_LOGI(TAG, "Using PSK for session resumption (ticket_age=%lu ms, lifetime=%lu s)", 
+                         (unsigned long)ticket_age_ms, (unsigned long)config_.ticket_lifetime);
+            }
+        }
+    }
+    
+    // Fall back to regular ClientHello if PSK failed or not available
+    if (ch_len == 0) {
+        using_psk_ = false;
+        ch_len = tls::BuildClientHello(config_.hostname,
+                                        crypto_.GetClientRandom(),
+                                        crypto_.GetPublicKey(),
+                                        local_params_,
+                                        payload_buf_, sizeof(payload_buf_));
+    }
+    
     if (ch_len == 0) {
         ESP_LOGE(TAG, "BuildClientHello failed");
         return false;
@@ -1124,11 +1184,17 @@ void QuicConnection::Impl::ProcessCryptoFrame(quic::BufferReader* reader,
         expected_offset = &initial_crypto_offset_;
         cache = &initial_crypto_cache_;
         space_name = "Initial";
-    } else {
+    } else if (pkt_type == quic::PacketType::kHandshake) {
         buffer = &handshake_crypto_buffer_;
         expected_offset = &handshake_crypto_offset_;
         cache = &handshake_crypto_cache_;
         space_name = "Handshake";
+    } else {
+        // 1-RTT - for post-handshake messages (e.g., NewSessionTicket)
+        buffer = &app_crypto_buffer_;
+        expected_offset = &app_crypto_offset_;
+        cache = &app_crypto_cache_;
+        space_name = "Application";
     }
     
     uint64_t offset = crypto_data.offset;
@@ -1242,6 +1308,12 @@ void QuicConnection::Impl::ProcessCryptoFrame(quic::BufferReader* reader,
                 ProcessServerFinished(msg_data, msg_len);
                 break;
                 
+            case tls::HandshakeType::kNewSessionTicket:
+                ESP_LOGD(TAG, "Received NewSessionTicket");
+                // NewSessionTicket is not included in transcript (post-handshake)
+                ProcessNewSessionTicket(msg_data, msg_len);
+                break;
+                
             default:
                 ESP_LOGW(TAG, "Unknown TLS message type: %d", 
                          static_cast<int>(msg_type));
@@ -1260,8 +1332,8 @@ bool QuicConnection::Impl::ProcessServerHello(const uint8_t* data, size_t len) {
         return false;
     }
     
-    ESP_LOGD(TAG, "ServerHello: cipher=0x%04x, key_share_group=0x%04x", 
-             sh.cipher_suite, sh.key_share_group);
+    ESP_LOGD(TAG, "ServerHello: cipher=0x%04x, key_share_group=0x%04x, has_psk=%d", 
+             sh.cipher_suite, sh.key_share_group, sh.has_psk);
     
     if (sh.is_hello_retry_request) {
         // Handle HRR - for now, fail
@@ -1270,12 +1342,30 @@ bool QuicConnection::Impl::ProcessServerHello(const uint8_t* data, size_t len) {
         return false;
     }
     
-    // Derive handshake secrets using CryptoManager
-    // Note: ServerHello should already be in transcript before this call
-    if (!crypto_.DeriveHandshakeSecrets(sh.key_share_public_key, nullptr, 0)) {
-        ESP_LOGW(TAG, "ProcessServerHello: DeriveHandshakeSecrets failed");
-        state_ = ConnectionState::kFailed;
-        return false;
+    // Check if server accepted our PSK
+    if (using_psk_ && sh.has_psk) {
+        psk_accepted_ = true;
+        ESP_LOGI(TAG, "Server accepted PSK resumption (identity=%u)", sh.selected_psk_identity);
+        
+        // For PSK mode, we need to derive handshake secrets with PSK as early_secret input
+        if (!crypto_.DeriveHandshakeSecretsWithPsk(sh.key_share_public_key, config_.psk.data())) {
+            ESP_LOGW(TAG, "ProcessServerHello: DeriveHandshakeSecretsWithPsk failed");
+            state_ = ConnectionState::kFailed;
+            return false;
+        }
+    } else {
+        if (using_psk_) {
+            ESP_LOGI(TAG, "Server did not accept PSK, falling back to full handshake");
+            using_psk_ = false;
+        }
+        psk_accepted_ = false;
+        
+        // Derive handshake secrets using normal mode
+        if (!crypto_.DeriveHandshakeSecrets(sh.key_share_public_key, nullptr, 0)) {
+            ESP_LOGW(TAG, "ProcessServerHello: DeriveHandshakeSecrets failed");
+            state_ = ConnectionState::kFailed;
+            return false;
+        }
     }
     
     return true;
@@ -1477,6 +1567,55 @@ bool QuicConnection::Impl::SendClientFinished() {
     return ok;
 }
 
+bool QuicConnection::Impl::ProcessNewSessionTicket(const uint8_t* data, size_t len) {
+    tls::NewSessionTicketData nst;
+    if (!tls::ParseNewSessionTicket(data, len, &nst)) {
+        ESP_LOGW(TAG, "ProcessNewSessionTicket: parse failed");
+        return false;
+    }
+    
+    if (on_session_ticket_) {
+        ESP_LOGI(TAG, "NewSessionTicket: lifetime=%lu s, ticket_len=%zu, 0-RTT=%s%s",
+                (unsigned long)nst.ticket_lifetime, nst.ticket.size(),
+                nst.has_early_data ? "yes" : "no",
+                nst.has_early_data ? (", max_early_data=" + std::to_string(nst.max_early_data_size)).c_str() : "");
+    }
+    
+    // Derive resumption_master_secret if not already done
+    if (!crypto_.HasResumptionSecret()) {
+        if (!crypto_.DeriveResumptionMasterSecret()) {
+            ESP_LOGW(TAG, "Failed to derive resumption master secret");
+            return false;
+        }
+    }
+    
+    // Derive PSK from ticket nonce
+    uint8_t psk[32];
+    if (!crypto_.DeriveResumptionPsk(nst.ticket_nonce.data(), nst.ticket_nonce.size(), psk)) {
+        ESP_LOGW(TAG, "Failed to derive PSK from ticket nonce");
+        return false;
+    }
+    
+    // Create session ticket data and notify callback
+    if (on_session_ticket_) {
+        SessionTicketData ticket_data;
+        ticket_data.ticket = std::move(nst.ticket);
+        ticket_data.psk.assign(psk, psk + 32);
+        ticket_data.ticket_lifetime = nst.ticket_lifetime;
+        ticket_data.ticket_age_add = nst.ticket_age_add;
+        ticket_data.received_time_ms = current_time_us_ / 1000;
+        ticket_data.supports_early_data = nst.has_early_data;
+        ticket_data.max_early_data_size = nst.max_early_data_size;
+        
+        on_session_ticket_(ticket_data);
+        
+        ESP_LOGI(TAG, "Session ticket saved (PSK derived, %zu bytes ticket)",
+                 ticket_data.ticket.size());
+    }
+    
+    return true;
+}
+
 void QuicConnection::Impl::ProcessHandshakeDoneFrame() {
     handshake_complete_ = true;
     state_ = ConnectionState::kConnected;
@@ -1484,6 +1623,7 @@ void QuicConnection::Impl::ProcessHandshakeDoneFrame() {
     // Release handshake-related buffers that are no longer needed
     // These can be quite large (several KB) and are only used during handshake
     // Use swap trick for guaranteed memory release (shrink_to_fit is non-binding)
+    std::vector<uint8_t>().swap(retry_token_);
     std::vector<uint8_t>().swap(initial_crypto_buffer_);
     std::vector<uint8_t>().swap(handshake_crypto_buffer_);
     initial_crypto_cache_.clear();
@@ -3580,6 +3720,10 @@ void QuicConnection::SetOnStreamWritable(OnStreamWritableCallback cb) {
 
 void QuicConnection::SetOnWritable(OnWritableCallback cb) {
     impl_->SetOnWritable(std::move(cb));
+}
+
+void QuicConnection::SetOnSessionTicket(OnSessionTicketCallback cb) {
+    impl_->SetOnSessionTicket(std::move(cb));
 }
 
 QuicConnection::Stats QuicConnection::GetStats() const {

@@ -40,9 +40,18 @@ enum class ExtensionType : uint16_t {
     kSupportedGroups = 10,
     kSignatureAlgorithms = 13,
     kALPN = 16,
+    kPreSharedKey = 41,
+    kEarlyData = 42,
     kSupportedVersions = 43,
+    kPskKeyExchangeModes = 45,
     kKeyShare = 51,
     kQUICTransportParameters = 0x39,
+};
+
+// PSK key exchange modes (RFC 8446 Section 4.2.9)
+enum class PskKeyExchangeMode : uint8_t {
+    kPskKe = 0,       // PSK-only key establishment
+    kPskDheKe = 1,    // PSK with (EC)DHE key establishment
 };
 
 // Cipher suites
@@ -60,6 +69,23 @@ constexpr uint16_t kEcdsaSecp256r1Sha256 = 0x0403;
 //=============================================================================
 
 /**
+ * @brief PSK identity for session resumption
+ */
+struct PskIdentity {
+    std::vector<uint8_t> ticket;          ///< Session ticket
+    uint32_t obfuscated_ticket_age = 0;   ///< (current_time - received_time) + ticket_age_add
+};
+
+/**
+ * @brief PSK parameters for session resumption
+ */
+struct PskParameters {
+    PskIdentity identity;                 ///< PSK identity (ticket + age)
+    uint8_t psk[32] = {0};                ///< Pre-shared key (32 bytes for SHA-256)
+    bool valid = false;                   ///< Whether PSK is valid
+};
+
+/**
  * @brief Build TLS 1.3 ClientHello message
  * 
  * @param hostname Server hostname (SNI)
@@ -75,6 +101,25 @@ size_t BuildClientHello(const std::string& hostname,
                          const uint8_t* x25519_public_key,
                          const quic::TransportParameters& transport_params,
                          uint8_t* out, size_t out_len);
+
+/**
+ * @brief Build TLS 1.3 ClientHello message with PSK for session resumption
+ * 
+ * @param hostname Server hostname (SNI)
+ * @param client_random 32-byte random
+ * @param x25519_public_key 32-byte X25519 public key
+ * @param transport_params QUIC transport parameters
+ * @param psk PSK parameters for session resumption
+ * @param out Output buffer
+ * @param out_len Output buffer size
+ * @return Size written, or 0 on failure
+ */
+size_t BuildClientHelloWithPsk(const std::string& hostname,
+                                const uint8_t* client_random,
+                                const uint8_t* x25519_public_key,
+                                const quic::TransportParameters& transport_params,
+                                const PskParameters& psk,
+                                uint8_t* out, size_t out_len);
 
 //=============================================================================
 // ServerHello Parsing
@@ -94,6 +139,10 @@ struct ServerHelloData {
     uint16_t selected_version = 0;
     uint16_t key_share_group = 0;
     uint8_t key_share_public_key[32] = {0};
+    
+    // PSK extension (if server accepted our PSK)
+    bool has_psk = false;                ///< Server accepted PSK
+    uint16_t selected_psk_identity = 0;  ///< Index of selected PSK (should be 0)
     
     bool is_hello_retry_request = false;
 };
@@ -218,7 +267,10 @@ struct NewSessionTicketData {
     uint32_t ticket_age_add = 0;
     std::vector<uint8_t> ticket_nonce;
     std::vector<uint8_t> ticket;
-    // Extensions not parsed
+    
+    // Extensions
+    bool has_early_data = false;          ///< Server supports 0-RTT with this ticket
+    uint32_t max_early_data_size = 0;     ///< Maximum early data size (0 = unlimited)
 };
 
 /**

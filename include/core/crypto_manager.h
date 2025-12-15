@@ -231,6 +231,19 @@ public:
                                  size_t sh_len);
     
     /**
+     * @brief Derive Handshake keys after ServerHello with PSK
+     * 
+     * This is used for PSK resumption mode where the early_secret is derived
+     * from the PSK instead of zeros.
+     * 
+     * @param server_public_key Server's X25519 public key (32 bytes)
+     * @param psk Pre-shared key (32 bytes)
+     * @return true on success
+     */
+    bool DeriveHandshakeSecretsWithPsk(const uint8_t* server_public_key,
+                                        const uint8_t* psk);
+    
+    /**
      * @brief Check if Handshake keys are available
      */
     bool HasHandshakeKeys() const { return client_handshake_secrets_.valid; }
@@ -372,6 +385,41 @@ public:
      * @brief Get master secret (for resumption, if derived)
      */
     const uint8_t* GetMasterSecret() const { return master_secret_; }
+    
+    //=========================================================================
+    // Session Resumption (RFC 8446 Section 4.6.1)
+    //=========================================================================
+    
+    /**
+     * @brief Derive resumption master secret after handshake complete
+     * 
+     * This must be called after DeriveApplicationSecrets() and after
+     * Client Finished has been added to the transcript.
+     * 
+     * @return true on success
+     */
+    bool DeriveResumptionMasterSecret();
+    
+    /**
+     * @brief Derive PSK from ticket nonce (for session resumption)
+     * 
+     * @param ticket_nonce Ticket nonce from NewSessionTicket
+     * @param nonce_len Length of ticket nonce
+     * @param psk_out Output buffer for PSK (32 bytes)
+     * @return true on success
+     */
+    bool DeriveResumptionPsk(const uint8_t* ticket_nonce, size_t nonce_len,
+                              uint8_t* psk_out);
+    
+    /**
+     * @brief Check if resumption master secret is available
+     */
+    bool HasResumptionSecret() const { return has_resumption_secret_; }
+    
+    /**
+     * @brief Get resumption master secret
+     */
+    const uint8_t* GetResumptionMasterSecret() const { return resumption_master_secret_; }
 
 private:
     // Key material
@@ -382,6 +430,10 @@ private:
     // Intermediate secrets
     uint8_t handshake_secret_[32];
     uint8_t master_secret_[32];
+    
+    // Resumption secret (for session tickets)
+    uint8_t resumption_master_secret_[32];
+    bool has_resumption_secret_ = false;
     
     // Crypto secrets for each level
     quic::CryptoSecrets client_initial_secrets_;

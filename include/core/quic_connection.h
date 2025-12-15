@@ -85,6 +85,15 @@ struct QuicConfig {
     const uint8_t* external_private_key = nullptr;  ///< External X25519 private key (32 bytes)
     const uint8_t* external_public_key = nullptr;   ///< External X25519 public key (32 bytes)
     
+    // Session resumption with PSK (Pre-Shared Key)
+    // If session_ticket is non-empty and psk is non-empty, PSK resumption will be attempted.
+    // Ticket will be validated against lifetime before use.
+    std::vector<uint8_t> session_ticket;            ///< Session ticket from previous connection
+    std::vector<uint8_t> psk;                       ///< Pre-shared key (32 bytes), copied for safety
+    uint32_t ticket_age_add = 0;                    ///< Ticket age add from NewSessionTicket
+    uint64_t ticket_received_time_ms = 0;           ///< Time when ticket was received
+    uint32_t ticket_lifetime = 0;                   ///< Ticket lifetime in seconds
+    
     // Debug
     bool enable_debug = false;              ///< Enable debug logging
 };
@@ -129,6 +138,22 @@ using OnStreamWritableCallback = std::function<void(int stream_id)>;
 /// Called when connection becomes writable (MAX_DATA received or ACK frees congestion window)
 /// Upper layer should retry any blocked writes.
 using OnWritableCallback = std::function<void()>;
+
+/**
+ * @brief Session ticket data for resumption
+ */
+struct SessionTicketData {
+    std::vector<uint8_t> ticket;          ///< Session ticket
+    std::vector<uint8_t> psk;             ///< Pre-shared key (32 bytes)
+    uint32_t ticket_lifetime = 0;         ///< Ticket lifetime in seconds
+    uint32_t ticket_age_add = 0;          ///< Ticket age add value
+    uint64_t received_time_ms = 0;        ///< Time ticket was received
+    bool supports_early_data = false;     ///< Server supports 0-RTT
+    uint32_t max_early_data_size = 0;     ///< Max early data size
+};
+
+/// Called when a NewSessionTicket is received (for session resumption)
+using OnSessionTicketCallback = std::function<void(const SessionTicketData& ticket)>;
 
 //=============================================================================
 // QuicConnection Class
@@ -384,6 +409,9 @@ public:
     
     /// Set callback for connection becoming writable (MAX_DATA or ACK frees window)
     void SetOnWritable(OnWritableCallback cb);
+    
+    /// Set callback for receiving NewSessionTicket (for session resumption)
+    void SetOnSessionTicket(OnSessionTicketCallback cb);
     
     //=========================================================================
     // Statistics

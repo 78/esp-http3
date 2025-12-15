@@ -546,6 +546,24 @@ bool Http3Client::EnsureConnected(uint32_t timeout_ms) {
         ESP_LOGI(TAG, "Reusing cached X25519 keypair for faster reconnection");
     }
     
+    // Pass cached session ticket if available (for PSK resumption)
+    // Note: Session ticket can only be used ONCE (TLS 1.3 anti-replay)
+    if (config_.cache_session_ticket && has_cached_session_ticket_) {
+        // Copy all data - PSK must be copied (not pointer) to avoid lifetime issues
+        quic_config.session_ticket = cached_session_ticket_.ticket;
+        quic_config.psk = cached_session_ticket_.psk;  // Vector copy for safety
+        quic_config.ticket_age_add = cached_session_ticket_.ticket_age_add;
+        quic_config.ticket_received_time_ms = cached_session_ticket_.received_time_ms;
+        quic_config.ticket_lifetime = cached_session_ticket_.ticket_lifetime;
+        ESP_LOGI(TAG, "Using cached session ticket for PSK resumption (one-time use, lifetime=%lu s)",
+                 (unsigned long)cached_session_ticket_.ticket_lifetime);
+        
+        // Clear the cached ticket after copying - it can only be used once
+        // Server will send a new ticket after successful connection
+        has_cached_session_ticket_ = false;
+        cached_session_ticket_ = esp_http3::SessionTicketData{};
+    }
+    
     // Create QUIC connection
     connection_ = std::make_unique<esp_http3::QuicConnection>(
         [this](const uint8_t* data, size_t length) -> int {
@@ -586,6 +604,21 @@ bool Http3Client::EnsureConnected(uint32_t timeout_ms) {
         // Connection or congestion window opened, wake event loop to retry writes
         WakeEventLoop();
     });
+    
+    // Set up session ticket callback for caching
+    // Note: Server may send multiple tickets, we always keep the latest one
+    // because it has a longer remaining lifetime for session resumption
+    if (config_.cache_session_ticket) {
+        connection_->SetOnSessionTicket([this](const esp_http3::SessionTicketData& ticket) {
+            // Always cache the latest session ticket (newer = longer lifetime)
+            cached_session_ticket_ = ticket;
+            has_cached_session_ticket_ = true;
+            ESP_LOGI(TAG, "Cached session ticket: %zu bytes, 0-RTT=%s, lifetime=%lu s",
+                     ticket.ticket.size(),
+                     ticket.supports_early_data ? "supported" : "not supported",
+                     (unsigned long)ticket.ticket_lifetime);
+        });
+    }
     
     // Start background tasks
     if (!event_loop_task_) {
@@ -631,7 +664,7 @@ bool Http3Client::EnsureConnected(uint32_t timeout_ms) {
                 connection_->GetPrivateKey(cached_private_key_) &&
                 connection_->GetPublicKey(cached_public_key_)) {
                 has_cached_keypair_ = true;
-                ESP_LOGI(TAG, "Cached X25519 keypair for future reconnections");
+                ESP_LOGD(TAG, "Cached X25519 keypair for future reconnections");
             }
         }
         

@@ -251,6 +251,12 @@ struct Http3ClientConfig {
     // client_random is still regenerated each connection for security.
     bool cache_keypair = true;
     
+    // Session ticket caching for session resumption
+    // When enabled, NewSessionTicket is saved for future connections.
+    // This can potentially enable faster reconnection through PSK resumption.
+    // Default: disabled (session tickets have limited lifetime and single-use)
+    bool cache_session_ticket = false;
+    
     // Debug logging
     bool enable_debug = false;
 };
@@ -518,5 +524,9 @@ private:
     bool has_cached_keypair_ = false;
     uint8_t cached_private_key_[32] = {0};
     uint8_t cached_public_key_[32] = {0};
+    
+    // Session ticket caching for session resumption
+    bool has_cached_session_ticket_ = false;
+    esp_http3::SessionTicketData cached_session_ticket_;
 };
 

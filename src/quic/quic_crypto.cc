@@ -83,6 +83,23 @@ bool Sha256(const uint8_t* data, size_t len, uint8_t* out) {
     return true;
 }
 
+bool HmacSha256(const uint8_t* key, size_t key_len,
+                const uint8_t* data, size_t data_len,
+                uint8_t* out) {
+    const mbedtls_md_info_t* md = mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
+    if (md == nullptr) {
+        ESP_LOGW(TAG, "HmacSha256: mbedtls_md_info_from_type failed");
+        return false;
+    }
+    
+    int ret = mbedtls_md_hmac(md, key, key_len, data, data_len, out);
+    if (ret != 0) {
+        ESP_LOGW(TAG, "HmacSha256: mbedtls_md_hmac failed: %d", ret);
+        return false;
+    }
+    return true;
+}
+
 bool HkdfExtract(const uint8_t* salt, size_t salt_len,
                  const uint8_t* ikm, size_t ikm_len,
                  uint8_t* out) {
@@ -325,6 +342,82 @@ bool DeriveHandshakeSecrets(const uint8_t* shared_secret,
         return false;
     }
     
+    return true;
+}
+
+bool DeriveHandshakeSecretsWithPsk(const uint8_t* shared_secret,
+                                    const uint8_t* transcript_hash,
+                                    const uint8_t* psk,
+                                    CryptoSecrets* client_out,
+                                    CryptoSecrets* server_out,
+                                    uint8_t* handshake_secret_out) {
+    // TLS 1.3 Key Schedule with PSK:
+    // PSK -> HKDF-Extract = Early Secret (instead of zeros)
+    // ...
+    // (EC)DHE -> HKDF-Extract = Handshake Secret
+    
+    // For PSK: early_secret = HKDF-Extract(salt=0, IKM=PSK)
+    uint8_t early_secret[32];
+    if (!HkdfExtract(nullptr, 0, psk, 32, early_secret)) {
+        ESP_LOGW(TAG, "DeriveHandshakeSecretsWithPsk: HkdfExtract(early_secret) failed");
+        return false;
+    }
+    
+    // derived_secret = Derive-Secret(early_secret, "derived", "")
+    const uint8_t* derived_label = reinterpret_cast<const uint8_t*>("derived");
+    uint8_t empty_hash[32];
+    if (!Sha256(nullptr, 0, empty_hash)) {
+        ESP_LOGW(TAG, "DeriveHandshakeSecretsWithPsk: Sha256(empty) failed");
+        return false;
+    }
+    
+    uint8_t derived_secret[32];
+    if (!HkdfExpandLabel(early_secret, 32, derived_label, 7, empty_hash, 32,
+                         derived_secret, 32)) {
+        ESP_LOGW(TAG, "DeriveHandshakeSecretsWithPsk: HkdfExpandLabel(derived_secret) failed");
+        return false;
+    }
+    
+    // handshake_secret = HKDF-Extract(derived_secret, shared_secret)
+    uint8_t handshake_secret[32];
+    if (!HkdfExtract(derived_secret, 32, shared_secret, 32, handshake_secret)) {
+        ESP_LOGW(TAG, "DeriveHandshakeSecretsWithPsk: HkdfExtract(handshake_secret) failed");
+        return false;
+    }
+    
+    // Save handshake secret
+    if (handshake_secret_out) {
+        std::memcpy(handshake_secret_out, handshake_secret, 32);
+    }
+    
+    // Derive traffic secrets (same as non-PSK mode from here)
+    const uint8_t* c_hs_label = reinterpret_cast<const uint8_t*>("c hs traffic");
+    uint8_t client_hs_secret[32];
+    if (!HkdfExpandLabel(handshake_secret, 32, c_hs_label, 12, transcript_hash, 32,
+                         client_hs_secret, 32)) {
+        ESP_LOGW(TAG, "DeriveHandshakeSecretsWithPsk: HkdfExpandLabel(client_hs_traffic) failed");
+        return false;
+    }
+    
+    const uint8_t* s_hs_label = reinterpret_cast<const uint8_t*>("s hs traffic");
+    uint8_t server_hs_secret[32];
+    if (!HkdfExpandLabel(handshake_secret, 32, s_hs_label, 12, transcript_hash, 32,
+                         server_hs_secret, 32)) {
+        ESP_LOGW(TAG, "DeriveHandshakeSecretsWithPsk: HkdfExpandLabel(server_hs_traffic) failed");
+        return false;
+    }
+    
+    // Derive traffic keys
+    if (client_out && !DeriveTrafficKeys(client_hs_secret, client_out)) {
+        ESP_LOGW(TAG, "DeriveHandshakeSecretsWithPsk: DeriveTrafficKeys(client) failed");
+        return false;
+    }
+    if (server_out && !DeriveTrafficKeys(server_hs_secret, server_out)) {
+        ESP_LOGW(TAG, "DeriveHandshakeSecretsWithPsk: DeriveTrafficKeys(server) failed");
+        return false;
+    }
+    
+    ESP_LOGI(TAG, "Derived Handshake secrets with PSK");
     return true;
 }
 

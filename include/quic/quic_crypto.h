@@ -91,6 +91,27 @@ bool DeriveHandshakeSecrets(const uint8_t* shared_secret,
                             CryptoSecrets* server_out,
                             uint8_t* handshake_secret_out);
 
+/**
+ * @brief Derive Handshake secrets with PSK (for session resumption)
+ * 
+ * Same as DeriveHandshakeSecrets but uses PSK for early_secret derivation
+ * instead of zeros.
+ * 
+ * @param shared_secret X25519 shared secret (32 bytes)
+ * @param transcript_hash SHA-256 up to ServerHello
+ * @param psk Pre-shared key (32 bytes)
+ * @param client_out Output client secrets
+ * @param server_out Output server secrets
+ * @param handshake_secret_out Output handshake secret
+ * @return true on success
+ */
+bool DeriveHandshakeSecretsWithPsk(const uint8_t* shared_secret,
+                                    const uint8_t* transcript_hash,
+                                    const uint8_t* psk,
+                                    CryptoSecrets* client_out,
+                                    CryptoSecrets* server_out,
+                                    uint8_t* handshake_secret_out);
+
 //=============================================================================
 // Application Key Derivation
 //=============================================================================
@@ -200,6 +221,20 @@ bool X25519ECDH(const uint8_t* private_key,
  * @return true on success
  */
 bool Sha256(const uint8_t* data, size_t len, uint8_t* out);
+
+/**
+ * @brief Compute HMAC-SHA256
+ * 
+ * @param key HMAC key
+ * @param key_len Key length
+ * @param data Input data
+ * @param data_len Data length
+ * @param out Output MAC (32 bytes)
+ * @return true on success
+ */
+bool HmacSha256(const uint8_t* key, size_t key_len,
+                const uint8_t* data, size_t data_len,
+                uint8_t* out);
 
 /**
  * @brief SHA-256 incremental context

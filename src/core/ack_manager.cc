@@ -220,7 +220,7 @@ SentPacketTracker::SentPacketTracker() {
 }
 
 void SentPacketTracker::Reset() {
-    sent_packets_.clear();
+    std::vector<SentPacketInfo>().swap(sent_packets_);
     next_packet_number_ = 0;
     largest_acked_ = -1;
     latest_rtt_us_ = 0;
