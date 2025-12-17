@@ -7,8 +7,7 @@ files:
   exclude:
   - .git
   - dist
-  - "*.md"
-license: MIT
+license: Apache-2.0
 repository: https://github.com/78/esp-http3
 url: https://github.com/78/esp-http3
-version: 1.2.3
+version: 1.2.4
