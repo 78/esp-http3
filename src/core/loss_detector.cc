@@ -7,6 +7,9 @@
 
 #include <algorithm>
 #include <cmath>
+#include <esp_log.h>
+
+#define TAG "LossDetector"
 
 namespace esp_http3 {
 
@@ -134,49 +137,40 @@ void LossDetector::Reset() {
 void LossDetector::OnPacketSent(uint64_t pn, uint64_t sent_time_us, 
                                  size_t bytes, bool ack_eliciting) {
     if (ack_eliciting) {
-        // RFC 9002: Reset PTO count when sending new ACK-eliciting data
-        // after all previous ACK-eliciting data has been acknowledged
-        // (indicated by last_ack_eliciting_time_us_ == 0)
+        // RFC 9002: PTO is based on the EARLIEST unacked ACK-eliciting packet.
+        // Only update last_ack_eliciting_time_us_ when there are NO unacked
+        // ACK-eliciting packets (i.e., this is the first in a new burst).
         // 
-        // Also reset PTO count if it has been a long time since last activity,
-        // indicating this is a new request burst after idle period
-        bool should_reset_pto = (last_ack_eliciting_time_us_ == 0);
+        // When there are already unacked packets, we should keep the earliest
+        // time to ensure proper PTO timeout calculation.
+        bool is_first_in_burst = (last_ack_eliciting_time_us_ == 0);
         bool should_reset_rtt = false;
         
-        if (!should_reset_pto && sent_time_us > last_ack_eliciting_time_us_) {
-            // If more than 2x PTO has elapsed since last ACK-eliciting packet,
-            // consider this a new request and reset PTO count
-            uint64_t elapsed = sent_time_us - last_ack_eliciting_time_us_;
-            uint64_t pto_threshold = 2 * GetPtoTimeout();
-            if (elapsed > pto_threshold) {
-                should_reset_pto = true;
+        if (is_first_in_burst) {
+            // First ACK-eliciting packet after all previous have been ACKed
+            pto_count_ = 0;
+            last_ack_eliciting_time_us_ = sent_time_us;
+            
+            // Check if RTT is unreasonably high (> 5 seconds) and reset
+            constexpr uint64_t kMaxReasonableRttUs = 5 * 1000 * 1000;  // 5 seconds
+            if (rtt_.GetSmoothedRtt() > kMaxReasonableRttUs) {
+                should_reset_rtt = true;
             }
-            // If idle for more than 10 seconds, also reset RTT to initial values
-            // to avoid using stale/polluted RTT estimates from previous bad network conditions
+        } else if (sent_time_us > last_ack_eliciting_time_us_) {
+            // Check if idle for too long - reset RTT to avoid stale estimates
+            uint64_t elapsed = sent_time_us - last_ack_eliciting_time_us_;
             constexpr uint64_t kIdleRttResetThresholdUs = 10 * 1000 * 1000;  // 10 seconds
             if (elapsed > kIdleRttResetThresholdUs) {
                 should_reset_rtt = true;
             }
-        }
-        
-        if (should_reset_pto) {
-            pto_count_ = 0;
-            // If no previous ACK-eliciting packets (fresh start after idle),
-            // also consider resetting RTT if current estimates are unreasonably high
-            if (last_ack_eliciting_time_us_ == 0) {
-                // Check if RTT is unreasonably high (> 5 seconds)
-                constexpr uint64_t kMaxReasonableRttUs = 5 * 1000 * 1000;  // 5 seconds
-                if (rtt_.GetSmoothedRtt() > kMaxReasonableRttUs) {
-                    should_reset_rtt = true;
-                }
-            }
+            // Do NOT update last_ack_eliciting_time_us_ here!
+            // PTO must be based on the earliest unacked packet.
         }
         
         if (should_reset_rtt) {
             rtt_.Reset();
         }
         
-        last_ack_eliciting_time_us_ = sent_time_us;
         cc_.OnPacketSent(bytes);
     }
 }
@@ -283,14 +277,15 @@ bool LossDetector::OnTimerTick(uint64_t current_time_us) {
 
 uint64_t LossDetector::GetPtoTimeout() const {
     // PTO = smoothed_rtt + max(4*rttvar, 1ms) + max_ack_delay
-    uint64_t pto = rtt_.GetSmoothedRtt();
+    uint64_t srtt = rtt_.GetSmoothedRtt();
+    uint64_t rttvar = rtt_.GetRttVar();
     
-    uint64_t rttvar_contribution = 4 * rtt_.GetRttVar();
+    uint64_t rttvar_contribution = 4 * rttvar;
     if (rttvar_contribution < 1000) {
         rttvar_contribution = 1000;  // Minimum 1ms
     }
-    pto += rttvar_contribution;
-    pto += max_ack_delay_us_;
+    
+    uint64_t pto = srtt + rttvar_contribution + max_ack_delay_us_;
     
     return pto;
 }

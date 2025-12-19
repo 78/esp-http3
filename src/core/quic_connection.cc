@@ -313,7 +313,7 @@ private:
     std::map<uint64_t, std::vector<uint8_t>> app_crypto_cache_;
     
     // Timers
-    uint64_t time_since_last_activity_us_ = 0;
+    uint64_t last_activity_time_us_ = 0;      // Absolute timestamp of last activity
     uint64_t handshake_start_time_us_ = 0;
     uint64_t current_time_us_ = 0;
     uint32_t effective_idle_timeout_ms_ = 0;  // min(local, peer) idle timeout
@@ -453,6 +453,7 @@ bool QuicConnection::Impl::StartHandshake() {
     state_ = ConnectionState::kHandshakeInProgress;
     handshake_start_time_us_ = start_time_us;
     current_time_us_ = handshake_start_time_us_;
+    last_activity_time_us_ = start_time_us;  // Initialize activity timer
     
     // Generate connection IDs
     GenerateRandom(scid_.data.data(), 8);
@@ -670,7 +671,7 @@ void QuicConnection::Impl::ProcessReceivedData(uint8_t* data, size_t len) {
     }
     
     current_time_us_ = quic::GetCurrentTimeUs();
-    time_since_last_activity_us_ = 0;
+    last_activity_time_us_ = current_time_us_;  // Reset idle timer on packet receive
     packets_received_++;
     bytes_received_ += len;
     
@@ -929,6 +930,12 @@ bool QuicConnection::Impl::Process1RttPacket(uint8_t* data, size_t len) {
     // Only record packet for ACK generation if it contains ACK-eliciting frames (RFC 9002)
     if (HasAckElicitingFrames(payload_buf_, payload_len)) {
         app_ack_mgr_.OnPacketReceived(info.packet_number, current_time_us_);
+        
+        // RFC 9002: Send ACK immediately after receiving 2+ ack-eliciting packets
+        // This ensures timely ACK even when processing batched UDP packets
+        if (app_ack_mgr_.ShouldSendAck()) {
+            SendAckIfNeeded(quic::PacketType::k1Rtt);
+        }
     }
     
     ProcessFrames(payload_buf_, payload_len, quic::PacketType::k1Rtt);
@@ -2231,22 +2238,22 @@ bool QuicConnection::Impl::SendStreamData(uint64_t stream_id,
 //=============================================================================
 
 uint32_t QuicConnection::Impl::OnTimerTick(uint32_t elapsed_ms) {
+    (void)elapsed_ms;  // No longer used for idle timeout calculation
     current_time_us_ = quic::GetCurrentTimeUs();
-    time_since_last_activity_us_ += elapsed_ms * 1000;
     
     // Maximum wait time (60 seconds as upper bound)
     static constexpr uint32_t kMaxWaitMs = 60000;
     uint32_t next_timer_ms = kMaxWaitMs;
     
-    // Check idle timeout (use effective timeout which is min of local and peer)
-    if (handshake_complete_ && effective_idle_timeout_ms_ > 0) {
-        uint64_t idle_deadline_us = effective_idle_timeout_ms_ * 1000ULL;
-        if (time_since_last_activity_us_ > idle_deadline_us) {
+    // Check idle timeout using absolute timestamps (RFC 9000 Section 10.1)
+    if (handshake_complete_ && effective_idle_timeout_ms_ > 0 && last_activity_time_us_ > 0) {
+        uint64_t idle_deadline_us = last_activity_time_us_ + effective_idle_timeout_ms_ * 1000ULL;
+        if (current_time_us_ > idle_deadline_us) {
             Close(0, "idle timeout");
             return 0;
         }
         // Calculate time until idle timeout
-        uint64_t remaining_us = idle_deadline_us - time_since_last_activity_us_;
+        uint64_t remaining_us = idle_deadline_us - current_time_us_;
         uint32_t remaining_ms = static_cast<uint32_t>(remaining_us / 1000);
         if (remaining_ms < next_timer_ms) {
             next_timer_ms = remaining_ms;
