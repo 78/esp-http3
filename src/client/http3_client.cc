@@ -563,6 +563,8 @@ bool Http3Client::EnsureConnected(uint32_t timeout_ms) {
         has_cached_session_ticket_ = false;
         cached_session_ticket_ = esp_http3::SessionTicketData{};
     }
+
+    connection_.reset();
     
     // Create QUIC connection
     connection_ = std::make_unique<esp_http3::QuicConnection>(
