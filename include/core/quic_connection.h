@@ -139,6 +139,10 @@ using OnStreamWritableCallback = std::function<void(int stream_id)>;
 /// Upper layer should retry any blocked writes.
 using OnWritableCallback = std::function<void()>;
 
+/// Called when a stream is reset by peer (RESET_STREAM or STOP_SENDING received)
+/// error_code is the application error code from the frame
+using OnStreamResetCallback = std::function<void(int stream_id, uint64_t error_code)>;
+
 /**
  * @brief Session ticket data for resumption
  */
@@ -412,6 +416,9 @@ public:
     
     /// Set callback for receiving NewSessionTicket (for session resumption)
     void SetOnSessionTicket(OnSessionTicketCallback cb);
+    
+    /// Set callback for stream reset by peer (RESET_STREAM or STOP_SENDING received)
+    void SetOnStreamReset(OnStreamResetCallback cb);
     
     //=========================================================================
     // Statistics

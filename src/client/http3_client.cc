@@ -176,6 +176,12 @@ int Http3Stream::Write(std::vector<uint8_t>&& data, uint32_t timeout_ms) {
         return -1;
     }
     
+    // Check if peer sent STOP_SENDING (write-only reset)
+    if (write_reset_) {
+        error_ = write_error_;
+        return -1;
+    }
+    
     if (data.empty()) {
         return 0;
     }
@@ -213,6 +219,12 @@ int Http3Stream::Write(std::vector<uint8_t>&& data, uint32_t timeout_ms) {
     }
     
     if (bits & EVENT_ERROR) {
+        return -1;
+    }
+    
+    // Check again after wait - STOP_SENDING may have arrived during write
+    if (write_reset_) {
+        error_ = write_error_;
         return -1;
     }
     
@@ -385,6 +397,31 @@ void Http3Stream::OnError(const std::string& error_message) {
     }
 }
 
+void Http3Stream::OnWriteReset(const std::string& error_message) {
+    // Only affects writes, not reads - allows receiving server response
+    write_error_ = error_message;
+    write_reset_ = true;
+    
+    // Signal write operations to wake up and fail
+    if (event_group_) {
+        xEventGroupSetBits(event_group_, EVENT_WRITE_COMPLETE);  // Wake up waiting writes
+    }
+}
+
+void Http3Stream::InvalidateClient() {
+    // Clear client pointer to prevent use-after-free
+    client_ = nullptr;
+    
+    // Mark as error state
+    has_error_ = true;
+    error_ = "Client destroyed";
+    
+    // Wake up any waiting operations
+    if (event_group_) {
+        xEventGroupSetBits(event_group_, EVENT_ERROR | EVENT_CLOSED);
+    }
+}
+
 // ============================================================================
 // Http3Client Implementation
 // ============================================================================
@@ -444,9 +481,14 @@ Http3Client::~Http3Client() {
         write_queues_.clear();
     }
     
-    // Cleanup any remaining streams
+    // Invalidate all active streams before clearing to prevent use-after-free
     {
         std::lock_guard<std::mutex> lock(streams_mutex_);
+        for (auto& [stream_id, stream] : streams_) {
+            if (stream) {
+                stream->InvalidateClient();
+            }
+        }
         streams_.clear();
     }
     
@@ -621,6 +663,11 @@ bool Http3Client::EnsureConnected(uint32_t timeout_ms) {
                      (unsigned long)ticket.ticket_lifetime);
         });
     }
+    
+    // Set up stream reset callback - notify Http3Stream when peer resets stream
+    connection_->SetOnStreamReset([this](int stream_id, uint64_t error_code) {
+        OnStreamReset(stream_id, error_code);
+    });
     
     // Start background tasks
     if (!event_loop_task_) {
@@ -1081,6 +1128,23 @@ void Http3Client::OnStreamWritable(int stream_id) {
     ESP_LOGD(TAG, "Stream %d became writable", stream_id);
     
     // Wake event loop to process write queues
+    WakeEventLoop();
+}
+
+void Http3Client::OnStreamReset(int stream_id, uint64_t error_code) {
+    ESP_LOGW(TAG, "Stream %d reset by peer, error=%llu", stream_id, (unsigned long long)error_code);
+    
+    // Notify the Http3Stream that writes are blocked (STOP_SENDING received)
+    // This only affects writes - reads can still receive server response
+    Http3Stream* stream = GetStream(stream_id);
+    if (stream) {
+        char error_msg[64];
+        snprintf(error_msg, sizeof(error_msg), "Stream reset by peer (error=%llu)", 
+                 (unsigned long long)error_code);
+        stream->OnWriteReset(error_msg);
+    }
+    
+    // Wake event loop to process
     WakeEventLoop();
 }
 

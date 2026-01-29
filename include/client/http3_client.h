@@ -192,6 +192,13 @@ private:
     // Called by Http3Client on error
     void OnError(const std::string& error_message);
     
+    // Called by Http3Client when peer sends STOP_SENDING (write-only reset)
+    // This only affects writes, reads can still receive server response
+    void OnWriteReset(const std::string& error_message);
+    
+    // Called by Http3Client during destruction to invalidate client pointer
+    void InvalidateClient();
+    
 private:
     Http3Client* client_;
     int stream_id_;
@@ -201,6 +208,7 @@ private:
     int status_ = 0;
     std::vector<std::pair<std::string, std::string>> headers_;
     std::string error_;
+    std::string write_error_;  // Separate error for write operations
     
     // Stream state
     std::atomic<bool> closed_{false};
@@ -208,6 +216,7 @@ private:
     std::atomic<bool> finished_receiving_{false};
     std::atomic<bool> finished_sending_{false};
     std::atomic<bool> has_error_{false};
+    std::atomic<bool> write_reset_{false};  // True if peer sent STOP_SENDING
     
     // Receive buffer (ring buffer in PSRAM)
     uint8_t* receive_buffer_ = nullptr;
@@ -502,6 +511,9 @@ private:
     
     // Called when stream becomes writable
     void OnStreamWritable(int stream_id);
+    
+    // Called when stream is reset by peer (STOP_SENDING or RESET_STREAM)
+    void OnStreamReset(int stream_id, uint64_t error_code);
     
     // Helper to set last error message
     void SetLastError(const std::string& error);

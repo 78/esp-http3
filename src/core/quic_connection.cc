@@ -71,7 +71,8 @@ public:
     bool IsStreamReset(int stream_id) const {
         uint64_t sid = static_cast<uint64_t>(stream_id);
         return reset_streams_.find(sid) != reset_streams_.end() ||
-               stop_sending_streams_.find(sid) != stop_sending_streams_.end();
+               local_stop_sending_streams_.find(sid) != local_stop_sending_streams_.end() ||
+               remote_stop_sending_streams_.find(sid) != remote_stop_sending_streams_.end();
     }
     
     void AcknowledgeStreamData(int stream_id, size_t bytes) {
@@ -94,6 +95,7 @@ public:
     void SetOnStreamWritable(OnStreamWritableCallback cb) { on_stream_writable_ = std::move(cb); }
     void SetOnWritable(OnWritableCallback cb) { on_writable_ = std::move(cb); }
     void SetOnSessionTicket(OnSessionTicketCallback cb) { on_session_ticket_ = std::move(cb); }
+    void SetOnStreamReset(OnStreamResetCallback cb) { on_stream_reset_ = std::move(cb); }
     
     // DATAGRAM callback type (same as public API)
     using OnDatagramCallback = QuicConnection::OnDatagramCallback;
@@ -243,10 +245,14 @@ private:
     OnStreamWritableCallback on_stream_writable_;
     OnWritableCallback on_writable_;
     OnSessionTicketCallback on_session_ticket_;
+    OnStreamResetCallback on_stream_reset_;
     
     // Track reset streams
     std::set<uint64_t> reset_streams_;
-    std::set<uint64_t> stop_sending_streams_;
+    // STOP_SENDING frames we've sent to peer (we don't want to receive data)
+    std::set<uint64_t> local_stop_sending_streams_;
+    // STOP_SENDING frames received from peer (peer doesn't want our data)
+    std::set<uint64_t> remote_stop_sending_streams_;
     
     // Connection IDs
     quic::ConnectionId dcid_;           // Destination CID (server's)
@@ -992,6 +998,11 @@ void QuicConnection::Impl::ProcessFrames(const uint8_t* data, size_t len,
                          (unsigned long long)stream_id, (unsigned long long)error_code);
                 // Stream was reset by server - this is a fatal error for the stream
                 reset_streams_.insert(stream_id);
+                
+                // Notify upper layer immediately
+                if (on_stream_reset_) {
+                    on_stream_reset_(static_cast<int>(stream_id), error_code);
+                }
             }
         } else if (frame_type == 0x05) {
             // STOP_SENDING - server wants us to stop sending data
@@ -1005,7 +1016,13 @@ void QuicConnection::Impl::ProcessFrames(const uint8_t* data, size_t len,
                 ESP_LOGW(TAG, "Server requested stop sending on stream %llu (error=%llu)", 
                          (unsigned long long)stream_id, (unsigned long long)error_code);
                 // Server wants us to stop sending - we should abort the upload
-                stop_sending_streams_.insert(stream_id);
+                // Note: This does NOT affect receiving data from server on this stream
+                remote_stop_sending_streams_.insert(stream_id);
+                
+                // Notify upper layer immediately so writes can fail fast
+                if (on_stream_reset_) {
+                    on_stream_reset_(static_cast<int>(stream_id), error_code);
+                }
             }
         } else if (frame_type == 0x06) {
             // CRYPTO
@@ -1732,7 +1749,10 @@ void QuicConnection::Impl::ProcessStreamFrame(quic::BufferReader* reader,
     
     // Check if we've sent STOP_SENDING for this stream - if so, ignore the data
     // The peer may not have received our STOP_SENDING yet, so we just silently drop
-    if (stop_sending_streams_.find(stream_data.stream_id) != stop_sending_streams_.end()) {
+    // Note: Only check local_stop_sending_streams_ (STOP_SENDING we sent to peer)
+    // Do NOT check remote_stop_sending_streams_ - peer's STOP_SENDING means they
+    // don't want OUR data, but we should still receive THEIR data
+    if (local_stop_sending_streams_.find(stream_data.stream_id) != local_stop_sending_streams_.end()) {
         if (config_.enable_debug) {
             ESP_LOGW(TAG, "  Ignoring STREAM data for cancelled stream %llu",
                      (unsigned long long)stream_data.stream_id);
@@ -2556,7 +2576,7 @@ bool QuicConnection::Impl::ResetStream(int stream_id, uint64_t error_code) {
     
     // Mark stream as reset locally (both directions)
     reset_streams_.insert(sid);
-    stop_sending_streams_.insert(sid);
+    local_stop_sending_streams_.insert(sid);  // We sent STOP_SENDING to peer
     
     ESP_LOGI(TAG, "ResetStream: stream %d reset with RESET_STREAM + STOP_SENDING, error=0x%llx, final_size=%llu",
              stream_id, (unsigned long long)error_code, (unsigned long long)final_size);
@@ -2577,7 +2597,8 @@ void QuicConnection::Impl::NotifyWritable() {
 void QuicConnection::Impl::CleanupStream(uint64_t stream_id) {
     // Remove from reset/stop_sending tracking sets
     reset_streams_.erase(stream_id);
-    stop_sending_streams_.erase(stream_id);
+    local_stop_sending_streams_.erase(stream_id);
+    remote_stop_sending_streams_.erase(stream_id);
     
     // Remove flow control state
     flow_controller_.RemoveStream(stream_id);
@@ -2959,9 +2980,9 @@ void QuicConnection::Impl::SetupFrameProcessorCallbacks() {
         reset_streams_.insert(data.stream_id);
     });
     
-    // STOP_SENDING frame callback
+    // STOP_SENDING frame callback - peer wants us to stop sending
     frame_processor_.SetOnStopSending([this](const StopSendingData& data) {
-        stop_sending_streams_.insert(data.stream_id);
+        remote_stop_sending_streams_.insert(data.stream_id);
     });
     
     // RETIRE_CONNECTION_ID frame callback
@@ -3731,6 +3752,10 @@ void QuicConnection::SetOnWritable(OnWritableCallback cb) {
 
 void QuicConnection::SetOnSessionTicket(OnSessionTicketCallback cb) {
     impl_->SetOnSessionTicket(std::move(cb));
+}
+
+void QuicConnection::SetOnStreamReset(OnStreamResetCallback cb) {
+    impl_->SetOnStreamReset(std::move(cb));
 }
 
 QuicConnection::Stats QuicConnection::GetStats() const {
