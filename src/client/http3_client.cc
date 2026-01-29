@@ -818,37 +818,11 @@ std::unique_ptr<Http3Stream> Http3Client::Open(const Http3Request& request,
     // Wake event loop to process
     WakeEventLoop();
     
-    // For non-streaming requests, wait for headers
-    if (!request.streaming_upload) {
-        EventBits_t bits = xEventGroupWaitBits(
-            stream->event_group_,
-            Http3Stream::EVENT_HEADERS_RECEIVED | Http3Stream::EVENT_ERROR | Http3Stream::EVENT_CLOSED,
-            pdFALSE,  // Don't clear - let Read() see the state
-            pdFALSE,
-            pdMS_TO_TICKS(timeout_ms)
-        );
-        
-        if (bits == 0) {
-            ESP_LOGE(TAG, "Timeout waiting for headers");
-            stream->error_ = "Timeout waiting for headers";
-            stream->Close();
-            return nullptr;
-        }
-        
-        if (bits & (Http3Stream::EVENT_ERROR | Http3Stream::EVENT_CLOSED)) {
-            ESP_LOGE(TAG, "Error waiting for headers: %s", stream->error_.c_str());
-            return nullptr;
-        }
-    }
-    
-    // For streaming upload, don't call GetStatus() as it would block waiting for headers
-    if (request.streaming_upload) {
-        ESP_LOGI(TAG, "Opened stream %d: %s %s (streaming upload)", 
-                 stream_id, request.method.c_str(), request.path.c_str());
-    } else {
-        ESP_LOGI(TAG, "Opened stream %d: %s %s -> status=%d", 
-                 stream_id, request.method.c_str(), request.path.c_str(), stream->GetStatus());
-    }
+    // Return stream immediately - caller should use GetStatus() to wait for headers
+    // This allows the caller to cancel the stream before headers arrive
+    ESP_LOGI(TAG, "Opened stream %d: %s %s%s", 
+             stream_id, request.method.c_str(), request.path.c_str(),
+             request.streaming_upload ? " (streaming upload)" : "");
     
     return stream;
 }
