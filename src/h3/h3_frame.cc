@@ -592,22 +592,25 @@ static size_t HuffmanDecode(const uint8_t* input, size_t input_len,
             }
             
             if (!found) {
-                // Check for EOS padding (all 1s in remaining bits)
-                if (bits_in_acc < 8) {
-                    uint32_t padding_mask = (1U << bits_in_acc) - 1;
-                    if ((accumulator & padding_mask) == padding_mask) {
-                        return output->size();
-                    }
-                }
+                // Need more bits to decode the next symbol.
+                // Don't check for EOS padding here - only check after all input
+                // is consumed. Some symbols like '~' (0x1ffd, 13 bits) start with
+                // many consecutive 1s which could be mistaken for EOS padding.
                 break;
             }
         }
     }
     
-    // Check final padding (must be all 1s, up to 7 bits)
-    if (bits_in_acc > 0 && bits_in_acc <= 7) {
+    // After processing all input, check remaining bits.
+    // Valid EOS padding must be all 1s, up to 7 bits (RFC 7541 Section 5.2).
+    if (bits_in_acc > 0) {
+        if (bits_in_acc > 7) {
+            // More than 7 bits remaining means incomplete/corrupted data
+            return 0;
+        }
         uint32_t padding_mask = (1U << bits_in_acc) - 1;
         if ((accumulator & padding_mask) != padding_mask) {
+            // Padding is not all 1s - invalid
             return 0;
         }
     }
