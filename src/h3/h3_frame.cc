@@ -618,60 +618,6 @@ static size_t HuffmanDecode(const uint8_t* input, size_t input_len,
     return output->size();
 }
 
-/**
- * @brief URL decode (percent decode) a string
- * 
- * Decodes percent-encoded characters (e.g., %E7%8E%B0 -> 现)
- * 
- * @param input Input string (may contain %XX encoded bytes)
- * @param output Output decoded string
- * @return true on success, false on invalid encoding
- */
-bool UrlDecode(const std::string& input, std::string* output) {
-    output->clear();
-    output->reserve(input.size());  // Usually same or smaller
-    
-    for (size_t i = 0; i < input.size(); ++i) {
-        if (input[i] == '%' && i + 2 < input.size()) {
-            // Try to decode %XX
-            char hex1 = input[i + 1];
-            char hex2 = input[i + 2];
-            
-            if ((hex1 >= '0' && hex1 <= '9') || (hex1 >= 'A' && hex1 <= 'F') || (hex1 >= 'a' && hex1 <= 'f')) {
-                if ((hex2 >= '0' && hex2 <= '9') || (hex2 >= 'A' && hex2 <= 'F') || (hex2 >= 'a' && hex2 <= 'f')) {
-                    // Valid hex digits
-                    uint8_t byte = 0;
-                    if (hex1 >= '0' && hex1 <= '9') {
-                        byte = (hex1 - '0') << 4;
-                    } else if (hex1 >= 'A' && hex1 <= 'F') {
-                        byte = (hex1 - 'A' + 10) << 4;
-                    } else {
-                        byte = (hex1 - 'a' + 10) << 4;
-                    }
-                    
-                    if (hex2 >= '0' && hex2 <= '9') {
-                        byte |= (hex2 - '0');
-                    } else if (hex2 >= 'A' && hex2 <= 'F') {
-                        byte |= (hex2 - 'A' + 10);
-                    } else {
-                        byte |= (hex2 - 'a' + 10);
-                    }
-                    
-                    output->push_back(static_cast<char>(byte));
-                    i += 2;  // Skip the two hex digits
-                    continue;
-                }
-            }
-            // Invalid % encoding, keep as-is
-            output->push_back(input[i]);
-        } else {
-            output->push_back(input[i]);
-        }
-    }
-    
-    return true;
-}
-
 size_t QpackDecodeInteger(const uint8_t* data, size_t len,
                           uint8_t prefix_bits, uint64_t* value) {
     if (len == 0) return 0;

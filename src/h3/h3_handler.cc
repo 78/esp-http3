@@ -583,10 +583,8 @@ void H3Handler::HandleRequestStream(uint64_t stream_id,
                             stream->response.status = std::atoi(h.value.c_str());
                             ESP_LOGD(TAG, "    Status: %d", stream->response.status);
                         } else if (h.name[0] != ':') {
-                            // URL decode header value
-                            std::string decoded_value;
-                            UrlDecode(h.value, &decoded_value);
-                            stream->response.headers.push_back({h.name, decoded_value});
+                            // Pass header value as-is, let application layer handle decoding if needed
+                            stream->response.headers.push_back({h.name, h.value});
                         }
                     }
                     
