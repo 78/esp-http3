@@ -1108,14 +1108,15 @@ void Http3Client::OnStreamWritable(int stream_id) {
 void Http3Client::OnStreamReset(int stream_id, uint64_t error_code) {
     ESP_LOGW(TAG, "Stream %d reset by peer, error=%llu", stream_id, (unsigned long long)error_code);
     
-    // Notify the Http3Stream that writes are blocked (STOP_SENDING received)
-    // This only affects writes - reads can still receive server response
+    // RESET_STREAM terminates the entire stream - both reads and writes should fail
+    // This is different from STOP_SENDING which only affects writes
     Http3Stream* stream = GetStream(stream_id);
     if (stream) {
         char error_msg[64];
         snprintf(error_msg, sizeof(error_msg), "Stream reset by peer (error=%llu)", 
                  (unsigned long long)error_code);
-        stream->OnWriteReset(error_msg);
+        // Call OnError to terminate both reads and writes
+        stream->OnError(error_msg);
     }
     
     // Wake event loop to process
