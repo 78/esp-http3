@@ -201,6 +201,29 @@ public:
         last_ack_eliciting_time_us_ = 0;
         pto_count_ = 0;
     }
+    
+    /**
+     * @brief Check if PTO timer is currently armed
+     * 
+     * Returns true if there is a pending PTO timeout.
+     */
+    bool IsPtoArmed() const {
+        return last_ack_eliciting_time_us_ != 0;
+    }
+    
+    /**
+     * @brief Force-arm PTO timer at the given time
+     * 
+     * RFC 9002 Section 6.2.3 / Appendix A.8: During handshake, the client
+     * MUST keep PTO armed even when no ack-eliciting packets are in flight,
+     * to keep the handshake progressing.
+     */
+    void ArmPtoAt(uint64_t time_us) {
+        if (last_ack_eliciting_time_us_ == 0) {
+            last_ack_eliciting_time_us_ = time_us;
+            pto_count_ = 0;
+        }
+    }
 
 private:
     RttEstimator rtt_;

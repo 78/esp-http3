@@ -137,6 +137,7 @@ private:
     bool SendInitialPacket(bool is_retransmit = false);
     size_t ProcessInitialPacket(uint8_t* data, size_t len);    // Returns consumed bytes
     size_t ProcessHandshakePacket(uint8_t* data, size_t len);  // Returns consumed bytes
+    void ProcessBufferedHandshakePackets();  // Process packets buffered before keys were available
     bool Process1RttPacket(uint8_t* data, size_t len);
     
     // TLS message processing
@@ -336,6 +337,13 @@ private:
     
     // Retry token
     std::vector<uint8_t> retry_token_;
+    
+    // Buffered Handshake packets (RFC 9000 Section 17.2.2)
+    // When Handshake packets arrive before we have Handshake keys (e.g., due to
+    // UDP reordering where server's Handshake packets arrive before the Initial
+    // containing ServerHello), we buffer them here and process after key derivation.
+    static constexpr size_t kMaxBufferedHandshakePackets = 8;
+    std::vector<std::vector<uint8_t>> buffered_handshake_packets_;
     
     // Flags
     bool handshake_complete_ = false;
@@ -697,44 +705,44 @@ void QuicConnection::Impl::ProcessReceivedData(uint8_t* data, size_t len) {
         if (quic::IsLongHeader(pkt_data[0])) {
             quic::PacketType type = quic::GetLongHeaderType(pkt_data[0]);
         
-        switch (type) {
-            case quic::PacketType::kInitial:
-                    consumed = ProcessInitialPacket(pkt_data, pkt_len);
-                break;
-            case quic::PacketType::kHandshake:
-                    consumed = ProcessHandshakePacket(pkt_data, pkt_len);
-                break;
-            case quic::PacketType::kRetry:
-                    // Handle Retry (no coalescing for Retry)
-                {
-                    ESP_LOGI(TAG, "Received Retry packet");
-                    quic::PacketInfo info;
-                    quic::ConnectionId new_scid;
-                    std::vector<uint8_t> token;
-                        if (quic::ParseRetryPacket(pkt_data, pkt_len,
-                                                initial_dcid_, &info,
-                                                &new_scid, &token)) {
-                        // Update DCID and retry token
-                        dcid_ = new_scid;
-                        retry_token_ = std::move(token);
-                        
-                        // Re-derive initial secrets with new DCID using CryptoManager
-                        crypto_.DeriveInitialSecrets(dcid_.Data(), dcid_.Length());
-                        
-                        // Resend Initial
-                        initial_tracker_.Reset();
-                        crypto_.ResetTranscript();
-                        SendInitialPacket();
+            switch (type) {
+                case quic::PacketType::kInitial:
+                        consumed = ProcessInitialPacket(pkt_data, pkt_len);
+                    break;
+                case quic::PacketType::kHandshake:
+                        consumed = ProcessHandshakePacket(pkt_data, pkt_len);
+                    break;
+                case quic::PacketType::kRetry:
+                        // Handle Retry (no coalescing for Retry)
+                    {
+                        ESP_LOGI(TAG, "Received Retry packet");
+                        quic::PacketInfo info;
+                        quic::ConnectionId new_scid;
+                        std::vector<uint8_t> token;
+                            if (quic::ParseRetryPacket(pkt_data, pkt_len,
+                                                    initial_dcid_, &info,
+                                                    &new_scid, &token)) {
+                            // Update DCID and retry token
+                            dcid_ = new_scid;
+                            retry_token_ = std::move(token);
+                            
+                            // Re-derive initial secrets with new DCID using CryptoManager
+                            crypto_.DeriveInitialSecrets(dcid_.Data(), dcid_.Length());
+                            
+                            // Resend Initial
+                            initial_tracker_.Reset();
+                            crypto_.ResetTranscript();
+                            SendInitialPacket();
+                        }
                     }
-                }
-                    consumed = pkt_len;  // Retry packet consumes the rest
-                break;
-            default:
-                ESP_LOGW(TAG, "Unknown long header type: %d", static_cast<int>(type));
-                    consumed = pkt_len;  // Skip rest on error
-                break;
-        }
-    } else {
+                        consumed = pkt_len;  // Retry packet consumes the rest
+                    break;
+                default:
+                    ESP_LOGW(TAG, "Unknown long header type: %d", static_cast<int>(type));
+                        consumed = pkt_len;  // Skip rest on error
+                    break;
+            }
+        } else {
             // Short header (1-RTT) - typically no coalescing
             Process1RttPacket(pkt_data, pkt_len);
             consumed = pkt_len;
@@ -752,6 +760,10 @@ void QuicConnection::Impl::ProcessReceivedData(uint8_t* data, size_t len) {
             ESP_LOGD(TAG, "Processing coalesced packet at offset %zu", offset);
         }
     }
+    
+    // After processing the current datagram, check if we now have Handshake keys
+    // and can process previously buffered Handshake packets (UDP reordering case)
+    ProcessBufferedHandshakePackets();
 }
 
 size_t QuicConnection::Impl::ProcessInitialPacket(uint8_t* data, size_t len) {
@@ -836,7 +848,29 @@ size_t QuicConnection::Impl::ProcessInitialPacket(uint8_t* data, size_t len) {
 
 size_t QuicConnection::Impl::ProcessHandshakePacket(uint8_t* data, size_t len) {
     if (!crypto_.HasHandshakeKeys()) {
-        return 0;  // Haven't derived handshake keys yet
+        // No Handshake keys yet - buffer this packet for later processing
+        // (RFC 9000 Section 17.2.2: client MAY buffer packets that cannot be
+        // decrypted yet, e.g., due to UDP reordering)
+        quic::PacketInfo hdr_info;
+        if (quic::ParsePacketHeader(data, len, 0, &hdr_info) && hdr_info.is_long_header) {
+            size_t hdr_len = hdr_info.header_length;
+            quic::BufferReader reader(data + hdr_len, len - hdr_len);
+            uint64_t pkt_length;
+            if (reader.ReadVarint(&pkt_length)) {
+                size_t length_field_size = (len - hdr_len) - reader.Remaining();
+                size_t packet_size = hdr_len + length_field_size + pkt_length;
+                if (packet_size <= len &&
+                    buffered_handshake_packets_.size() < kMaxBufferedHandshakePackets) {
+                    buffered_handshake_packets_.emplace_back(data, data + packet_size);
+                    if (config_.enable_debug) {
+                        ESP_LOGI(TAG, "Buffered Handshake packet (%zu bytes, %zu total buffered)",
+                                 packet_size, buffered_handshake_packets_.size());
+                    }
+                    return packet_size;  // Consumed, will process after key derivation
+                }
+            }
+        }
+        return 0;  // Can't parse header, stop processing
     }
     
     quic::PacketInfo info;
@@ -880,6 +914,31 @@ size_t QuicConnection::Impl::ProcessHandshakePacket(uint8_t* data, size_t len) {
     ProcessFrames(payload_buf_, payload_len, quic::PacketType::kHandshake);
     
     return info.packet_size;  // Return consumed bytes for coalesced packet handling
+}
+
+void QuicConnection::Impl::ProcessBufferedHandshakePackets() {
+    if (buffered_handshake_packets_.empty() || !crypto_.HasHandshakeKeys()) {
+        return;
+    }
+    
+    if (config_.enable_debug) {
+        ESP_LOGI(TAG, "Processing %zu buffered Handshake packet(s)",
+                 buffered_handshake_packets_.size());
+    }
+    
+    // Move buffer to local to avoid issues if processing adds new packets
+    auto packets = std::move(buffered_handshake_packets_);
+    buffered_handshake_packets_.clear();
+    
+    for (auto& pkt : packets) {
+        size_t consumed = ProcessHandshakePacket(pkt.data(), pkt.size());
+        if (consumed == 0) {
+            if (config_.enable_debug) {
+                ESP_LOGW(TAG, "Failed to process buffered Handshake packet (%zu bytes)",
+                         pkt.size());
+            }
+        }
+    }
 }
 
 bool QuicConnection::Impl::Process1RttPacket(uint8_t* data, size_t len) {
@@ -2297,6 +2356,14 @@ uint32_t QuicConnection::Impl::OnTimerTick(uint32_t elapsed_ms) {
         if (remaining_ms < next_timer_ms) {
             next_timer_ms = remaining_ms;
         }
+        
+        // RFC 9002 Section 6.2.3 / Appendix A.8: During handshake, the client
+        // MUST keep PTO armed even when no ack-eliciting packets are in flight.
+        // This ensures the handshake keeps progressing (e.g., when waiting for
+        // server's remaining Handshake CRYPTO data after a packet loss).
+        if (crypto_.HasHandshakeKeys() && !loss_detector_.IsPtoArmed()) {
+            loss_detector_.ArmPtoAt(current_time_us_);
+        }
     }
     
     // Check PTO - all PTO handling is done via on_pto_ callback (HandlePto)
@@ -2662,11 +2729,51 @@ void QuicConnection::Impl::RetransmitLostPackets(const std::vector<SentPacketInf
 void QuicConnection::Impl::HandlePto() {
     // Dispatch PTO handling based on connection state
     if (state_ == ConnectionState::kHandshakeInProgress) {
-        // Handshake in progress - retransmit Initial packet
-        if (config_.enable_debug) {
-            ESP_LOGI(TAG, "PTO fired, retransmitting Initial");
+        if (crypto_.HasHandshakeKeys()) {
+            // Initial exchange is complete (we have Handshake keys), but Client
+            // Finished hasn't been sent yet - waiting for server's remaining
+            // Handshake CRYPTO data (likely a lost Handshake packet).
+            // Send a PING in the Handshake space to:
+            // 1. Keep PTO alive so we keep probing
+            // 2. Elicit ACK from server, helping its loss detection retransmit
+            if (config_.enable_debug) {
+                ESP_LOGI(TAG, "PTO fired, sending Handshake PING (waiting for server CRYPTO)");
+            }
+            
+            uint8_t frames[64];
+            quic::BufferWriter writer(frames, sizeof(frames));
+            
+            // Piggyback Handshake ACK if pending
+            bool has_ack = handshake_ack_mgr_.HasPendingAck();
+            if (has_ack) {
+                handshake_ack_mgr_.BuildAckFrame(&writer, current_time_us_);
+            }
+            
+            // Add PING frame (0x01)
+            writer.WriteUint8(0x01);
+            
+            uint64_t pn = handshake_tracker_.AllocatePacketNumber();
+            size_t packet_len = quic::BuildHandshakePacket(
+                dcid_, scid_, pn,
+                frames, writer.Offset(),
+                crypto_.GetClientHandshakeSecrets(),
+                packet_buf_, sizeof(packet_buf_));
+            
+            if (packet_len > 0) {
+                handshake_tracker_.OnPacketSent(pn, current_time_us_, packet_len, true);
+                loss_detector_.OnPacketSent(pn, current_time_us_, packet_len, true);
+                if (has_ack) {
+                    handshake_ack_mgr_.OnAckSent();
+                }
+                SendPacket(packet_buf_, packet_len);
+            }
+        } else {
+            // Still in Initial phase - retransmit ClientHello
+            if (config_.enable_debug) {
+                ESP_LOGI(TAG, "PTO fired, retransmitting Initial");
+            }
+            SendInitialPacket(true);  // Mark as retransmit to avoid updating transcript hash
         }
-        SendInitialPacket(true);  // Mark as retransmit to avoid updating transcript hash
     } else if (state_ == ConnectionState::kConnected) {
         if (!handshake_complete_) {
             // Client Finished sent but HANDSHAKE_DONE not received yet

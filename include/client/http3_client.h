@@ -340,13 +340,13 @@ public:
     // ==================== Stream API ====================
     
     /**
-     * Open an HTTP request stream (blocking)
+     * Open an HTTP request stream (non-blocking)
      * 
-     * Blocks until response headers are received or timeout.
-     * For streaming uploads, set request.streaming_upload = true.
+     * Opens a stream and sends the request. Returns immediately without
+     * waiting for response headers. Use GetStatus()/Read()/Write() on
+     * the returned stream with their own timeout parameters.
      * 
      * @param request Request configuration
-     * @param timeout_ms Timeout for receiving headers (0 = use config default)
      * @return Stream object, or nullptr on failure
      * 
      * Example (simple GET):
@@ -372,8 +372,7 @@ public:
      *       // Read response...
      *   }
      */
-    std::unique_ptr<Http3Stream> Open(const Http3Request& request, 
-                                       uint32_t timeout_ms = 0);
+    std::unique_ptr<Http3Stream> Open(const Http3Request& request);
     
     // ==================== Convenience Methods ====================
     

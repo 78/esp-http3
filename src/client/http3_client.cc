@@ -751,13 +751,7 @@ void Http3Client::Disconnect() {
 
 // ==================== Stream API ====================
 
-std::unique_ptr<Http3Stream> Http3Client::Open(const Http3Request& request, 
-                                                  uint32_t timeout_ms) {
-    // Use default timeout if 0
-    if (timeout_ms == 0) {
-        timeout_ms = config_.request_timeout_ms;
-    }
-    
+std::unique_ptr<Http3Stream> Http3Client::Open(const Http3Request& request) {
     // Ensure connected
     if (!EnsureConnected()) {
         ESP_LOGE(TAG, "Failed to connect");
@@ -837,13 +831,13 @@ bool Http3Client::Get(const std::string& path, Http3Response& response, uint32_t
     request.method = "GET";
     request.path = path;
     
-    auto stream = Open(request, timeout_ms);
+    auto stream = Open(request);
     if (!stream) {
         response.error = "Failed to open stream";
         return false;
     }
     
-    response.status = stream->GetStatus();
+    response.status = stream->GetStatus(timeout_ms);
     response.headers = stream->GetHeaders();
     
     // Read entire response body
@@ -881,13 +875,13 @@ bool Http3Client::Post(const std::string& path,
     request.body = body;
     request.body_size = body_size;
     
-    auto stream = Open(request, timeout_ms);
+    auto stream = Open(request);
     if (!stream) {
         response.error = "Failed to open stream";
         return false;
     }
     
-    response.status = stream->GetStatus();
+    response.status = stream->GetStatus(timeout_ms);
     response.headers = stream->GetHeaders();
     
     // Read entire response body
