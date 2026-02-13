@@ -1479,10 +1479,20 @@ bool QuicConnection::Impl::ProcessEncryptedExtensions(const uint8_t* data,
             effective_idle_timeout_ms_ = config_.idle_timeout_ms;
         }
         
-        if (config_.enable_debug) {
-            ESP_LOGI(TAG, "Effective idle timeout: %lu ms (local=%lu, peer=%lu)",
-                     effective_idle_timeout_ms_, config_.idle_timeout_ms, peer_idle_ms);
+        // Client should timeout before server to ensure graceful connection closure.
+        // Apply a margin (10% of timeout, capped at 3 seconds) to ensure client times out first.
+        if (effective_idle_timeout_ms_ > 0) {
+            static constexpr uint32_t kMaxMarginMs = 3000;  // Cap margin at 3 seconds
+            uint32_t margin_ms = std::min(effective_idle_timeout_ms_ / 10, kMaxMarginMs);
+            // Ensure we don't reduce timeout below a reasonable minimum (e.g., 1 second)
+            if (effective_idle_timeout_ms_ > margin_ms + 1000) {
+                effective_idle_timeout_ms_ -= margin_ms;
+            }
         }
+        
+        // Always log effective idle timeout (important for debugging connection issues)
+        ESP_LOGI(TAG, "Effective idle timeout: %lu ms (local=%lu, peer=%lu, margin applied)",
+                 effective_idle_timeout_ms_, config_.idle_timeout_ms, peer_idle_ms);
         
         // Update DATAGRAM support (RFC 9221)
         if (peer_params_.max_datagram_frame_size > 0) {
@@ -1998,6 +2008,12 @@ bool QuicConnection::Impl::SendPacket(const uint8_t* data, size_t len) {
     if (result > 0) {
         packets_sent_++;
         bytes_sent_ += len;
+        // RFC 9000 Section 10.1: Reset idle timer when sending ack-eliciting packets.
+        // We reset on any successful send as a conservative approach - this won't cause
+        // premature timeout, and most packets after handshake are ack-eliciting anyway.
+        if (handshake_complete_) {
+            last_activity_time_us_ = quic::GetCurrentTimeUs();
+        }
         return true;
     }
     return false;
