@@ -356,6 +356,14 @@ void H3Handler::OnStreamData(uint64_t stream_id, uint64_t offset,
                            all_data_received);
     }
     
+    // HandleRequestStream's on_stream_data_ callback may trigger
+    // CleanupStream -> CloseStream, which erases the stream from streams_.
+    // Re-lookup to avoid use-after-free.
+    stream = GetStream(stream_id);
+    if (!stream) {
+        return;
+    }
+    
     // Update stream state if FIN received and all data processed
     if (stream->fin_offset != UINT64_MAX && 
         stream->contiguous_end >= stream->fin_offset) {
