@@ -253,6 +253,7 @@ struct Http3ClientConfig {
     
     // Buffer sizes
     size_t receive_buffer_size = 64 * 1024;  // Per-stream receive buffer
+    uint32_t max_udp_payload_size = 1200;    // QUIC max_udp_payload_size transport parameter
     
     // Keypair caching for faster reconnection
     // When enabled, the X25519 keypair is cached and reused across connections.

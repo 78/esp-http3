@@ -295,9 +295,13 @@ void H3Handler::OnStreamData(uint64_t stream_id, uint64_t offset,
         
     } else if (offset > stream->contiguous_end) {
         // Out of order - store for later
-        ESP_LOGD(TAG, "  Buffering out-of-order data at offset %llu (expecting %llu)",
-                 (unsigned long long)offset, 
-                 (unsigned long long)stream->contiguous_end);
+        ESP_LOGD(TAG, "Stream %llu gap: expecting offset=%llu, got offset=%llu, len=%zu, gap=%llu, pending=%zu",
+                 (unsigned long long)stream_id,
+                 (unsigned long long)stream->contiguous_end,
+                 (unsigned long long)offset,
+                 len,
+                 (unsigned long long)(offset - stream->contiguous_end),
+                 stream->pending_chunks.size());
         
         // Check for duplicates before adding
         bool is_dup = false;

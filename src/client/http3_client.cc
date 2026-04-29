@@ -580,6 +580,7 @@ bool Http3Client::EnsureConnected(uint32_t timeout_ms) {
     }
     quic_config.max_stream_data = static_cast<uint32_t>(effective_buffer_size);
     quic_config.max_data = static_cast<uint32_t>(effective_buffer_size * 4);  // Allow 4 concurrent streams
+    quic_config.max_udp_payload_size = config_.max_udp_payload_size;
     
     // Pass cached keypair if available (speeds up reconnection by ~100ms)
     if (config_.cache_keypair && has_cached_keypair_) {

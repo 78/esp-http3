@@ -80,10 +80,18 @@ public:
         flow_controller_.OnStreamBytesConsumed(sid, bytes);
         
         // Check if we should send flow control updates (backpressure released)
-        if (flow_controller_.ShouldSendMaxStreamData(sid)) {
+        bool send_stream_update = flow_controller_.ShouldSendMaxStreamData(sid);
+        bool send_connection_update = flow_controller_.ShouldSendMaxData();
+        if (config_.enable_debug && (send_stream_update || send_connection_update)) {
+            ESP_LOGI(TAG, "Flow-control update needed after app consumed stream=%llu bytes=%zu (stream=%d, conn=%d)",
+                     (unsigned long long)sid, bytes,
+                     send_stream_update ? 1 : 0,
+                     send_connection_update ? 1 : 0);
+        }
+        if (send_stream_update) {
             SendMaxStreamDataFrame(sid);
         }
-        if (flow_controller_.ShouldSendMaxData()) {
+        if (send_connection_update) {
             SendMaxDataFrame();
         }
     }
@@ -423,6 +431,7 @@ QuicConnection::Impl::Impl(SendCallback send_cb, const QuicConfig& config)
     local_params_.initial_max_streams_bidi = 100;
     local_params_.initial_max_streams_uni = 100;
     local_params_.active_connection_id_limit = 4;
+    local_params_.max_udp_payload_size = config_.max_udp_payload_size;
     
     // DATAGRAM support (RFC 9221)
     if (config_.enable_datagram) {

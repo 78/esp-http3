@@ -74,6 +74,7 @@ struct QuicConfig {
     uint32_t max_stream_data = quic::defaults::kInitialMaxStreamDataBidiRemote;       ///< Per-stream flow control limit
     uint32_t max_streams_bidi = quic::defaults::kInitialMaxStreamsBidi;          ///< Max concurrent bidirectional streams
     uint32_t max_streams_uni = quic::defaults::kInitialMaxStreamsUni;           ///< Max concurrent unidirectional streams
+    uint32_t max_udp_payload_size = 1200;    ///< Maximum UDP payload peer may send
     
     // DATAGRAM (RFC 9221)
     bool enable_datagram = false;           ///< Enable DATAGRAM frame support
