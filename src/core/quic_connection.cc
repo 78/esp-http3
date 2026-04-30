@@ -13,6 +13,7 @@
 #include "core/loss_detector.h"
 #include "core/crypto_manager.h"
 #include "core/frame_processor.h"
+#include "h3/h3_constants.h"
 #include "h3/h3_handler.h"
 #include "quic/quic_crypto.h"
 #include "quic/quic_aead.h"
@@ -30,6 +31,49 @@
 namespace esp_http3 {
 
 static const char* TAG = "QuicConnection";
+
+static const char* H3ErrorCodeToString(uint64_t error_code) {
+    using namespace h3::error;
+
+    switch (error_code) {
+        case kNoError:
+            return "H3_NO_ERROR";
+        case kGeneralProtocolError:
+            return "H3_GENERAL_PROTOCOL_ERROR";
+        case kInternalError:
+            return "H3_INTERNAL_ERROR";
+        case kStreamCreationError:
+            return "H3_STREAM_CREATION_ERROR";
+        case kClosedCriticalStream:
+            return "H3_CLOSED_CRITICAL_STREAM";
+        case kFrameUnexpected:
+            return "H3_FRAME_UNEXPECTED";
+        case kFrameError:
+            return "H3_FRAME_ERROR";
+        case kExcessiveLoad:
+            return "H3_EXCESSIVE_LOAD";
+        case kIdError:
+            return "H3_ID_ERROR";
+        case kSettingsError:
+            return "H3_SETTINGS_ERROR";
+        case kMissingSettings:
+            return "H3_MISSING_SETTINGS";
+        case kRequestRejected:
+            return "H3_REQUEST_REJECTED";
+        case kRequestCancelled:
+            return "H3_REQUEST_CANCELLED";
+        case kRequestIncomplete:
+            return "H3_REQUEST_INCOMPLETE";
+        case kMessageError:
+            return "H3_MESSAGE_ERROR";
+        case kConnectError:
+            return "H3_CONNECT_ERROR";
+        case kVersionFallback:
+            return "H3_VERSION_FALLBACK";
+        default:
+            return "UNKNOWN_H3_ERROR";
+    }
+}
 
 //=============================================================================
 // QuicConnection::Impl
@@ -1062,8 +1106,9 @@ void QuicConnection::Impl::ProcessFrames(const uint8_t* data, size_t len,
                              pkt_type_str, (unsigned long long)stream_id, 
                              (unsigned long long)error_code, (unsigned long long)final_size);
                 }
-                ESP_LOGW(TAG, "Server reset stream %llu with error code %llu (H3_FRAME_ERROR)", 
-                         (unsigned long long)stream_id, (unsigned long long)error_code);
+                ESP_LOGW(TAG, "Server reset stream %llu with error code %llu (%s)", 
+                         (unsigned long long)stream_id, (unsigned long long)error_code,
+                         H3ErrorCodeToString(error_code));
                 // Stream was reset by server - this is a fatal error for the stream
                 reset_streams_.insert(stream_id);
                 
@@ -1081,8 +1126,9 @@ void QuicConnection::Impl::ProcessFrames(const uint8_t* data, size_t len,
                              pkt_type_str, (unsigned long long)stream_id, 
                              (unsigned long long)error_code);
                 }
-                ESP_LOGW(TAG, "Server requested stop sending on stream %llu (error=%llu)", 
-                         (unsigned long long)stream_id, (unsigned long long)error_code);
+                ESP_LOGW(TAG, "Server requested stop sending on stream %llu (error=%llu, %s)", 
+                         (unsigned long long)stream_id, (unsigned long long)error_code,
+                         H3ErrorCodeToString(error_code));
                 // Server wants us to stop sending - we should abort the upload
                 // Note: This does NOT affect receiving data from server on this stream
                 remote_stop_sending_streams_.insert(stream_id);
