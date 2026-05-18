@@ -6,8 +6,7 @@
 #include "quic/quic_aead.h"
 #include "quic/quic_constants.h"
 
-#include <mbedtls/gcm.h>
-#include <mbedtls/aes.h>
+#include <psa/crypto.h>
 
 #include <cstring>
 #include <esp_log.h>
@@ -16,6 +15,27 @@ namespace esp_http3 {
 namespace quic {
 
 static const char* TAG = "QUIC_AEAD";
+
+static psa_key_id_t ImportAesKey(const uint8_t* key, psa_key_usage_t usage,
+                                 psa_algorithm_t algorithm) {
+    psa_crypto_init();
+
+    psa_key_attributes_t attributes = PSA_KEY_ATTRIBUTES_INIT;
+    psa_set_key_type(&attributes, PSA_KEY_TYPE_AES);
+    psa_set_key_bits(&attributes, 128);
+    psa_set_key_algorithm(&attributes, algorithm);
+    psa_set_key_usage_flags(&attributes, usage);
+
+    psa_key_id_t key_id = 0;
+    psa_status_t status = psa_import_key(&attributes, key, 16, &key_id);
+    psa_reset_key_attributes(&attributes);
+    if (status != PSA_SUCCESS) {
+        ESP_LOGW(TAG, "ImportAesKey failed: %ld", static_cast<long>(status));
+        return 0;
+    }
+
+    return key_id;
+}
 
 //=============================================================================
 // Nonce Generation
@@ -40,13 +60,8 @@ size_t AeadEncrypt(const uint8_t* key, const uint8_t* iv,
                    const uint8_t* aad, size_t aad_len,
                    const uint8_t* plaintext, size_t plaintext_len,
                    uint8_t* ciphertext_out) {
-    mbedtls_gcm_context ctx;
-    mbedtls_gcm_init(&ctx);
-    
-    int ret = mbedtls_gcm_setkey(&ctx, MBEDTLS_CIPHER_ID_AES, key, 128);
-    if (ret != 0) {
-        ESP_LOGW(TAG, "AeadEncrypt: mbedtls_gcm_setkey failed: %d", ret);
-        mbedtls_gcm_free(&ctx);
+    psa_key_id_t key_id = ImportAesKey(key, PSA_KEY_USAGE_ENCRYPT, PSA_ALG_GCM);
+    if (key_id == 0) {
         return 0;
     }
     
@@ -54,28 +69,22 @@ size_t AeadEncrypt(const uint8_t* key, const uint8_t* iv,
     uint8_t nonce[12];
     GenerateNonce(iv, packet_number, nonce);
     
-    // Encrypt and generate tag
-    uint8_t tag[16];
-    ret = mbedtls_gcm_crypt_and_tag(&ctx,
-                                     MBEDTLS_GCM_ENCRYPT,
-                                     plaintext_len,
-                                     nonce, 12,
-                                     aad, aad_len,
-                                     plaintext,
-                                     ciphertext_out,
-                                     16, tag);
-    
-    mbedtls_gcm_free(&ctx);
-    
-    if (ret != 0) {
-        ESP_LOGW(TAG, "AeadEncrypt: mbedtls_gcm_crypt_and_tag failed: %d", ret);
+    size_t ciphertext_len = 0;
+    psa_status_t status = psa_aead_encrypt(key_id,
+                                           PSA_ALG_GCM,
+                                           nonce, sizeof(nonce),
+                                           aad, aad_len,
+                                           plaintext, plaintext_len,
+                                           ciphertext_out, plaintext_len + 16,
+                                           &ciphertext_len);
+    psa_destroy_key(key_id);
+
+    if (status != PSA_SUCCESS) {
+        ESP_LOGW(TAG, "AeadEncrypt: psa_aead_encrypt failed: %ld", static_cast<long>(status));
         return 0;
     }
     
-    // Append tag to ciphertext
-    std::memcpy(ciphertext_out + plaintext_len, tag, 16);
-    
-    return plaintext_len + 16;
+    return ciphertext_len;
 }
 
 size_t AeadDecrypt(const uint8_t* key, const uint8_t* iv,
@@ -88,13 +97,8 @@ size_t AeadDecrypt(const uint8_t* key, const uint8_t* iv,
         return 0;  // Too short, no room for tag
     }
     
-    mbedtls_gcm_context ctx;
-    mbedtls_gcm_init(&ctx);
-    
-    int ret = mbedtls_gcm_setkey(&ctx, MBEDTLS_CIPHER_ID_AES, key, 128);
-    if (ret != 0) {
-        ESP_LOGW(TAG, "AeadDecrypt: mbedtls_gcm_setkey failed: %d", ret);
-        mbedtls_gcm_free(&ctx);
+    psa_key_id_t key_id = ImportAesKey(key, PSA_KEY_USAGE_DECRYPT, PSA_ALG_GCM);
+    if (key_id == 0) {
         return 0;
     }
     
@@ -102,22 +106,19 @@ size_t AeadDecrypt(const uint8_t* key, const uint8_t* iv,
     uint8_t nonce[12];
     GenerateNonce(iv, packet_number, nonce);
     
-    size_t plaintext_len = ciphertext_len - 16;
-    const uint8_t* tag = ciphertext + plaintext_len;
-    
-    // Decrypt and verify tag
-    ret = mbedtls_gcm_auth_decrypt(&ctx,
-                                    plaintext_len,
-                                    nonce, 12,
-                                    aad, aad_len,
-                                    tag, 16,
-                                    ciphertext,
-                                    plaintext_out);
-    
-    mbedtls_gcm_free(&ctx);
-    
-    if (ret != 0) {
-        ESP_LOGW(TAG, "AeadDecrypt: mbedtls_gcm_auth_decrypt failed: %d (auth tag mismatch?)", ret);
+    size_t plaintext_len = 0;
+    psa_status_t status = psa_aead_decrypt(key_id,
+                                           PSA_ALG_GCM,
+                                           nonce, sizeof(nonce),
+                                           aad, aad_len,
+                                           ciphertext, ciphertext_len,
+                                           plaintext_out, ciphertext_len - 16,
+                                           &plaintext_len);
+    psa_destroy_key(key_id);
+
+    if (status != PSA_SUCCESS) {
+        ESP_LOGW(TAG, "AeadDecrypt: psa_aead_decrypt failed: %ld (auth tag mismatch?)",
+                 static_cast<long>(status));
         return 0;  // Decryption or auth failed
     }
     
@@ -130,21 +131,22 @@ size_t AeadDecrypt(const uint8_t* key, const uint8_t* iv,
 
 // AES-ECB encrypt a single block for header protection
 static bool AesEcbEncrypt(const uint8_t* key, const uint8_t* input, uint8_t* output) {
-    mbedtls_aes_context ctx;
-    mbedtls_aes_init(&ctx);
-    
-    int ret = mbedtls_aes_setkey_enc(&ctx, key, 128);
-    if (ret != 0) {
-        ESP_LOGW(TAG, "AesEcbEncrypt: mbedtls_aes_setkey_enc failed: %d", ret);
-        mbedtls_aes_free(&ctx);
+    psa_key_id_t key_id = ImportAesKey(key, PSA_KEY_USAGE_ENCRYPT, PSA_ALG_ECB_NO_PADDING);
+    if (key_id == 0) {
         return false;
     }
     
-    ret = mbedtls_aes_crypt_ecb(&ctx, MBEDTLS_AES_ENCRYPT, input, output);
-    mbedtls_aes_free(&ctx);
-    
-    if (ret != 0) {
-        ESP_LOGW(TAG, "AesEcbEncrypt: mbedtls_aes_crypt_ecb failed: %d", ret);
+    size_t output_len = 0;
+    psa_status_t status = psa_cipher_encrypt(key_id,
+                                             PSA_ALG_ECB_NO_PADDING,
+                                             input, 16,
+                                             output, 16,
+                                             &output_len);
+    psa_destroy_key(key_id);
+
+    if (status != PSA_SUCCESS || output_len != 16) {
+        ESP_LOGW(TAG, "AesEcbEncrypt: psa_cipher_encrypt failed: %ld len=%zu",
+                 static_cast<long>(status), output_len);
         return false;
     }
     return true;
@@ -247,30 +249,30 @@ bool ComputeRetryIntegrityTag(const uint8_t* odcid, size_t odcid_len,
     aad.insert(aad.end(), retry_packet, retry_packet + retry_len);
     
     // Compute tag using AES-128-GCM with empty plaintext
-    mbedtls_gcm_context ctx;
-    mbedtls_gcm_init(&ctx);
-    
-    int ret = mbedtls_gcm_setkey(&ctx, MBEDTLS_CIPHER_ID_AES, kRetryKey, 128);
-    if (ret != 0) {
-        ESP_LOGW(TAG, "ComputeRetryIntegrityTag: mbedtls_gcm_setkey failed: %d", ret);
-        mbedtls_gcm_free(&ctx);
+    psa_key_id_t key_id = ImportAesKey(kRetryKey, PSA_KEY_USAGE_ENCRYPT, PSA_ALG_GCM);
+    if (key_id == 0) {
         return false;
     }
-    
-    ret = mbedtls_gcm_crypt_and_tag(&ctx,
-                                     MBEDTLS_GCM_ENCRYPT,
-                                     0,  // No plaintext
-                                     kRetryNonce, 12,
-                                     aad.data(), aad.size(),
-                                     nullptr,  // No input
-                                     nullptr,  // No output
-                                     16, tag_out);
-    
-    mbedtls_gcm_free(&ctx);
-    if (ret != 0) {
-        ESP_LOGW(TAG, "ComputeRetryIntegrityTag: mbedtls_gcm_crypt_and_tag failed: %d", ret);
+
+    uint8_t ciphertext[16] = {};
+    uint8_t empty_plaintext = 0;
+    size_t ciphertext_len = 0;
+    psa_status_t status = psa_aead_encrypt(key_id,
+                                           PSA_ALG_GCM,
+                                           kRetryNonce, sizeof(kRetryNonce),
+                                           aad.data(), aad.size(),
+                                           &empty_plaintext, 0,
+                                           ciphertext, sizeof(ciphertext),
+                                           &ciphertext_len);
+    psa_destroy_key(key_id);
+
+    if (status != PSA_SUCCESS || ciphertext_len != 16) {
+        ESP_LOGW(TAG, "ComputeRetryIntegrityTag: psa_aead_encrypt failed: %ld len=%zu",
+                 static_cast<long>(status), ciphertext_len);
         return false;
     }
+
+    std::memcpy(tag_out, ciphertext, sizeof(ciphertext));
     return true;
 }
 
@@ -304,4 +306,3 @@ bool VerifyRetryIntegrityTag(const uint8_t* odcid, size_t odcid_len,
 
 } // namespace quic
 } // namespace esp_http3
-

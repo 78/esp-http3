@@ -6,21 +6,28 @@
 #include "quic/quic_crypto.h"
 #include "quic/quic_constants.h"
 
-#include <mbedtls/hkdf.h>
-#include <mbedtls/sha256.h>
-#include <mbedtls/ecdh.h>
-#include <mbedtls/ecp.h>
-#include <mbedtls/entropy.h>
-#include <mbedtls/ctr_drbg.h>
-#include <mbedtls/platform_util.h>
+#define MBEDTLS_DECLARE_PRIVATE_IDENTIFIERS
 
+#include <mbedtls/md.h>
+#include <mbedtls/platform_util.h>
+#include <mbedtls/private/ecdh.h>
+#include <mbedtls/private/ecp.h>
+#include <mbedtls/private/sha256.h>
+
+#include <algorithm>
 #include <cstring>
 #include <esp_log.h>
+#include <esp_random.h>
 
 namespace esp_http3 {
 namespace quic {
 
 static const char* TAG = "QUIC_CRYPTO";
+
+static int EspRandomCallback(void*, unsigned char* output, size_t output_len) {
+    esp_fill_random(output, output_len);
+    return 0;
+}
 
 //=============================================================================
 // SHA-256 Context Implementation
@@ -103,18 +110,64 @@ bool HmacSha256(const uint8_t* key, size_t key_len,
 bool HkdfExtract(const uint8_t* salt, size_t salt_len,
                  const uint8_t* ikm, size_t ikm_len,
                  uint8_t* out) {
-    // Use mbedtls HKDF-Extract
-    const mbedtls_md_info_t* md = mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
-    if (md == nullptr) {
-        ESP_LOGW(TAG, "HkdfExtract: mbedtls_md_info_from_type failed");
+    uint8_t zero_salt[32] = {};
+    if (salt == nullptr || salt_len == 0) {
+        salt = zero_salt;
+        salt_len = sizeof(zero_salt);
+    }
+
+    if (!HmacSha256(salt, salt_len, ikm, ikm_len, out)) {
+        ESP_LOGW(TAG, "HkdfExtract failed");
         return false;
     }
-    
-    int ret = mbedtls_hkdf_extract(md, salt, salt_len, ikm, ikm_len, out);
-    if (ret != 0) {
-        ESP_LOGW(TAG, "HkdfExtract failed: %d", ret);
+    return true;
+}
+
+static bool HkdfExpandSha256(const uint8_t* prk, size_t prk_len,
+                             const uint8_t* info, size_t info_len,
+                             uint8_t* out, size_t out_len) {
+    if (out_len > 255 * 32) {
+        ESP_LOGW(TAG, "HkdfExpandSha256: output too long (%zu)", out_len);
         return false;
     }
+
+    uint8_t previous[32] = {};
+    uint8_t block[32] = {};
+    size_t previous_len = 0;
+    size_t produced = 0;
+    uint8_t counter = 1;
+
+    while (produced < out_len) {
+        uint8_t hmac_input[32 + 2 + 1 + 255 + 1 + 255 + 1];
+        size_t hmac_input_len = 0;
+
+        if (previous_len > 0) {
+            std::memcpy(hmac_input + hmac_input_len, previous, previous_len);
+            hmac_input_len += previous_len;
+        }
+        if (info_len > 0) {
+            std::memcpy(hmac_input + hmac_input_len, info, info_len);
+            hmac_input_len += info_len;
+        }
+        hmac_input[hmac_input_len++] = counter;
+
+        if (!HmacSha256(prk, prk_len, hmac_input, hmac_input_len, block)) {
+            ESP_LOGW(TAG, "HkdfExpandSha256: HMAC block failed");
+            mbedtls_platform_zeroize(hmac_input, sizeof(hmac_input));
+            return false;
+        }
+        mbedtls_platform_zeroize(hmac_input, sizeof(hmac_input));
+
+        size_t copy_len = std::min(sizeof(block), out_len - produced);
+        std::memcpy(out + produced, block, copy_len);
+        std::memcpy(previous, block, sizeof(previous));
+        previous_len = sizeof(previous);
+        produced += copy_len;
+        counter++;
+    }
+
+    mbedtls_platform_zeroize(previous, sizeof(previous));
+    mbedtls_platform_zeroize(block, sizeof(block));
     return true;
 }
 
@@ -161,16 +214,8 @@ bool HkdfExpandLabel(const uint8_t* secret, size_t secret_len,
         info_len += context_len;
     }
     
-    // Use mbedtls HKDF-Expand
-    const mbedtls_md_info_t* md = mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
-    if (md == nullptr) {
-        ESP_LOGW(TAG, "HkdfExpandLabel: mbedtls_md_info_from_type failed");
-        return false;
-    }
-    
-    int ret = mbedtls_hkdf_expand(md, secret, secret_len, info, info_len, out, out_len);
-    if (ret != 0) {
-        ESP_LOGW(TAG, "HkdfExpandLabel failed: %d", ret);
+    if (!HkdfExpandSha256(secret, secret_len, info, info_len, out, out_len)) {
+        ESP_LOGW(TAG, "HkdfExpandLabel failed");
         return false;
     }
     return true;
@@ -610,26 +655,12 @@ bool GenerateX25519KeyPair(uint8_t* private_key_out, uint8_t* public_key_out) {
     mbedtls_ecp_group grp;
     mbedtls_mpi priv;
     mbedtls_ecp_point pub;
-    mbedtls_entropy_context entropy;
-    mbedtls_ctr_drbg_context ctr_drbg;
     
     mbedtls_ecp_group_init(&grp);
     mbedtls_mpi_init(&priv);
     mbedtls_ecp_point_init(&pub);
-    mbedtls_entropy_init(&entropy);
-    mbedtls_ctr_drbg_init(&ctr_drbg);
     
     int ret = -1;
-    
-    // Seed the random number generator
-    const char* pers = "quic_x25519_keygen";
-    ret = mbedtls_ctr_drbg_seed(&ctr_drbg, mbedtls_entropy_func, &entropy,
-                                reinterpret_cast<const unsigned char*>(pers),
-                                strlen(pers));
-    if (ret != 0) {
-        ESP_LOGW("QUIC_CRYPTO", "X25519 keygen: ctr_drbg_seed failed: %d", ret);
-        goto cleanup;
-    }
     
     // Load Curve25519 group
     ret = mbedtls_ecp_group_load(&grp, MBEDTLS_ECP_DP_CURVE25519);
@@ -640,7 +671,7 @@ bool GenerateX25519KeyPair(uint8_t* private_key_out, uint8_t* public_key_out) {
     
     // Generate key pair
     ret = mbedtls_ecdh_gen_public(&grp, &priv, &pub,
-                                   mbedtls_ctr_drbg_random, &ctr_drbg);
+                                   EspRandomCallback, nullptr);
     if (ret != 0) {
         ESP_LOGW("QUIC_CRYPTO", "X25519 keygen: gen_public failed: %d", ret);
         goto cleanup;
@@ -672,8 +703,6 @@ cleanup:
     mbedtls_ecp_group_free(&grp);
     mbedtls_mpi_free(&priv);
     mbedtls_ecp_point_free(&pub);
-    mbedtls_ctr_drbg_free(&ctr_drbg);
-    mbedtls_entropy_free(&entropy);
     
     return ret == 0;
 }
@@ -684,27 +713,13 @@ bool X25519ECDH(const uint8_t* private_key,
     mbedtls_ecp_group grp;
     mbedtls_mpi priv, shared;
     mbedtls_ecp_point peer_pub;
-    mbedtls_entropy_context entropy;
-    mbedtls_ctr_drbg_context ctr_drbg;
     
     mbedtls_ecp_group_init(&grp);
     mbedtls_mpi_init(&priv);
     mbedtls_mpi_init(&shared);
     mbedtls_ecp_point_init(&peer_pub);
-    mbedtls_entropy_init(&entropy);
-    mbedtls_ctr_drbg_init(&ctr_drbg);
     
     int ret = -1;
-    
-    // Seed the random number generator
-    const char* pers = "quic_x25519_ecdh";
-    ret = mbedtls_ctr_drbg_seed(&ctr_drbg, mbedtls_entropy_func, &entropy,
-                                reinterpret_cast<const unsigned char*>(pers),
-                                strlen(pers));
-    if (ret != 0) {
-        ESP_LOGW("QUIC_CRYPTO", "X25519 ECDH: ctr_drbg_seed failed: %d", ret);
-        goto cleanup;
-    }
     
     // Load Curve25519 group
     ret = mbedtls_ecp_group_load(&grp, MBEDTLS_ECP_DP_CURVE25519);
@@ -729,7 +744,7 @@ bool X25519ECDH(const uint8_t* private_key,
     
     // Compute shared secret
     ret = mbedtls_ecdh_compute_shared(&grp, &shared, &peer_pub, &priv,
-                                       mbedtls_ctr_drbg_random, &ctr_drbg);
+                                       EspRandomCallback, nullptr);
     if (ret != 0) {
         ESP_LOGW("QUIC_CRYPTO", "X25519 ECDH: compute_shared failed: %d", ret);
         goto cleanup;
@@ -749,12 +764,9 @@ cleanup:
     mbedtls_mpi_free(&priv);
     mbedtls_mpi_free(&shared);
     mbedtls_ecp_point_free(&peer_pub);
-    mbedtls_ctr_drbg_free(&ctr_drbg);
-    mbedtls_entropy_free(&entropy);
     
     return ret == 0;
 }
 
 } // namespace quic
 } // namespace esp_http3
-
