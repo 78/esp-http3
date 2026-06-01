@@ -15,6 +15,7 @@
 #include <mbedtls/private/sha256.h>
 
 #include <algorithm>
+#include <array>
 #include <cstring>
 #include <esp_log.h>
 #include <esp_random.h>
@@ -23,6 +24,14 @@ namespace esp_http3 {
 namespace quic {
 
 static const char* TAG = "QUIC_CRYPTO";
+
+// Bounded scratch sizes for HKDF helpers. The TLS 1.3 / QUIC labels and
+// contexts used in this codebase never exceed these sizes (longest label
+// "c hs traffic" = 12 bytes, longest context = SHA-256 hash = 32 bytes),
+// so a 96-byte stack buffer leaves comfortable headroom while saving ~900
+// bytes of stack per HKDF call compared to the spec's worst-case 255+255.
+static constexpr size_t kHkdfInfoMaxSize = 96;
+static constexpr size_t kHkdfHmacInputMaxSize = 96;
 
 static int EspRandomCallback(void*, unsigned char* output, size_t output_len) {
     esp_fill_random(output, output_len);
@@ -131,6 +140,15 @@ static bool HkdfExpandSha256(const uint8_t* prk, size_t prk_len,
         return false;
     }
 
+    // Worst case usage: T(i-1) (32B) + info + counter (1B). Reject early
+    // if a caller supplies an info longer than our scratch can hold.
+    if (info_len + 32 + 1 > kHkdfHmacInputMaxSize) {
+        ESP_LOGW(TAG, "HkdfExpandSha256: info_len=%zu exceeds scratch (%zu)",
+                 info_len, kHkdfHmacInputMaxSize);
+        return false;
+    }
+
+    std::array<uint8_t, kHkdfHmacInputMaxSize> hmac_input{};
     uint8_t previous[32] = {};
     uint8_t block[32] = {};
     size_t previous_len = 0;
@@ -138,25 +156,23 @@ static bool HkdfExpandSha256(const uint8_t* prk, size_t prk_len,
     uint8_t counter = 1;
 
     while (produced < out_len) {
-        uint8_t hmac_input[32 + 2 + 1 + 255 + 1 + 255 + 1];
         size_t hmac_input_len = 0;
 
         if (previous_len > 0) {
-            std::memcpy(hmac_input + hmac_input_len, previous, previous_len);
+            std::memcpy(hmac_input.data() + hmac_input_len, previous, previous_len);
             hmac_input_len += previous_len;
         }
         if (info_len > 0) {
-            std::memcpy(hmac_input + hmac_input_len, info, info_len);
+            std::memcpy(hmac_input.data() + hmac_input_len, info, info_len);
             hmac_input_len += info_len;
         }
         hmac_input[hmac_input_len++] = counter;
 
-        if (!HmacSha256(prk, prk_len, hmac_input, hmac_input_len, block)) {
+        if (!HmacSha256(prk, prk_len, hmac_input.data(), hmac_input_len, block)) {
             ESP_LOGW(TAG, "HkdfExpandSha256: HMAC block failed");
-            mbedtls_platform_zeroize(hmac_input, sizeof(hmac_input));
+            mbedtls_platform_zeroize(hmac_input.data(), hmac_input.size());
             return false;
         }
-        mbedtls_platform_zeroize(hmac_input, sizeof(hmac_input));
 
         size_t copy_len = std::min(sizeof(block), out_len - produced);
         std::memcpy(out + produced, block, copy_len);
@@ -166,6 +182,7 @@ static bool HkdfExpandSha256(const uint8_t* prk, size_t prk_len,
         counter++;
     }
 
+    mbedtls_platform_zeroize(hmac_input.data(), hmac_input.size());
     mbedtls_platform_zeroize(previous, sizeof(previous));
     mbedtls_platform_zeroize(block, sizeof(block));
     return true;
@@ -181,40 +198,42 @@ bool HkdfExpandLabel(const uint8_t* secret, size_t secret_len,
     //     opaque label<7..255> = "tls13 " + Label;
     //     opaque context<0..255> = Context;
     // } HkdfLabel;
-    
+
     const char* tls13_prefix = "tls13 ";
-    size_t prefix_len = 6;
-    size_t full_label_len = prefix_len + label_len;
-    
-    if (full_label_len > 255 || context_len > 255) {
-        ESP_LOGW(TAG, "HkdfExpandLabel: label or context too long (label=%zu, context=%zu)", 
-                 full_label_len, context_len);
+    const size_t prefix_len = 6;
+    const size_t full_label_len = prefix_len + label_len;
+
+    // 2 (length) + 1 (label_len) + full_label + 1 (ctx_len) + context
+    const size_t needed = 2 + 1 + full_label_len + 1 + context_len;
+    if (full_label_len > 255 || context_len > 255 ||
+        needed > kHkdfInfoMaxSize) {
+        ESP_LOGW(TAG, "HkdfExpandLabel: info too long (label=%zu, context=%zu, needed=%zu, max=%zu)",
+                 full_label_len, context_len, needed, kHkdfInfoMaxSize);
         return false;
     }
-    
-    // Build info buffer
-    uint8_t info[2 + 1 + 255 + 1 + 255];
+
+    std::array<uint8_t, kHkdfInfoMaxSize> info{};
     size_t info_len = 0;
-    
+
     // Length (2 bytes, big-endian)
     info[info_len++] = static_cast<uint8_t>((out_len >> 8) & 0xFF);
     info[info_len++] = static_cast<uint8_t>(out_len & 0xFF);
-    
+
     // Label length + label
     info[info_len++] = static_cast<uint8_t>(full_label_len);
-    std::memcpy(info + info_len, tls13_prefix, prefix_len);
+    std::memcpy(info.data() + info_len, tls13_prefix, prefix_len);
     info_len += prefix_len;
-    std::memcpy(info + info_len, label, label_len);
+    std::memcpy(info.data() + info_len, label, label_len);
     info_len += label_len;
-    
+
     // Context length + context
     info[info_len++] = static_cast<uint8_t>(context_len);
     if (context_len > 0) {
-        std::memcpy(info + info_len, context, context_len);
+        std::memcpy(info.data() + info_len, context, context_len);
         info_len += context_len;
     }
-    
-    if (!HkdfExpandSha256(secret, secret_len, info, info_len, out, out_len)) {
+
+    if (!HkdfExpandSha256(secret, secret_len, info.data(), info_len, out, out_len)) {
         ESP_LOGW(TAG, "HkdfExpandLabel failed");
         return false;
     }

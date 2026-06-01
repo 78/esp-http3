@@ -512,8 +512,11 @@ private:
     // Called when stream becomes writable
     void OnStreamWritable(int stream_id);
     
-    // Called when stream is reset by peer (STOP_SENDING or RESET_STREAM)
+    // Called when stream is reset by peer (RESET_STREAM)
     void OnStreamReset(int stream_id, uint64_t error_code);
+
+    // Called when peer sends STOP_SENDING for request body writes
+    void OnStreamStopSending(int stream_id, uint64_t error_code);
     
     // Helper to set last error message
     void SetLastError(const std::string& error);
@@ -541,4 +544,3 @@ private:
     bool has_cached_session_ticket_ = false;
     esp_http3::SessionTicketData cached_session_ticket_;
 };
-

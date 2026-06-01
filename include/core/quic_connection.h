@@ -140,9 +140,13 @@ using OnStreamWritableCallback = std::function<void(int stream_id)>;
 /// Upper layer should retry any blocked writes.
 using OnWritableCallback = std::function<void()>;
 
-/// Called when a stream is reset by peer (RESET_STREAM or STOP_SENDING received)
+/// Called when a stream is reset by peer (RESET_STREAM received)
 /// error_code is the application error code from the frame
 using OnStreamResetCallback = std::function<void(int stream_id, uint64_t error_code)>;
+
+/// Called when peer asks us to stop sending request data (STOP_SENDING received)
+/// error_code is the application error code from the frame
+using OnStreamStopSendingCallback = std::function<void(int stream_id, uint64_t error_code)>;
 
 /**
  * @brief Session ticket data for resumption
@@ -418,8 +422,11 @@ public:
     /// Set callback for receiving NewSessionTicket (for session resumption)
     void SetOnSessionTicket(OnSessionTicketCallback cb);
     
-    /// Set callback for stream reset by peer (RESET_STREAM or STOP_SENDING received)
+    /// Set callback for stream reset by peer (RESET_STREAM received)
     void SetOnStreamReset(OnStreamResetCallback cb);
+
+    /// Set callback for peer STOP_SENDING. This only affects request writes.
+    void SetOnStreamStopSending(OnStreamStopSendingCallback cb);
     
     //=========================================================================
     // Statistics
@@ -624,4 +631,3 @@ private:
 };
 
 } // namespace esp_http3
-

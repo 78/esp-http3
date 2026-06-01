@@ -249,6 +249,11 @@ bool Http3Stream::Finish() {
     if (finished_sending_) {
         return true;  // Already finished
     }
+
+    if (write_reset_) {
+        finished_sending_ = true;
+        return true;  // Peer already stopped receiving request body
+    }
     
     if (!client_ || !client_->StreamFinish(stream_id_)) {
         error_ = "Finish failed";
@@ -668,6 +673,12 @@ bool Http3Client::EnsureConnected(uint32_t timeout_ms) {
     // Set up stream reset callback - notify Http3Stream when peer resets stream
     connection_->SetOnStreamReset([this](int stream_id, uint64_t error_code) {
         OnStreamReset(stream_id, error_code);
+    });
+
+    // STOP_SENDING only means the peer will not consume more request body.
+    // Response headers/body on the same stream may still carry useful details.
+    connection_->SetOnStreamStopSending([this](int stream_id, uint64_t error_code) {
+        OnStreamStopSending(stream_id, error_code);
     });
     
     // Start background tasks
@@ -1118,6 +1129,21 @@ void Http3Client::OnStreamReset(int stream_id, uint64_t error_code) {
     WakeEventLoop();
 }
 
+void Http3Client::OnStreamStopSending(int stream_id, uint64_t error_code) {
+    ESP_LOGW(TAG, "Stream %d stopped sending by peer, error=%llu",
+             stream_id, (unsigned long long)error_code);
+    
+    Http3Stream* stream = GetStream(stream_id);
+    if (stream) {
+        char error_msg[80];
+        snprintf(error_msg, sizeof(error_msg), "Server stopped receiving request body (error=%llu)",
+                 (unsigned long long)error_code);
+        stream->OnWriteReset(error_msg);
+    }
+    
+    WakeEventLoop();
+}
+
 void Http3Client::StreamClose(int stream_id, bool force_reset) {
     // Unregister first
     UnregisterStream(stream_id);
@@ -1456,4 +1482,3 @@ void Http3Client::OnStreamData(int stream_id, const uint8_t* data, size_t length
         stream->OnData(data, length, finished);
     }
 }
-

@@ -148,6 +148,7 @@ public:
     void SetOnWritable(OnWritableCallback cb) { on_writable_ = std::move(cb); }
     void SetOnSessionTicket(OnSessionTicketCallback cb) { on_session_ticket_ = std::move(cb); }
     void SetOnStreamReset(OnStreamResetCallback cb) { on_stream_reset_ = std::move(cb); }
+    void SetOnStreamStopSending(OnStreamStopSendingCallback cb) { on_stream_stop_sending_ = std::move(cb); }
     
     // DATAGRAM callback type (same as public API)
     using OnDatagramCallback = QuicConnection::OnDatagramCallback;
@@ -299,6 +300,7 @@ private:
     OnWritableCallback on_writable_;
     OnSessionTicketCallback on_session_ticket_;
     OnStreamResetCallback on_stream_reset_;
+    OnStreamStopSendingCallback on_stream_stop_sending_;
     
     // Track reset streams
     std::set<uint64_t> reset_streams_;
@@ -1129,13 +1131,14 @@ void QuicConnection::Impl::ProcessFrames(const uint8_t* data, size_t len,
                 ESP_LOGW(TAG, "Server requested stop sending on stream %llu (error=%llu, %s)", 
                          (unsigned long long)stream_id, (unsigned long long)error_code,
                          H3ErrorCodeToString(error_code));
-                // Server wants us to stop sending - we should abort the upload
-                // Note: This does NOT affect receiving data from server on this stream
+                // Server wants us to stop sending request data.
+                // Note: This does NOT affect receiving data from server on this stream.
                 remote_stop_sending_streams_.insert(stream_id);
                 
-                // Notify upper layer immediately so writes can fail fast
-                if (on_stream_reset_) {
-                    on_stream_reset_(static_cast<int>(stream_id), error_code);
+                // Notify upper layer immediately so writes can fail fast while
+                // keeping response headers/body readable.
+                if (on_stream_stop_sending_) {
+                    on_stream_stop_sending_(static_cast<int>(stream_id), error_code);
                 }
             }
         } else if (frame_type == 0x06) {
@@ -3936,6 +3939,10 @@ void QuicConnection::SetOnStreamReset(OnStreamResetCallback cb) {
     impl_->SetOnStreamReset(std::move(cb));
 }
 
+void QuicConnection::SetOnStreamStopSending(OnStreamStopSendingCallback cb) {
+    impl_->SetOnStreamStopSending(std::move(cb));
+}
+
 QuicConnection::Stats QuicConnection::GetStats() const {
     return impl_->GetStats();
 }
@@ -4037,4 +4044,3 @@ bool QuicConnection::IsDatagramAvailable() const {
 }
 
 } // namespace esp_http3
-
