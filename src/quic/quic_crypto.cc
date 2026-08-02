@@ -10,9 +10,8 @@
 
 #include <mbedtls/md.h>
 #include <mbedtls/platform_util.h>
-#include <mbedtls/private/ecdh.h>
-#include <mbedtls/private/ecp.h>
 #include <mbedtls/private/sha256.h>
+#include <psa/crypto.h>
 
 #include <algorithm>
 #include <array>
@@ -32,11 +31,6 @@ static const char* TAG = "QUIC_CRYPTO";
 // bytes of stack per HKDF call compared to the spec's worst-case 255+255.
 static constexpr size_t kHkdfInfoMaxSize = 96;
 static constexpr size_t kHkdfHmacInputMaxSize = 96;
-
-static int EspRandomCallback(void*, unsigned char* output, size_t output_len) {
-    esp_fill_random(output, output_len);
-    return 0;
-}
 
 //=============================================================================
 // SHA-256 Context Implementation
@@ -663,128 +657,93 @@ bool BuildClientFinishedMessage(const uint8_t* client_hs_traffic_secret,
 }
 
 //=============================================================================
-// X25519 Key Exchange (using mbedtls ECP API with point I/O functions)
-// 
-// NOTE: For Curve25519/X25519, mbedtls uses point format where:
-// - Public key is 32 bytes (X coordinate only, little-endian)
-// - mbedtls_ecp_point_read_binary/write_binary handle the format correctly
+// X25519 Key Exchange (using the PSA Crypto API)
+//
+// The legacy mbedtls ECP/MPI/ECDH low-level API was removed in mbedtls 4.x
+// (ESP-IDF 6.2), so X25519 is implemented through PSA, which is available on
+// both ESP-IDF 6.0 and 6.2. For Curve25519/X25519 the PSA raw export format is
+// the 32-byte little-endian u-coordinate, matching the QUIC/TLS 1.3 wire
+// format produced by the previous implementation.
 //=============================================================================
 
 bool GenerateX25519KeyPair(uint8_t* private_key_out, uint8_t* public_key_out) {
-    mbedtls_ecp_group grp;
-    mbedtls_mpi priv;
-    mbedtls_ecp_point pub;
-    
-    mbedtls_ecp_group_init(&grp);
-    mbedtls_mpi_init(&priv);
-    mbedtls_ecp_point_init(&pub);
-    
-    int ret = -1;
-    
-    // Load Curve25519 group
-    ret = mbedtls_ecp_group_load(&grp, MBEDTLS_ECP_DP_CURVE25519);
-    if (ret != 0) {
-        ESP_LOGW("QUIC_CRYPTO", "X25519 keygen: group_load failed: %d", ret);
-        goto cleanup;
+    if (psa_crypto_init() != PSA_SUCCESS) {
+        ESP_LOGW(TAG, "X25519 keygen: psa_crypto_init failed");
+        return false;
     }
-    
-    // Generate key pair
-    ret = mbedtls_ecdh_gen_public(&grp, &priv, &pub,
-                                   EspRandomCallback, nullptr);
-    if (ret != 0) {
-        ESP_LOGW("QUIC_CRYPTO", "X25519 keygen: gen_public failed: %d", ret);
-        goto cleanup;
+
+    psa_key_attributes_t attributes = PSA_KEY_ATTRIBUTES_INIT;
+    psa_set_key_type(&attributes, PSA_KEY_TYPE_ECC_KEY_PAIR(PSA_ECC_FAMILY_MONTGOMERY));
+    psa_set_key_bits(&attributes, 255);
+    psa_set_key_algorithm(&attributes, PSA_ALG_ECDH);
+    psa_set_key_usage_flags(&attributes, PSA_KEY_USAGE_DERIVE | PSA_KEY_USAGE_EXPORT);
+
+    psa_key_id_t key_id = 0;
+    psa_status_t status = psa_generate_key(&attributes, &key_id);
+    psa_reset_key_attributes(&attributes);
+    if (status != PSA_SUCCESS) {
+        ESP_LOGW(TAG, "X25519 keygen: psa_generate_key failed: %ld", static_cast<long>(status));
+        return false;
     }
-    
-    // Export private key - mbedtls generates Curve25519 private key properly
-    // The private key needs to be in the specific format for X25519
-    ret = mbedtls_mpi_write_binary_le(&priv, private_key_out, 32);
-    if (ret != 0) {
-        ESP_LOGW("QUIC_CRYPTO", "X25519 keygen: export private failed: %d", ret);
-        goto cleanup;
+
+    bool ok = true;
+    size_t olen = 0;
+
+    status = psa_export_key(key_id, private_key_out, 32, &olen);
+    if (status != PSA_SUCCESS || olen != 32) {
+        ESP_LOGW(TAG, "X25519 keygen: export private failed: %ld, olen=%zu",
+                 static_cast<long>(status), olen);
+        ok = false;
     }
-    
-    // Export public key using point write (handles format correctly)
-    {
-        size_t olen = 0;
-        ret = mbedtls_ecp_point_write_binary(&grp, &pub, MBEDTLS_ECP_PF_COMPRESSED,
-                                              &olen, public_key_out, 32);
-        if (ret != 0 || olen != 32) {
-            ESP_LOGW("QUIC_CRYPTO", "X25519 keygen: export public failed: %d, olen=%zu", ret, olen);
-            if (ret == 0) ret = -1;
-            goto cleanup;
+
+    if (ok) {
+        status = psa_export_public_key(key_id, public_key_out, 32, &olen);
+        if (status != PSA_SUCCESS || olen != 32) {
+            ESP_LOGW(TAG, "X25519 keygen: export public failed: %ld, olen=%zu",
+                     static_cast<long>(status), olen);
+            ok = false;
         }
     }
-    
-    ret = 0;
-    
-cleanup:
-    mbedtls_ecp_group_free(&grp);
-    mbedtls_mpi_free(&priv);
-    mbedtls_ecp_point_free(&pub);
-    
-    return ret == 0;
+
+    psa_destroy_key(key_id);
+    return ok;
 }
 
 bool X25519ECDH(const uint8_t* private_key,
                 const uint8_t* peer_public_key,
                 uint8_t* shared_secret_out) {
-    mbedtls_ecp_group grp;
-    mbedtls_mpi priv, shared;
-    mbedtls_ecp_point peer_pub;
-    
-    mbedtls_ecp_group_init(&grp);
-    mbedtls_mpi_init(&priv);
-    mbedtls_mpi_init(&shared);
-    mbedtls_ecp_point_init(&peer_pub);
-    
-    int ret = -1;
-    
-    // Load Curve25519 group
-    ret = mbedtls_ecp_group_load(&grp, MBEDTLS_ECP_DP_CURVE25519);
-    if (ret != 0) {
-        ESP_LOGW("QUIC_CRYPTO", "X25519 ECDH: group_load failed: %d", ret);
-        goto cleanup;
+    if (psa_crypto_init() != PSA_SUCCESS) {
+        ESP_LOGW(TAG, "X25519 ECDH: psa_crypto_init failed");
+        return false;
     }
-    
-    // Import our private key (X25519 format is little-endian)
-    ret = mbedtls_mpi_read_binary_le(&priv, private_key, 32);
-    if (ret != 0) {
-        ESP_LOGW("QUIC_CRYPTO", "X25519 ECDH: read private failed: %d", ret);
-        goto cleanup;
+
+    psa_key_attributes_t attributes = PSA_KEY_ATTRIBUTES_INIT;
+    psa_set_key_type(&attributes, PSA_KEY_TYPE_ECC_KEY_PAIR(PSA_ECC_FAMILY_MONTGOMERY));
+    psa_set_key_bits(&attributes, 255);
+    psa_set_key_algorithm(&attributes, PSA_ALG_ECDH);
+    psa_set_key_usage_flags(&attributes, PSA_KEY_USAGE_DERIVE);
+
+    psa_key_id_t key_id = 0;
+    psa_status_t status = psa_import_key(&attributes, private_key, 32, &key_id);
+    psa_reset_key_attributes(&attributes);
+    if (status != PSA_SUCCESS) {
+        ESP_LOGW(TAG, "X25519 ECDH: import private failed: %ld", static_cast<long>(status));
+        return false;
     }
-    
-    // Import peer's public key using point read (handles Curve25519 format)
-    ret = mbedtls_ecp_point_read_binary(&grp, &peer_pub, peer_public_key, 32);
-    if (ret != 0) {
-        ESP_LOGW("QUIC_CRYPTO", "X25519 ECDH: read peer public failed: %d", ret);
-        goto cleanup;
+
+    size_t olen = 0;
+    status = psa_raw_key_agreement(PSA_ALG_ECDH, key_id,
+                                   peer_public_key, 32,
+                                   shared_secret_out, 32, &olen);
+    psa_destroy_key(key_id);
+
+    if (status != PSA_SUCCESS || olen != 32) {
+        ESP_LOGW(TAG, "X25519 ECDH: key agreement failed: %ld, olen=%zu",
+                 static_cast<long>(status), olen);
+        return false;
     }
-    
-    // Compute shared secret
-    ret = mbedtls_ecdh_compute_shared(&grp, &shared, &peer_pub, &priv,
-                                       EspRandomCallback, nullptr);
-    if (ret != 0) {
-        ESP_LOGW("QUIC_CRYPTO", "X25519 ECDH: compute_shared failed: %d", ret);
-        goto cleanup;
-    }
-    
-    // Export shared secret (X25519 format is little-endian)
-    ret = mbedtls_mpi_write_binary_le(&shared, shared_secret_out, 32);
-    if (ret != 0) {
-        ESP_LOGW("QUIC_CRYPTO", "X25519 ECDH: export shared failed: %d", ret);
-        goto cleanup;
-    }
-    
-    ret = 0;
-    
-cleanup:
-    mbedtls_ecp_group_free(&grp);
-    mbedtls_mpi_free(&priv);
-    mbedtls_mpi_free(&shared);
-    mbedtls_ecp_point_free(&peer_pub);
-    
-    return ret == 0;
+
+    return true;
 }
 
 } // namespace quic

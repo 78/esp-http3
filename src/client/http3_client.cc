@@ -764,6 +764,16 @@ void Http3Client::Disconnect() {
 // ==================== Stream API ====================
 
 std::unique_ptr<Http3Stream> Http3Client::Open(const Http3Request& request) {
+    // Hold the future stream lock before connection establishment. Otherwise
+    // EnsureConnected() releases its handshake-only lock just before the
+    // stream acquires a new one, briefly reporting the logical request as
+    // idle and allowing a policy-managed uplink hand-off in that gap.
+    std::unique_ptr<ScopedPowerLock> stream_power_lock;
+    if (power_lock_provider_) {
+        stream_power_lock = std::make_unique<ScopedPowerLock>(
+            power_lock_provider_, PowerSaveLevel::BALANCED);
+    }
+
     // Ensure connected
     if (!EnsureConnected()) {
         ESP_LOGE(TAG, "Failed to connect");
@@ -813,10 +823,9 @@ std::unique_ptr<Http3Stream> Http3Client::Open(const Http3Request& request) {
         return nullptr;
     }
     
-    // Create power lock for the stream
-    if (power_lock_provider_) {
-        stream->power_lock_ = std::make_unique<ScopedPowerLock>(power_lock_provider_, PowerSaveLevel::BALANCED);
-    }
+    // Transfer the continuously-held request lock to the stream. Close() or
+    // destruction releases it; every failure path above releases it by RAII.
+    stream->power_lock_ = std::move(stream_power_lock);
     
     // Register stream
     RegisterStream(stream_id, stream.get());
