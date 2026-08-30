@@ -28,9 +28,7 @@ namespace quic {
  * @param out Output PRK (32 bytes)
  * @return true on success
  */
-bool HkdfExtract(const uint8_t* salt, size_t salt_len,
-                 const uint8_t* ikm, size_t ikm_len,
-                 uint8_t* out);
+bool HkdfExtract(const uint8_t* salt, size_t salt_len, const uint8_t* ikm, size_t ikm_len, uint8_t* out);
 
 /**
  * @brief HKDF-Expand-Label (TLS 1.3 style)
@@ -45,10 +43,8 @@ bool HkdfExtract(const uint8_t* salt, size_t salt_len,
  * @param out_len Desired output length
  * @return true on success
  */
-bool HkdfExpandLabel(const uint8_t* secret, size_t secret_len,
-                     const uint8_t* label, size_t label_len,
-                     const uint8_t* context, size_t context_len,
-                     uint8_t* out, size_t out_len);
+bool HkdfExpandLabel(const uint8_t* secret, size_t secret_len, const uint8_t* label, size_t label_len,
+                     const uint8_t* context, size_t context_len, uint8_t* out, size_t out_len);
 
 //=============================================================================
 // Initial Key Derivation
@@ -62,14 +58,12 @@ bool HkdfExpandLabel(const uint8_t* secret, size_t secret_len,
  * @param out Output secrets
  * @return true on success
  */
-bool DeriveClientInitialSecrets(const uint8_t* dcid, size_t dcid_len,
-                                 CryptoSecrets* out);
+bool DeriveClientInitialSecrets(const uint8_t* dcid, size_t dcid_len, CryptoSecrets* out);
 
 /**
  * @brief Derive server Initial secrets from DCID
  */
-bool DeriveServerInitialSecrets(const uint8_t* dcid, size_t dcid_len,
-                                 CryptoSecrets* out);
+bool DeriveServerInitialSecrets(const uint8_t* dcid, size_t dcid_len, CryptoSecrets* out);
 
 //=============================================================================
 // Handshake Key Derivation
@@ -85,11 +79,8 @@ bool DeriveServerInitialSecrets(const uint8_t* dcid, size_t dcid_len,
  * @param handshake_secret_out Output handshake secret (for app key derivation)
  * @return true on success
  */
-bool DeriveHandshakeSecrets(const uint8_t* shared_secret,
-                            const uint8_t* transcript_hash,
-                            CryptoSecrets* client_out,
-                            CryptoSecrets* server_out,
-                            uint8_t* handshake_secret_out);
+bool DeriveHandshakeSecrets(const uint8_t* shared_secret, const uint8_t* transcript_hash, CryptoSecrets* client_out,
+                            CryptoSecrets* server_out, uint8_t* handshake_secret_out);
 
 /**
  * @brief Derive Handshake secrets with PSK (for session resumption)
@@ -105,12 +96,8 @@ bool DeriveHandshakeSecrets(const uint8_t* shared_secret,
  * @param handshake_secret_out Output handshake secret
  * @return true on success
  */
-bool DeriveHandshakeSecretsWithPsk(const uint8_t* shared_secret,
-                                    const uint8_t* transcript_hash,
-                                    const uint8_t* psk,
-                                    CryptoSecrets* client_out,
-                                    CryptoSecrets* server_out,
-                                    uint8_t* handshake_secret_out);
+bool DeriveHandshakeSecretsWithPsk(const uint8_t* shared_secret, const uint8_t* transcript_hash, const uint8_t* psk,
+                                   CryptoSecrets* client_out, CryptoSecrets* server_out, uint8_t* handshake_secret_out);
 
 //=============================================================================
 // Application Key Derivation
@@ -126,11 +113,8 @@ bool DeriveHandshakeSecretsWithPsk(const uint8_t* shared_secret,
  * @param master_secret_out Output master secret (for resumption)
  * @return true on success
  */
-bool DeriveApplicationSecrets(const uint8_t* handshake_secret,
-                              const uint8_t* transcript_hash,
-                              CryptoSecrets* client_out,
-                              CryptoSecrets* server_out,
-                              uint8_t* master_secret_out);
+bool DeriveApplicationSecrets(const uint8_t* handshake_secret, const uint8_t* transcript_hash,
+                              CryptoSecrets* client_out, CryptoSecrets* server_out, uint8_t* master_secret_out);
 
 //=============================================================================
 // Key Update (RFC 9001 Section 6)
@@ -143,16 +127,18 @@ bool DeriveApplicationSecrets(const uint8_t* handshake_secret,
  * application_traffic_secret_N+1 = HKDF-Expand-Label(application_traffic_secret_N,
  *                                                     "quic ku", "", 32)
  * 
- * @param current_client_secret Current client application traffic secret
- * @param current_server_secret Current server application traffic secret
+ * Header protection keys do not change during a key update (RFC 9001
+ * Section 6.1); the current secrets are therefore passed as complete key
+ * sets rather than traffic-secret byte arrays.
+ *
+ * @param current_client Current client application secrets
+ * @param current_server Current server application secrets
  * @param next_client_out Output next client secrets
  * @param next_server_out Output next server secrets
  * @return true on success
  */
-bool DeriveNextApplicationSecrets(const uint8_t* current_client_secret,
-                                   const uint8_t* current_server_secret,
-                                   CryptoSecrets* next_client_out,
-                                   CryptoSecrets* next_server_out);
+bool DeriveNextApplicationSecrets(const CryptoSecrets& current_client, const CryptoSecrets& current_server,
+                                  CryptoSecrets* next_client_out, CryptoSecrets* next_server_out);
 
 //=============================================================================
 // Finished Message
@@ -166,9 +152,7 @@ bool DeriveNextApplicationSecrets(const uint8_t* current_client_secret,
  * @param out Output verify_data (32 bytes)
  * @return true on success
  */
-bool ComputeFinishedVerifyData(const uint8_t* traffic_secret,
-                               const uint8_t* transcript_hash,
-                               uint8_t* out);
+bool ComputeFinishedVerifyData(const uint8_t* traffic_secret, const uint8_t* transcript_hash, uint8_t* out);
 
 /**
  * @brief Build Client Finished TLS message
@@ -179,9 +163,8 @@ bool ComputeFinishedVerifyData(const uint8_t* traffic_secret,
  * @param out_len Output length written
  * @return true on success
  */
-bool BuildClientFinishedMessage(const uint8_t* client_hs_traffic_secret,
-                                const uint8_t* transcript_hash,
-                                uint8_t* out, size_t* out_len);
+bool BuildClientFinishedMessage(const uint8_t* client_hs_traffic_secret, const uint8_t* transcript_hash, uint8_t* out,
+                                size_t* out_len);
 
 //=============================================================================
 // X25519 Key Exchange
@@ -204,9 +187,7 @@ bool GenerateX25519KeyPair(uint8_t* private_key_out, uint8_t* public_key_out);
  * @param shared_secret_out Output shared secret (32 bytes)
  * @return true on success
  */
-bool X25519ECDH(const uint8_t* private_key,
-                const uint8_t* peer_public_key,
-                uint8_t* shared_secret_out);
+bool X25519ECDH(const uint8_t* private_key, const uint8_t* peer_public_key, uint8_t* shared_secret_out);
 
 //=============================================================================
 // SHA-256 Hash
@@ -232,9 +213,7 @@ bool Sha256(const uint8_t* data, size_t len, uint8_t* out);
  * @param out Output MAC (32 bytes)
  * @return true on success
  */
-bool HmacSha256(const uint8_t* key, size_t key_len,
-                const uint8_t* data, size_t data_len,
-                uint8_t* out);
+bool HmacSha256(const uint8_t* key, size_t key_len, const uint8_t* data, size_t data_len, uint8_t* out);
 
 /**
  * @brief SHA-256 incremental context
@@ -243,19 +222,18 @@ class Sha256Context {
 public:
     Sha256Context();
     ~Sha256Context();
-    
+
     void Reset();
     void Update(const uint8_t* data, size_t len);
     void Finish(uint8_t* out);
-    
+
     // Get intermediate hash without finishing
     void GetHash(uint8_t* out) const;
-    
+
 private:
     struct Impl;
     Impl* impl_;
 };
 
-} // namespace quic
-} // namespace esp_http3
-
+}  // namespace quic
+}  // namespace esp_http3

@@ -20,9 +20,7 @@ static const char* TAG = "CryptoManager";
 // Constructor / Destructor
 //=============================================================================
 
-CryptoManager::CryptoManager() {
-    Reset();
-}
+CryptoManager::CryptoManager() { Reset(); }
 
 CryptoManager::~CryptoManager() {
     // Clear sensitive data
@@ -35,9 +33,7 @@ CryptoManager::~CryptoManager() {
 // Initialization
 //=============================================================================
 
-void CryptoManager::Initialize() {
-    Reset();
-}
+void CryptoManager::Initialize() { Reset(); }
 
 void CryptoManager::Reset() {
     // Clear all key material
@@ -48,7 +44,7 @@ void CryptoManager::Reset() {
     memset(master_secret_, 0, sizeof(master_secret_));
     memset(resumption_master_secret_, 0, sizeof(resumption_master_secret_));
     has_resumption_secret_ = false;
-    
+
     // Reset secrets
     client_initial_secrets_ = quic::CryptoSecrets{};
     server_initial_secrets_ = quic::CryptoSecrets{};
@@ -56,17 +52,17 @@ void CryptoManager::Reset() {
     server_handshake_secrets_ = quic::CryptoSecrets{};
     client_app_secrets_ = quic::CryptoSecrets{};
     server_app_secrets_ = quic::CryptoSecrets{};
-    
+
     // Reset previous secrets (Key Update)
     prev_client_app_secrets_ = quic::CryptoSecrets{};
     prev_server_app_secrets_ = quic::CryptoSecrets{};
-    
+
     // Reset transcript
     transcript_hash_.Reset();
-    
+
     // Reset state
     level_ = CryptoLevel::kNone;
-    
+
     // Reset Key Update state
     key_phase_ = 0;
     key_update_generation_ = 0;
@@ -82,14 +78,14 @@ bool CryptoManager::GenerateKeyPair() {
         ESP_LOGE(TAG, "GenerateX25519KeyPair failed");
         return false;
     }
-    
+
     // Generate client random
     GenerateClientRandom();
-    
+
     if (debug_) {
         ESP_LOGI(TAG, "Generated X25519 key pair and client random");
     }
-    
+
     return true;
 }
 
@@ -98,14 +94,14 @@ bool CryptoManager::SetKeyPair(const uint8_t* private_key, const uint8_t* public
         ESP_LOGE(TAG, "SetKeyPair: null pointer");
         return false;
     }
-    
+
     memcpy(x25519_private_key_, private_key, 32);
     memcpy(x25519_public_key_, public_key, 32);
-    
+
     if (debug_) {
         ESP_LOGI(TAG, "Set external X25519 key pair (reusing cached keypair)");
     }
-    
+
     return true;
 }
 
@@ -140,26 +136,25 @@ bool CryptoManager::DeriveInitialSecrets(const uint8_t* dcid, size_t dcid_len) {
         ESP_LOGE(TAG, "DeriveClientInitialSecrets failed");
         return false;
     }
-    
+
     // Derive server Initial secrets
     if (!quic::DeriveServerInitialSecrets(dcid, dcid_len, &server_initial_secrets_)) {
         ESP_LOGE(TAG, "DeriveServerInitialSecrets failed");
         return false;
     }
-    
+
     level_ = CryptoLevel::kInitial;
-    
+
     if (debug_) {
         ESP_LOGI(TAG, "Derived Initial secrets from DCID (len=%zu)", dcid_len);
     }
-    
+
     // Notify callback
     if (on_keys_) {
-        on_keys_(CryptoLevel::kInitial,
-                 client_initial_secrets_.traffic_secret.data(),
+        on_keys_(CryptoLevel::kInitial, client_initial_secrets_.traffic_secret.data(),
                  server_initial_secrets_.traffic_secret.data());
     }
-    
+
     return true;
 }
 
@@ -167,25 +162,18 @@ bool CryptoManager::DeriveInitialSecrets(const uint8_t* dcid, size_t dcid_len) {
 // Transcript Hash Management
 //=============================================================================
 
-void CryptoManager::ResetTranscript() {
-    transcript_hash_.Reset();
-}
+void CryptoManager::ResetTranscript() { transcript_hash_.Reset(); }
 
-void CryptoManager::UpdateTranscript(const uint8_t* data, size_t len) {
-    transcript_hash_.Update(data, len);
-}
+void CryptoManager::UpdateTranscript(const uint8_t* data, size_t len) { transcript_hash_.Update(data, len); }
 
-void CryptoManager::GetTranscriptHash(uint8_t* out) const {
-    transcript_hash_.GetHash(out);
-}
+void CryptoManager::GetTranscriptHash(uint8_t* out) const { transcript_hash_.GetHash(out); }
 
 //=============================================================================
 // Handshake Keys
 //=============================================================================
 
-bool CryptoManager::DeriveHandshakeSecrets(const uint8_t* server_public_key,
-                                            const uint8_t* server_hello,
-                                            size_t sh_len) {
+bool CryptoManager::DeriveHandshakeSecrets(const uint8_t* server_public_key, const uint8_t* server_hello,
+                                           size_t sh_len) {
     uint64_t start_time_us = quic::GetCurrentTimeUs();
 
     // Compute ECDH shared secret
@@ -194,45 +182,40 @@ bool CryptoManager::DeriveHandshakeSecrets(const uint8_t* server_public_key,
         ESP_LOGE(TAG, "X25519ECDH failed");
         return false;
     }
-    
+
     // Get transcript hash (should include ClientHello + ServerHello)
     // Note: ServerHello should already be in the transcript before calling this
     uint8_t transcript[32];
     GetTranscriptHash(transcript);
-    
+
     // Derive handshake secrets
-    if (!quic::DeriveHandshakeSecrets(shared_secret, transcript,
-                                       &client_handshake_secrets_,
-                                       &server_handshake_secrets_,
-                                       handshake_secret_)) {
+    if (!quic::DeriveHandshakeSecrets(shared_secret, transcript, &client_handshake_secrets_, &server_handshake_secrets_,
+                                      handshake_secret_)) {
         ESP_LOGE(TAG, "DeriveHandshakeSecrets failed");
         return false;
     }
-    
+
     // Clear shared secret
     memset(shared_secret, 0, sizeof(shared_secret));
-    
+
     level_ = CryptoLevel::kHandshake;
-    
+
     if (debug_) {
         uint64_t end_time_us = quic::GetCurrentTimeUs();
         uint64_t elapsed_us = end_time_us - start_time_us;
-        ESP_LOGI(TAG, "Derived Handshake secrets took %llu us (%.3f ms)", 
-                elapsed_us, elapsed_us / 1000.0f);
+        ESP_LOGI(TAG, "Derived Handshake secrets took %llu us (%.3f ms)", elapsed_us, elapsed_us / 1000.0f);
     }
-    
+
     // Notify callback
     if (on_keys_) {
-        on_keys_(CryptoLevel::kHandshake,
-                 client_handshake_secrets_.traffic_secret.data(),
+        on_keys_(CryptoLevel::kHandshake, client_handshake_secrets_.traffic_secret.data(),
                  server_handshake_secrets_.traffic_secret.data());
     }
-    
+
     return true;
 }
 
-bool CryptoManager::DeriveHandshakeSecretsWithPsk(const uint8_t* server_public_key,
-                                                   const uint8_t* psk) {
+bool CryptoManager::DeriveHandshakeSecretsWithPsk(const uint8_t* server_public_key, const uint8_t* psk) {
     uint64_t start_time_us = quic::GetCurrentTimeUs();
 
     // Compute ECDH shared secret
@@ -241,39 +224,35 @@ bool CryptoManager::DeriveHandshakeSecretsWithPsk(const uint8_t* server_public_k
         ESP_LOGE(TAG, "X25519ECDH failed");
         return false;
     }
-    
+
     // Get transcript hash (should include ClientHello + ServerHello)
     uint8_t transcript[32];
     GetTranscriptHash(transcript);
-    
+
     // Derive handshake secrets with PSK
-    if (!quic::DeriveHandshakeSecretsWithPsk(shared_secret, transcript, psk,
-                                              &client_handshake_secrets_,
-                                              &server_handshake_secrets_,
-                                              handshake_secret_)) {
+    if (!quic::DeriveHandshakeSecretsWithPsk(shared_secret, transcript, psk, &client_handshake_secrets_,
+                                             &server_handshake_secrets_, handshake_secret_)) {
         ESP_LOGE(TAG, "DeriveHandshakeSecretsWithPsk failed");
         return false;
     }
-    
+
     // Clear shared secret
     memset(shared_secret, 0, sizeof(shared_secret));
-    
+
     level_ = CryptoLevel::kHandshake;
-    
+
     if (debug_) {
         uint64_t end_time_us = quic::GetCurrentTimeUs();
         uint64_t elapsed_us = end_time_us - start_time_us;
-        ESP_LOGI(TAG, "Derived Handshake secrets with PSK took %llu us (%.3f ms)", 
-                elapsed_us, elapsed_us / 1000.0f);
+        ESP_LOGI(TAG, "Derived Handshake secrets with PSK took %llu us (%.3f ms)", elapsed_us, elapsed_us / 1000.0f);
     }
-    
+
     // Notify callback
     if (on_keys_) {
-        on_keys_(CryptoLevel::kHandshake,
-                 client_handshake_secrets_.traffic_secret.data(),
+        on_keys_(CryptoLevel::kHandshake, client_handshake_secrets_.traffic_secret.data(),
                  server_handshake_secrets_.traffic_secret.data());
     }
-    
+
     return true;
 }
 
@@ -287,32 +266,28 @@ bool CryptoManager::DeriveApplicationSecrets() {
     // Get transcript hash (should include up to Server Finished)
     uint8_t transcript[32];
     GetTranscriptHash(transcript);
-    
+
     // Derive application secrets
-    if (!quic::DeriveApplicationSecrets(handshake_secret_, transcript,
-                                         &client_app_secrets_,
-                                         &server_app_secrets_,
-                                         master_secret_)) {
+    if (!quic::DeriveApplicationSecrets(handshake_secret_, transcript, &client_app_secrets_, &server_app_secrets_,
+                                        master_secret_)) {
         ESP_LOGE(TAG, "DeriveApplicationSecrets failed");
         return false;
     }
-    
+
     level_ = CryptoLevel::kApplication;
-    
+
     if (debug_) {
         uint64_t end_time_us = quic::GetCurrentTimeUs();
         uint64_t elapsed_us = end_time_us - start_time_us;
-        ESP_LOGI(TAG, "Derived Application secrets took %llu us (%.3f ms)", 
-                elapsed_us, elapsed_us / 1000.0f);
+        ESP_LOGI(TAG, "Derived Application secrets took %llu us (%.3f ms)", elapsed_us, elapsed_us / 1000.0f);
     }
-    
+
     // Notify callback
     if (on_keys_) {
-        on_keys_(CryptoLevel::kApplication,
-                 client_app_secrets_.traffic_secret.data(),
+        on_keys_(CryptoLevel::kApplication, client_app_secrets_.traffic_secret.data(),
                  server_app_secrets_.traffic_secret.data());
     }
-    
+
     return true;
 }
 
@@ -324,19 +299,17 @@ bool CryptoManager::BuildClientFinished(uint8_t* out, size_t* out_len) {
     // Get transcript hash before Finished
     uint8_t transcript[32];
     GetTranscriptHash(transcript);
-    
+
     // Build Finished message
-    if (!quic::BuildClientFinishedMessage(client_handshake_secrets_.traffic_secret.data(),
-                                           transcript,
-                                           out, out_len)) {
+    if (!quic::BuildClientFinishedMessage(client_handshake_secrets_.traffic_secret.data(), transcript, out, out_len)) {
         ESP_LOGE(TAG, "BuildClientFinishedMessage failed");
         return false;
     }
-    
+
     if (debug_) {
         ESP_LOGI(TAG, "Built Client Finished message (%zu bytes)", *out_len);
     }
-    
+
     return true;
 }
 
@@ -351,41 +324,36 @@ bool CryptoManager::InitiateKeyUpdate() {
         }
         return false;
     }
-    
+
     // Save current secrets as previous
     prev_client_app_secrets_ = client_app_secrets_;
     prev_server_app_secrets_ = server_app_secrets_;
-    
+
     // Derive next generation secrets
     quic::CryptoSecrets next_client, next_server;
-    if (!quic::DeriveNextApplicationSecrets(
-            client_app_secrets_.traffic_secret.data(),
-            server_app_secrets_.traffic_secret.data(),
-            &next_client, &next_server)) {
+    if (!quic::DeriveNextApplicationSecrets(client_app_secrets_, server_app_secrets_, &next_client, &next_server)) {
         ESP_LOGE(TAG, "DeriveNextApplicationSecrets failed");
         return false;
     }
-    
+
     // Switch to new keys
     client_app_secrets_ = next_client;
     server_app_secrets_ = next_server;
-    
+
     // Flip key phase
     key_phase_ = 1 - key_phase_;
     key_update_generation_++;
-    
+
     if (debug_) {
-        ESP_LOGI(TAG, "Key Update initiated! Generation: %lu, Phase: %u",
-                 key_update_generation_, key_phase_);
+        ESP_LOGI(TAG, "Key Update initiated! Generation: %lu, Phase: %u", key_update_generation_, key_phase_);
     }
-    
+
     // Notify callback
     if (on_keys_) {
-        on_keys_(CryptoLevel::kApplication,
-                 client_app_secrets_.traffic_secret.data(),
+        on_keys_(CryptoLevel::kApplication, client_app_secrets_.traffic_secret.data(),
                  server_app_secrets_.traffic_secret.data());
     }
-    
+
     return true;
 }
 
@@ -393,41 +361,36 @@ void CryptoManager::HandlePeerKeyUpdate(uint8_t received_key_phase) {
     if (received_key_phase == key_phase_) {
         return;  // Same key phase, no update needed
     }
-    
+
     if (debug_) {
-        ESP_LOGI(TAG, "Peer initiated Key Update (phase: %u -> %u)",
-                 key_phase_, received_key_phase);
+        ESP_LOGI(TAG, "Peer initiated Key Update (phase: %u -> %u)", key_phase_, received_key_phase);
     }
-    
+
     // Save current secrets as previous
     prev_client_app_secrets_ = client_app_secrets_;
     prev_server_app_secrets_ = server_app_secrets_;
-    
+
     // Derive next generation secrets
     quic::CryptoSecrets next_client, next_server;
-    if (!quic::DeriveNextApplicationSecrets(
-            client_app_secrets_.traffic_secret.data(),
-            server_app_secrets_.traffic_secret.data(),
-            &next_client, &next_server)) {
+    if (!quic::DeriveNextApplicationSecrets(client_app_secrets_, server_app_secrets_, &next_client, &next_server)) {
         ESP_LOGE(TAG, "HandlePeerKeyUpdate: DeriveNextApplicationSecrets failed");
         return;
     }
-    
+
     // Switch to new keys
     client_app_secrets_ = next_client;
     server_app_secrets_ = next_server;
-    
+
     // Update key phase
     key_phase_ = received_key_phase;
     key_update_generation_++;
-    
+
     // Notify callback
     if (on_keys_) {
-        on_keys_(CryptoLevel::kApplication,
-                 client_app_secrets_.traffic_secret.data(),
+        on_keys_(CryptoLevel::kApplication, client_app_secrets_.traffic_secret.data(),
                  server_app_secrets_.traffic_secret.data());
     }
-    
+
     if (debug_) {
         ESP_LOGI(TAG, "Keys updated to generation %lu", key_update_generation_);
     }
@@ -437,7 +400,7 @@ void CryptoManager::CompleteKeyUpdate() {
     // Clear previous keys
     prev_client_app_secrets_.Clear();
     prev_server_app_secrets_.Clear();
-    
+
     if (debug_) {
         ESP_LOGI(TAG, "Key Update complete (generation %lu)", key_update_generation_);
     }
@@ -452,49 +415,45 @@ bool CryptoManager::DeriveResumptionMasterSecret() {
         ESP_LOGE(TAG, "Cannot derive resumption secret: application secrets not available");
         return false;
     }
-    
+
     // Get transcript hash (should include Client Finished)
     uint8_t transcript[32];
     GetTranscriptHash(transcript);
-    
+
     // resumption_master_secret = Derive-Secret(master_secret, "res master", transcript)
     const uint8_t* label = reinterpret_cast<const uint8_t*>("res master");
-    if (!quic::HkdfExpandLabel(master_secret_, 32, label, 10, transcript, 32,
-                                resumption_master_secret_, 32)) {
+    if (!quic::HkdfExpandLabel(master_secret_, 32, label, 10, transcript, 32, resumption_master_secret_, 32)) {
         ESP_LOGE(TAG, "DeriveResumptionMasterSecret: HkdfExpandLabel failed");
         return false;
     }
-    
+
     has_resumption_secret_ = true;
-    
+
     if (debug_) {
         ESP_LOGI(TAG, "Derived resumption_master_secret");
     }
-    
+
     return true;
 }
 
-bool CryptoManager::DeriveResumptionPsk(const uint8_t* ticket_nonce, size_t nonce_len,
-                                         uint8_t* psk_out) {
+bool CryptoManager::DeriveResumptionPsk(const uint8_t* ticket_nonce, size_t nonce_len, uint8_t* psk_out) {
     if (!has_resumption_secret_) {
         ESP_LOGE(TAG, "Cannot derive PSK: resumption master secret not available");
         return false;
     }
-    
+
     // PSK = HKDF-Expand-Label(resumption_master_secret, "resumption", ticket_nonce, 32)
     const uint8_t* label = reinterpret_cast<const uint8_t*>("resumption");
-    if (!quic::HkdfExpandLabel(resumption_master_secret_, 32, label, 10,
-                                ticket_nonce, nonce_len, psk_out, 32)) {
+    if (!quic::HkdfExpandLabel(resumption_master_secret_, 32, label, 10, ticket_nonce, nonce_len, psk_out, 32)) {
         ESP_LOGE(TAG, "DeriveResumptionPsk: HkdfExpandLabel failed");
         return false;
     }
-    
+
     if (debug_) {
         ESP_LOGI(TAG, "Derived PSK from ticket nonce");
     }
-    
+
     return true;
 }
 
-} // namespace esp_http3
-
+}  // namespace esp_http3

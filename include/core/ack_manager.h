@@ -7,6 +7,7 @@
 
 #pragma once
 
+#include "esp_http3_memory.h"
 #include "quic/quic_types.h"
 #include "quic/quic_constants.h"
 #include <cstdint>
@@ -22,22 +23,23 @@ class AckManager {
 public:
     AckManager();
     ~AckManager() = default;
-    
+
     /**
      * @brief Record a received packet number
      * 
      * @param pn Packet number
      * @param recv_time_us Receive time in microseconds
+     * @param ack_eliciting Whether this packet should advance ACK scheduling
      */
-    void OnPacketReceived(uint64_t pn, uint64_t recv_time_us);
-    
+    void OnPacketReceived(uint64_t pn, uint64_t recv_time_us, bool ack_eliciting = true);
+
     /**
      * @brief Check if ACK should be sent (simple check, 2+ ack-eliciting packets)
      * 
      * @return true if ACK is needed
      */
     bool ShouldSendAck() const;
-    
+
     /**
      * @brief Check if ACK should be sent with max_ack_delay timer (RFC 9002)
      * 
@@ -49,14 +51,14 @@ public:
      * @return true if ACK is needed
      */
     bool ShouldSendAck(uint64_t current_time_us) const;
-    
+
     /**
      * @brief Get largest received packet number
      * 
      * @return Largest PN, or -1 if none received
      */
     int64_t GetLargestReceived() const;
-    
+
     /**
      * @brief Build ACK frame for received packets
      * 
@@ -65,34 +67,34 @@ public:
      * @return true on success
      */
     bool BuildAckFrame(quic::BufferWriter* writer, uint64_t current_time_us);
-    
+
     /**
      * @brief Mark that ACK was sent
      */
     void OnAckSent();
-    
+
     /**
      * @brief Set ACK delay exponent (default: 3)
      */
     void SetAckDelayExponent(uint64_t exponent) { ack_delay_exponent_ = exponent; }
-    
+
     /**
      * @brief Get ACK delay exponent
      */
     uint64_t GetAckDelayExponent() const { return ack_delay_exponent_; }
-    
+
     /**
      * @brief Reset state
      */
     void Reset();
-    
+
     /**
      * @brief Check if there are any pending ack-eliciting packets
      * 
      * @return true if there are packets waiting to be ACKed
      */
     bool HasPendingAck() const { return ack_eliciting_count_ > 0; }
-    
+
     /**
      * @brief Get the time when we should send ACK if no more packets arrive
      * 
@@ -107,19 +109,19 @@ private:
     static constexpr uint64_t kMaxAckDelayUs = 25000;
     // Received packet numbers (for generating ACK ranges)
     std::set<uint64_t> received_packets_;
-    
+
     // Largest received packet number
     int64_t largest_received_ = -1;
-    
+
     // Time when largest_received was received (microseconds)
     uint64_t largest_received_time_us_ = 0;
-    
+
     // Number of ack-eliciting packets received since last ACK
     uint32_t ack_eliciting_count_ = 0;
-    
+
     // ACK delay exponent
     uint64_t ack_delay_exponent_ = 3;
-    
+
     // Maximum packet numbers to track
     static constexpr size_t kMaxTrackedPackets = 256;
 };
@@ -135,13 +137,13 @@ struct SentPacketInfo {
     bool in_flight = true;
     bool acknowledged = false;
     bool lost = false;
-    
+
     // Stream ID for this packet (0 = no stream data, e.g. control frames)
     // Used for cleaning up frames when stream is reset/cancelled
     uint64_t stream_id = 0;
-    
+
     // Frames in this packet (for retransmission)
-    std::vector<uint8_t> frames;
+    Http3Vector<uint8_t> frames;
 };
 
 /**
@@ -151,7 +153,7 @@ class SentPacketTracker {
 public:
     SentPacketTracker();
     ~SentPacketTracker() = default;
-    
+
     /**
      * @brief Record a sent packet
      * 
@@ -162,11 +164,9 @@ public:
      * @param frames Frames in the packet (for potential retransmission)
      * @param stream_id Stream ID (0 for control frames without stream data)
      */
-    void OnPacketSent(uint64_t pn, uint64_t sent_time_us, 
-                      size_t sent_bytes, bool ack_eliciting,
-                      std::vector<uint8_t> frames = {},
-                      uint64_t stream_id = 0);
-    
+    void OnPacketSent(uint64_t pn, uint64_t sent_time_us, size_t sent_bytes, bool ack_eliciting,
+                      Http3Vector<uint8_t> frames = {}, uint64_t stream_id = 0);
+
     /**
      * @brief Process received ACK frame
      * 
@@ -178,53 +178,50 @@ public:
      * @param newly_acked_bytes Output: bytes newly acknowledged
      * @return true if any packets were newly acknowledged
      */
-    bool OnAckReceived(uint64_t largest_acked, 
-                       uint64_t ack_delay,
-                       uint64_t first_ack_range,
-                       const std::vector<std::pair<uint64_t, uint64_t>>& ack_ranges,
-                       uint64_t current_time_us,
+    bool OnAckReceived(uint64_t largest_acked, uint64_t ack_delay, uint64_t first_ack_range,
+                       const std::vector<std::pair<uint64_t, uint64_t>>& ack_ranges, uint64_t current_time_us,
                        size_t* newly_acked_bytes);
-    
+
     /**
      * @brief Get largest acked packet number
      */
     int64_t GetLargestAcked() const { return largest_acked_; }
-    
+
     /**
      * @brief Get next packet number to send
      */
     uint64_t GetNextPacketNumber() const { return next_packet_number_; }
-    
+
     /**
      * @brief Increment and return next packet number
      */
     uint64_t AllocatePacketNumber() { return next_packet_number_++; }
-    
+
     /**
      * @brief Get sent packets that may need retransmission
      */
     std::vector<SentPacketInfo*> GetUnackedPackets();
-    
+
     /**
      * @brief Mark packet as lost
      */
     void MarkLost(uint64_t pn);
-    
+
     /**
      * @brief Remove acknowledged/lost packets older than threshold
      */
     void PruneOldPackets();
-    
+
     /**
      * @brief Reset state
      */
     void Reset();
-    
+
     /**
      * @brief Get RTT sample from last ACK (0 if none)
      */
     uint64_t GetLatestRttUs() const { return latest_rtt_us_; }
-    
+
     /**
      * @brief Clear frame data for all unacked packets belonging to a stream
      * 
@@ -237,13 +234,12 @@ public:
     size_t ClearStreamFrames(uint64_t stream_id);
 
 private:
-    std::vector<SentPacketInfo> sent_packets_;
+    Http3Vector<SentPacketInfo> sent_packets_;
     uint64_t next_packet_number_ = 0;
     int64_t largest_acked_ = -1;
     uint64_t latest_rtt_us_ = 0;
-    
+
     static constexpr size_t kMaxSentPackets = 256;
 };
 
-} // namespace esp_http3
-
+}  // namespace esp_http3

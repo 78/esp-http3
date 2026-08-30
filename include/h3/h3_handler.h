@@ -5,6 +5,7 @@
 
 #pragma once
 
+#include "esp_http3_memory.h"
 #include "h3/h3_frame.h"
 #include "quic/quic_types.h"
 #include <cstdint>
@@ -46,7 +47,7 @@ enum class StreamState {
  */
 struct PendingChunk {
     uint64_t offset;
-    std::vector<uint8_t> data;
+    Http3Vector<uint8_t> data;
 };
 
 /**
@@ -58,51 +59,44 @@ struct H3Stream {
     bool is_control = false;
     bool is_qpack_encoder = false;
     bool is_qpack_decoder = false;
-    
+
     // For request streams
     std::string method;
     std::string path;
-    
+
     // Response data
     H3Response response;
     bool response_headers_sent = false;  // Track if OnResponse callback has been triggered
-    
+
     // Stream reassembly (like Python's H3StreamManager)
-    std::vector<uint8_t> recv_buffer;      // Contiguous data buffer
-    uint64_t contiguous_end = 0;           // End of contiguous data
-    std::vector<PendingChunk> pending_chunks;  // Out-of-order data chunks
-    uint64_t fin_offset = UINT64_MAX;      // Final offset if FIN received
-    size_t parsed_offset = 0;              // Offset of parsed H3 frames
-    
+    Http3Vector<uint8_t> recv_buffer;          // Contiguous data buffer
+    uint64_t contiguous_end = 0;               // End of contiguous data
+    Http3Vector<PendingChunk> pending_chunks;  // Out-of-order data chunks
+    uint64_t fin_offset = UINT64_MAX;          // Final offset if FIN received
+    size_t parsed_offset = 0;                  // Offset of parsed H3 frames
+
     // Incremental DATA frame processing (for large downloads)
     uint64_t pending_data_frame_remaining = 0;  // Remaining bytes in current DATA frame
-    
+
     // Send data
-    std::vector<uint8_t> send_buffer;
+    Http3Vector<uint8_t> send_buffer;
     size_t send_offset = 0;
 };
 
 /**
  * @brief Callback for sending QUIC stream data
  */
-using SendStreamCallback = std::function<bool(uint64_t stream_id, 
-                                               const uint8_t* data, 
-                                               size_t len, 
-                                               bool fin)>;
+using SendStreamCallback = std::function<bool(uint64_t stream_id, const uint8_t* data, size_t len, bool fin)>;
 
 /**
  * @brief Callback when response is complete
  */
-using OnResponseCallback = std::function<void(uint64_t stream_id, 
-                                               const H3Response& response)>;
+using OnResponseCallback = std::function<void(uint64_t stream_id, const H3Response& response)>;
 
 /**
  * @brief Callback for streaming data
  */
-using OnStreamDataCallback = std::function<void(uint64_t stream_id,
-                                                 const uint8_t* data,
-                                                 size_t len,
-                                                 bool fin)>;
+using OnStreamDataCallback = std::function<void(uint64_t stream_id, const uint8_t* data, size_t len, bool fin)>;
 
 /**
  * @brief HTTP/3 handler
@@ -113,14 +107,14 @@ class H3Handler {
 public:
     H3Handler();
     ~H3Handler() = default;
-    
+
     /**
      * @brief Set callbacks
      */
     void SetSendStream(SendStreamCallback cb) { send_stream_ = std::move(cb); }
     void SetOnResponse(OnResponseCallback cb) { on_response_ = std::move(cb); }
     void SetOnStreamData(OnStreamDataCallback cb) { on_stream_data_ = std::move(cb); }
-    
+
     /**
      * @brief Initialize control streams
      * 
@@ -131,19 +125,19 @@ public:
      * @param next_uni_stream_id Starting unidirectional stream ID (client: 2)
      */
     void Initialize(uint64_t next_bidi_stream_id, uint64_t next_uni_stream_id);
-    
+
     /**
      * @brief Send SETTINGS on control stream
      */
     bool SendSettings();
-    
+
     /**
      * @brief Create new request stream
      * 
      * @return Stream ID, or -1 on failure
      */
     int64_t CreateRequestStream();
-    
+
     /**
      * @brief Send HTTP request
      * 
@@ -155,13 +149,10 @@ public:
      * @param body Request body (may be empty)
      * @return true on success
      */
-    bool SendRequest(uint64_t stream_id,
-                     const std::string& method,
-                     const std::string& path,
-                     const std::string& authority,
-                     const std::vector<std::pair<std::string, std::string>>& headers,
+    bool SendRequest(uint64_t stream_id, const std::string& method, const std::string& path,
+                     const std::string& authority, const std::vector<std::pair<std::string, std::string>>& headers,
                      const std::vector<uint8_t>& body);
-    
+
     /**
      * @brief Process received stream data with offset for reassembly
      * 
@@ -171,44 +162,43 @@ public:
      * @param len Length
      * @param fin FIN flag
      */
-    void OnStreamData(uint64_t stream_id, uint64_t offset, 
-                      const uint8_t* data, size_t len, bool fin);
-    
+    void OnStreamData(uint64_t stream_id, uint64_t offset, const uint8_t* data, size_t len, bool fin);
+
     /**
      * @brief Get stream by ID
      */
     H3Stream* GetStream(uint64_t stream_id);
-    
+
     /**
      * @brief Check if stream exists
      */
     bool HasStream(uint64_t stream_id) const;
-    
+
     /**
      * @brief Close stream
      */
     void CloseStream(uint64_t stream_id);
-    
+
     /**
      * @brief Get next bidirectional stream ID (for request streams)
      */
     uint64_t GetNextBidiStreamId() const { return next_bidi_stream_id_; }
-    
+
     /**
      * @brief Get control stream ID
      */
     uint64_t GetControlStreamId() const { return control_stream_id_; }
-    
+
     /**
      * @brief Reset all state
      */
     void Reset();
-    
+
     /**
      * @brief Set peer settings
      */
     void SetPeerSettings(const SettingsFrame& settings);
-    
+
     /**
      * @brief Get our settings
      */
@@ -217,16 +207,16 @@ public:
 private:
     // Process frames in receive buffer
     void ProcessReceivedData(uint64_t stream_id);
-    
+
     // Handle control stream data
     void HandleControlStream(uint64_t stream_id, const uint8_t* data, size_t len);
-    
+
     // Handle request stream data
     void HandleRequestStream(uint64_t stream_id, const uint8_t* data, size_t len, bool fin);
-    
+
     // Handle unidirectional stream type
     void HandleUniStreamType(uint64_t stream_id);
-    
+
     // Merge pending out-of-order chunks into contiguous buffer
     void MergePendingChunks(H3Stream* stream);
 
@@ -234,24 +224,23 @@ private:
     SendStreamCallback send_stream_;
     OnResponseCallback on_response_;
     OnStreamDataCallback on_stream_data_;
-    
+
     std::unordered_map<uint64_t, std::unique_ptr<H3Stream>> streams_;
-    
-    uint64_t next_bidi_stream_id_ = 0;    // Client: 0, 4, 8, ...
-    uint64_t next_uni_stream_id_ = 2;     // Client: 2, 6, 10, ...
-    
+
+    uint64_t next_bidi_stream_id_ = 0;  // Client: 0, 4, 8, ...
+    uint64_t next_uni_stream_id_ = 2;   // Client: 2, 6, 10, ...
+
     uint64_t control_stream_id_ = UINT64_MAX;
     uint64_t qpack_encoder_stream_id_ = UINT64_MAX;
     uint64_t qpack_decoder_stream_id_ = UINT64_MAX;
-    
+
     uint64_t peer_control_stream_id_ = UINT64_MAX;
-    
+
     SettingsFrame local_settings_;
     SettingsFrame peer_settings_;
     bool peer_settings_received_ = false;
     bool initialized_ = false;
 };
 
-} // namespace h3
-} // namespace esp_http3
-
+}  // namespace h3
+}  // namespace esp_http3

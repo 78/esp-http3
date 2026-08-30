@@ -1,0 +1,24 @@
+---
+Language: Cpp
+BasedOnStyle: Google
+
+# esp-http3 uses four-space indentation. Keep this explicit so formatting
+# never depends on clang-format's built-in fallback style.
+IndentWidth: 4
+ContinuationIndentWidth: 4
+ConstructorInitializerIndentWidth: 4
+AccessModifierOffset: -4
+IndentCaseLabels: true
+
+PointerAlignment: Left
+ReferenceAlignment: Left
+DerivePointerAlignment: false
+
+BreakBeforeBraces: Attach
+AllowShortFunctionsOnASingleLine: All
+ColumnLimit: 120
+
+SortIncludes: Never
+ReflowComments: false
+FixNamespaceComments: false
+...

@@ -1,3 +1,4 @@
 dist/
 .component_hash
 .idea
+.vscode/

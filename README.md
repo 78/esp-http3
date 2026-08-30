@@ -5,12 +5,13 @@ A QUIC/HTTP3 client library for ESP32 platform, implementing RFC 9000 (QUIC) and
 ## Features
 
 - ✅ QUIC v1 transport protocol
-- ✅ TLS 1.3 handshake (using mbedtls)
+- ✅ TLS 1.3 handshake and peer authentication (using mbedtls)
 - ✅ HTTP/3 request/response
 - ✅ Stream multiplexing
 - ✅ Flow control
 - ✅ Packet loss detection and recovery
 - ✅ Synchronous blocking API with background event loop
+- ✅ Bounded event-driven asynchronous requests with per-instance concurrency
 
 ## Quick Start
 
@@ -23,6 +24,7 @@ A QUIC/HTTP3 client library for ESP32 platform, implementing RFC 9000 (QUIC) and
 Http3ClientConfig config;
 config.hostname = "api.example.com";
 config.port = 443;
+config.trusted_ca_der.assign(ca_der, ca_der + ca_der_size);
 
 // Create client (manages connection lifecycle)
 Http3Client client(config);
@@ -80,6 +82,52 @@ while ((bytes_read = stream->Read(buffer, sizeof(buffer))) > 0) {
 // bytes_read == 0 means EOF, < 0 means error
 ```
 
+### Bounded event-driven asynchronous requests
+
+`Http3AsyncClient` owns the socket, QUIC connection, background event loop,
+stream registry, and bounded request state machine. Its maximum in-flight
+request count is selected when each instance is created; the default is 10 and
+the state machine never grows beyond that capacity.
+
+```cpp
+#include "client/http3_async_client.h"
+
+Http3AsyncClientConfig config;
+config.hostname = "api.example.com";
+config.max_concurrent_requests = 10;
+Http3AsyncClient requests(config);
+requests.Start();
+
+Http3AsyncRequest request;
+request.method = "POST";
+request.path = "/api/data";
+request.headers = {{"content-type", "application/json"}};
+request.body.assign(body, body + body_size);
+Http3AsyncRequestHandle handle = requests.Submit(std::move(request));
+
+Http3AsyncResult result;
+if (requests.PollCompletion(result)) {
+    ESP_LOGI(TAG, "request=%lu status=%d", (unsigned long)result.handle.value, result.status);
+}
+```
+
+`Start()` performs the one-time connection establishment. After that,
+`Submit()`, `Cancel()`, and `PollCompletion()` do not wait for network I/O.
+If the transport disconnects, outstanding requests complete with a transport
+error and the asynchronous scheduler stops accepting submissions. The owning
+task must call `Start()` again before resubmitting; that call performs the
+reconnection and may wait up to `connect_timeout_ms`.
+There is no periodic request scan: state advances only on submission,
+cancellation, incoming UDP data, a QUIC protocol timer, or a request deadline.
+Scheduled request methods, paths, headers (including header strings), request
+bodies, response headers, response bodies, errors, and slot storage use the
+component allocator (PSRAM when configured). Use `Http3AsyncClient::Open()` for
+a long-lived control stream or a large streaming upload/download.
+`Http3Client` remains available as a synchronous compatibility adapter and can
+either own an asynchronous client or borrow one whose lifetime is managed by
+the application. The adapter copies final headers/body into the original
+standard-library response types at that compatibility boundary.
+
 ### Streaming Upload
 
 ```cpp
@@ -118,12 +166,13 @@ if (stream->GetStatus() == 200) {
 
 ### Http3Client
 
-Main client class that manages QUIC connection and HTTP/3 streams.
+Synchronous compatibility adapter over `Http3AsyncClient`.
 
 ```cpp
 class Http3Client {
     // Constructor
     explicit Http3Client(const Http3ClientConfig& config);
+    explicit Http3Client(Http3AsyncClient& async_client); // non-owning adapter
     
     // Connection state
     bool IsConnected() const;
@@ -139,8 +188,7 @@ class Http3Client {
               uint32_t timeout_ms = 0);
     
     // Stream API (for streaming or large responses)
-    std::unique_ptr<Http3Stream> Open(const Http3Request& request,
-                                       uint32_t timeout_ms = 0);
+    std::unique_ptr<Http3Stream> Open(const Http3Request& request);
     
     // Statistics
     Statistics GetStatistics() const;
@@ -194,6 +242,11 @@ struct Http3ClientConfig {
     
     // Buffer sizes
     size_t receive_buffer_size = 64 * 1024;
+    uint32_t max_concurrent_requests = 10;
+
+    // TLS peer authentication. The vector contains the application's trust root.
+    std::vector<uint8_t> trusted_ca_der;
+    bool allow_unverified_peer = false; // Development only; see below.
     
     // Performance optimizations
     bool cache_keypair = true;         // Cache X25519 keypair for faster reconnect
@@ -225,9 +278,25 @@ struct Http3Response {
 };
 ```
 
+### TLS peer authentication
+
+Connections fail closed unless `hostname` is non-empty and
+`trusted_ca_der` contains one DER-encoded trust anchor. The client verifies
+the certificate chain, validity period, hostname, server-auth/key-usage
+constraints, TLS 1.3 CertificateVerify signature, Finished MAC, handshake
+message order, and the expected QUIC encryption level. The application must
+establish trustworthy wall-clock time before connecting so certificate dates
+can be evaluated.
+
+`allow_unverified_peer` is a development-only escape hatch. It skips chain,
+date, and hostname verification, but still requires a suitable leaf
+certificate and validates CertificateVerify and Finished. Do not enable it in
+released firmware or over an untrusted network.
+
 ## Threading Model
 
-- `Http3Client` manages background tasks for UDP receive and QUIC event processing
+- `Http3AsyncClient` uses one `select()`-driven background task for UDP receive,
+  QUIC timers, and event processing
 - Public methods can be called from any task
 - Each `Http3Stream` should be used from a single task (except `Close()`)
 - Connection is established automatically on first request
@@ -244,6 +313,19 @@ struct Http3Response {
 - ESP-IDF v5.4+
 - mbedtls (for TLS 1.3)
 - lwip (for network stack)
+
+## Memory allocation
+
+`CONFIG_ESP_HTTP3_USE_PSRAM_ALLOCATOR` is enabled by default when PSRAM is
+available. It places the component's large stream receive buffers, HTTP/3
+reassembly buffers, QUIC handshake caches, and retransmission data in PSRAM.
+`CONFIG_ESP_HTTP3_PSRAM_ALLOCATOR_FALLBACK` is also enabled by default and
+retries failed PSRAM allocations from internal RAM.
+
+The allocator intentionally does not redirect FreeRTOS objects, task stacks,
+lwIP-owned buffers, or memory with DMA/internal-RAM capability requirements.
+Disabling the allocator keeps the same container types but backs them with the
+internal byte-addressable heap.
 
 ## License
 

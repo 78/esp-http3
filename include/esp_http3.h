@@ -70,6 +70,7 @@
 
 #include "core/quic_connection.h"
 #include "client/power_lock.h"
+#include "client/http3_async_client.h"
 #include "client/http3_client.h"
 
 // Re-export main types for convenience
@@ -79,4 +80,3 @@ namespace esp_http3 {
 constexpr uint32_t kQuicVersion = 0x00000001;  // QUIC v1
 
 } // namespace esp_http3
-

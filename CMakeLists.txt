@@ -2,6 +2,9 @@
 # Based on RFC 9000 (QUIC), RFC 9001 (QUIC-TLS), RFC 9114 (HTTP/3)
 
 set(COMPONENT_SRCS
+    # Component memory policy
+    "src/esp_http3_memory.cc"
+
     # QUIC core
     "src/quic/quic_varint.cc"
     "src/quic/quic_types.cc"
@@ -27,6 +30,8 @@ set(COMPONENT_SRCS
     
     # High-level client API
     "src/client/http3_client.cc"
+    "src/client/http3_async_client.cc"
+    "src/client/http3_async_scheduler.cc"
 )
 
 set(COMPONENT_INCLUDE_DIRS
@@ -39,6 +44,7 @@ set(COMPONENT_REQUIRES
     freertos
     lwip
     esp_psram
+    vfs
 )
 
 idf_component_register(

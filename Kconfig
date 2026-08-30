@@ -1,0 +1,23 @@
+menu "ESP HTTP/3"
+
+    config ESP_HTTP3_USE_PSRAM_ALLOCATOR
+        bool "Prefer PSRAM for HTTP/3 dynamic buffers"
+        depends on SPIRAM
+        default y
+        help
+            Allocate the component's large receive, reassembly, handshake, and
+            retransmission buffers from byte-addressable PSRAM. Small control
+            objects, FreeRTOS primitives, task stacks, and network/DMA-owned
+            memory remain in their required heaps.
+
+    config ESP_HTTP3_PSRAM_ALLOCATOR_FALLBACK
+        bool "Fall back to internal RAM when PSRAM is exhausted"
+        depends on ESP_HTTP3_USE_PSRAM_ALLOCATOR
+        default y
+        help
+            Retry a failed PSRAM allocation from the internal byte-addressable
+            heap. Keeping this enabled makes allocation failures less abrupt,
+            while heap telemetry should still be used to detect PSRAM pressure.
+
+endmenu
+
