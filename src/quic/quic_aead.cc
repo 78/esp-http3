@@ -118,8 +118,19 @@ size_t AeadDecrypt(const uint8_t* key, const uint8_t* iv,
     psa_destroy_key(key_id);
 
     if (status != PSA_SUCCESS) {
-        ESP_LOGW(TAG, "AeadDecrypt: psa_aead_decrypt failed: %ld (auth tag mismatch?)",
-                 static_cast<long>(status));
+        // These are candidate header values until authentication succeeds.
+        // Never log keys, IVs, ciphertext, or decrypted application data.
+        if (status == PSA_ERROR_INVALID_SIGNATURE) {
+            // Expected when probing receive keys across a QUIC key update.
+            // The connection logs recovery or final packet discard.
+            ESP_LOGD(TAG,
+                     "AeadDecrypt: authentication failed: %ld, candidate_pn=%llu, aad_len=%zu, ciphertext_len=%zu",
+                     static_cast<long>(status), (unsigned long long)packet_number, aad_len, ciphertext_len);
+        } else {
+            ESP_LOGW(TAG,
+                     "AeadDecrypt: PSA error: %ld, candidate_pn=%llu, aad_len=%zu, ciphertext_len=%zu",
+                     static_cast<long>(status), (unsigned long long)packet_number, aad_len, ciphertext_len);
+        }
         return 0;  // Decryption or auth failed
     }
     

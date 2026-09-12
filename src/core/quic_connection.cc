@@ -1035,19 +1035,41 @@ bool QuicConnection::Impl::Process1RttPacket(uint8_t* data, size_t len) {
     }
     std::memcpy(frame_buf_.data(), data, len);
 
-    const auto decrypt_with = [&](const quic::CryptoSecrets& secrets) {
+    const int64_t largest_pn = app_ack_mgr_.GetLargestReceived();
+    const uint32_t generation = crypto_.GetKeyUpdateGeneration();
+    const unsigned key_phase = crypto_.GetKeyPhase();
+    const char* accepted_keys = "current";
+    unsigned attempts = 0;
+    const auto decrypt_with = [&](const quic::CryptoSecrets& secrets, const char* keys) {
+        ++attempts;
+        info = {};
         std::memcpy(data, frame_buf_.data(), len);
-        return quic::Decrypt1RttPacket(data, len,
+        const size_t decrypted_len = quic::Decrypt1RttPacket(data, len,
                                        scid_.Length(),  // Our SCID length is the expected DCID length
-                                       secrets, app_ack_mgr_.GetLargestReceived(), &info, payload_buf_.data(),
+                                       secrets, largest_pn, &info, payload_buf_.data(),
                                        payload_buf_.size());
+        if (decrypted_len == 0) {
+            // PN and phase are unauthenticated candidates, not peer state.
+            // A failed key attempt can still recover with previous/next keys.
+            ESP_LOGD(TAG,
+                     "1-RTT decrypt attempt failed: conn=%p rx_us=%llu keys=%s attempt=%u len=%zu "
+                     "generation=%lu local_phase=%u largest_pn=%lld header_ready=%u "
+                     "candidate_pn=%llu pn_bytes=%zu candidate_phase=%u",
+                     static_cast<void*>(this), (unsigned long long)current_time_us_, keys, attempts, len,
+                     (unsigned long)generation, key_phase, (long long)largest_pn,
+                     info.header_length != 0 ? 1U : 0U, (unsigned long long)info.packet_number,
+                     static_cast<size_t>(info.pn_length), info.short_header.key_phase() ? 1U : 0U);
+        } else {
+            accepted_keys = keys;
+        }
+        return decrypted_len;
     };
 
-    size_t payload_len = decrypt_with(crypto_.GetServerAppSecrets());
+    size_t payload_len = decrypt_with(crypto_.GetServerAppSecrets(), "current");
 
     if (payload_len == 0 && crypto_.GetPreviousServerAppSecrets().valid) {
         // A reordered packet from the preceding generation remains acceptable.
-        payload_len = decrypt_with(crypto_.GetPreviousServerAppSecrets());
+        payload_len = decrypt_with(crypto_.GetPreviousServerAppSecrets(), "previous");
     }
 
     if (payload_len == 0) {
@@ -1057,10 +1079,13 @@ bool QuicConnection::Impl::Process1RttPacket(uint8_t* data, size_t len) {
         const auto& server_secrets = crypto_.GetServerAppSecrets();
         if (quic::DeriveNextApplicationSecrets(client_secrets, server_secrets, &next_client_secrets,
                                                &next_server_secrets)) {
-            payload_len = decrypt_with(next_server_secrets);
+            payload_len = decrypt_with(next_server_secrets, "next");
             if (payload_len != 0) {
                 crypto_.HandlePeerKeyUpdate(info.short_header.key_phase() ? 1U : 0U);
             }
+        } else {
+            ESP_LOGW(TAG, "1-RTT next-key derivation failed: conn=%p rx_us=%llu",
+                     static_cast<void*>(this), (unsigned long long)current_time_us_);
         }
     }
 
@@ -1072,8 +1097,8 @@ bool QuicConnection::Impl::Process1RttPacket(uint8_t* data, size_t len) {
         // - NEW_CONNECTION_ID frames (additional CIDs)
         if (IsStatelessReset(data, len)) {
             ESP_LOGW(TAG,
-                     "Received Stateless Reset from server - connection was "
-                     "closed by peer");
+                     "Received Stateless Reset from server: conn=%p rx_us=%llu len=%zu attempts=%u",
+                     static_cast<void*>(this), (unsigned long long)current_time_us_, len, attempts);
             Close(0, "stateless reset received");
             return false;
         }
@@ -1082,6 +1107,12 @@ bool QuicConnection::Impl::Process1RttPacket(uint8_t* data, size_t len) {
         // connection but we didn't receive a proper close signal (e.g., server
         // restarted, network issue)
         consecutive_decrypt_failures_++;
+        ESP_LOGW(TAG,
+                 "1-RTT packet discarded: conn=%p rx_us=%llu len=%zu attempts=%u "
+                 "generation=%lu local_phase=%u largest_pn=%lld consecutive_failures=%lu",
+                 static_cast<void*>(this), (unsigned long long)current_time_us_, len, attempts,
+                 (unsigned long)generation, key_phase, (long long)largest_pn,
+                 (unsigned long)consecutive_decrypt_failures_);
         if (consecutive_decrypt_failures_ >= kMaxConsecutiveDecryptFailures) {
             ESP_LOGW(TAG, "Too many consecutive decrypt failures (%lu), closing connection",
                      consecutive_decrypt_failures_);
@@ -1089,10 +1120,17 @@ bool QuicConnection::Impl::Process1RttPacket(uint8_t* data, size_t len) {
             return false;
         }
 
-        if (config_.enable_debug) {
-            ESP_LOGW(TAG, "Decrypt1RttPacket failed (len=%zu, failures=%lu)", len, consecutive_decrypt_failures_);
-        }
         return false;
+    }
+
+    if (attempts > 1 || consecutive_decrypt_failures_ != 0) {
+        ESP_LOGI(TAG,
+                 "1-RTT decrypt recovered: conn=%p rx_us=%llu keys=%s attempts=%u pn=%llu "
+                 "peer_phase=%u generation=%lu->%lu prior_discarded=%lu",
+                 static_cast<void*>(this), (unsigned long long)current_time_us_, accepted_keys, attempts,
+                 (unsigned long long)info.packet_number, info.short_header.key_phase() ? 1U : 0U,
+                 (unsigned long)generation, (unsigned long)crypto_.GetKeyUpdateGeneration(),
+                 (unsigned long)consecutive_decrypt_failures_);
     }
 
     // Reset failure counter on successful decrypt
