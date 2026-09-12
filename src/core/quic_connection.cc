@@ -1202,6 +1202,22 @@ void QuicConnection::Impl::ProcessFrames(const uint8_t* data, size_t len, quic::
                 ESP_LOGI(TAG, "[RecvFrame] [%s] Frame: CRYPTO", pkt_type_str);
             }
             ProcessCryptoFrame(&reader, pkt_type);
+        } else if (frame_type == 0x07) {
+            // NEW_TOKEN. The token is useful for a future connection, but this
+            // client does not persist address-validation tokens yet. It still
+            // has to consume the complete frame so subsequent frames in the
+            // same packet (notably HANDSHAKE_DONE) are processed.
+            uint64_t token_length = 0;
+            if (pkt_type != quic::PacketType::k1Rtt || !reader.ReadVarint(&token_length) || token_length == 0 ||
+                token_length > reader.Remaining() || !reader.Skip(static_cast<size_t>(token_length))) {
+                ESP_LOGE(TAG, "Malformed NEW_TOKEN frame");
+                FailHandshake("Malformed NEW_TOKEN frame");
+                break;
+            }
+            if (config_.enable_debug) {
+                ESP_LOGI(TAG, "[RecvFrame] [%s] Frame: NEW_TOKEN, len=%llu", pkt_type_str,
+                         (unsigned long long)token_length);
+            }
         } else if (frame_type >= 0x08 && frame_type <= 0x0f) {
             // STREAM
             if (config_.enable_debug) {
