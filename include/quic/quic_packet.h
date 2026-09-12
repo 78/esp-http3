@@ -5,6 +5,7 @@
 
 #pragma once
 
+#include "esp_http3_memory.h"
 #include "quic/quic_types.h"
 #include "quic/quic_constants.h"
 #include <cstdint>
@@ -67,7 +68,7 @@ struct PacketInfo {
     size_t packet_size = 0;
     
     // For Initial packets
-    std::vector<uint8_t> token;
+    Http3Vector<uint8_t> token;
 };
 
 //=============================================================================
@@ -228,7 +229,7 @@ bool ParseRetryPacket(const uint8_t* packet, size_t packet_len,
                       const ConnectionId& original_dcid,
                       PacketInfo* info,
                       ConnectionId* new_scid,
-                      std::vector<uint8_t>* retry_token);
+                      Http3Vector<uint8_t>* retry_token);
 
 //=============================================================================
 // Utility Functions

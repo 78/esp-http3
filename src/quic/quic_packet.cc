@@ -52,7 +52,7 @@ size_t BuildInitialPacket(const ConnectionId& dcid, const ConnectionId& scid, co
     size_t pn_len = GetPacketNumberLength(packet_number);
 
     // Build header (without length and PN)
-    std::vector<uint8_t> header(256);
+    Http3Vector<uint8_t> header(256);
     size_t header_offset = 0;
 
     // First byte (will update PN length later)
@@ -120,7 +120,7 @@ size_t BuildInitialPacket(const ConnectionId& dcid, const ConnectionId& scid, co
     offset += EncodePacketNumber(packet_number, out + offset);
 
     // Prepare plaintext (payload + padding)
-    std::vector<uint8_t> plaintext(payload_len + padding_len);
+    Http3Vector<uint8_t> plaintext(payload_len + padding_len);
     std::memcpy(plaintext.data(), payload, payload_len);
     std::memset(plaintext.data() + payload_len, 0, padding_len);  // PADDING frames
 
@@ -152,7 +152,7 @@ size_t BuildHandshakePacket(const ConnectionId& dcid, const ConnectionId& scid, 
     size_t pn_len = GetPacketNumberLength(packet_number);
 
     // Build header
-    std::vector<uint8_t> header(256);
+    Http3Vector<uint8_t> header(256);
     size_t header_offset = 0;
 
     // First byte: Handshake type = 2
@@ -565,7 +565,7 @@ size_t Decrypt1RttPacket(uint8_t* packet, size_t packet_len, size_t dcid_len, co
 }
 
 bool ParseRetryPacket(const uint8_t* packet, size_t packet_len, const ConnectionId& original_dcid, PacketInfo* info,
-                      ConnectionId* new_scid, std::vector<uint8_t>* retry_token) {
+                      ConnectionId* new_scid, Http3Vector<uint8_t>* retry_token) {
     // Minimum: 1 + 4 + 1 + 0 + 1 + 0 + 16 = 23 bytes
     if (packet_len < 23) {
         return false;

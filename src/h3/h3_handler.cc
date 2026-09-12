@@ -138,7 +138,7 @@ bool H3Handler::SendRequest(uint64_t stream_id,
                             const std::string& path,
                             const std::string& authority,
                             const std::vector<std::pair<std::string, std::string>>& headers,
-                            const std::vector<uint8_t>& body) {
+                            const Http3Vector<uint8_t>& body) {
     auto* stream = GetStream(stream_id);
     if (!stream || stream->state != StreamState::kOpen) {
         ESP_LOGE(TAG, "SendRequest failed: stream %llu not found or not open (state=%d)",
@@ -151,7 +151,7 @@ bool H3Handler::SendRequest(uint64_t stream_id,
     stream->path = path;
     
     // Build QPACK-encoded headers
-    std::vector<uint8_t> qpack_headers(1024);
+    Http3Vector<uint8_t> qpack_headers(1024);
     size_t qpack_len = BuildQpackRequestHeaders(
         method, path, authority, "https", headers,
         qpack_headers.data(), qpack_headers.size());
@@ -163,8 +163,8 @@ bool H3Handler::SendRequest(uint64_t stream_id,
     }
     
     // Build HEADERS frame
-    std::vector<uint8_t> encoded_headers(qpack_headers.data(), qpack_headers.data() + qpack_len);
-    std::vector<uint8_t> headers_frame(1024);
+    Http3Vector<uint8_t> encoded_headers(qpack_headers.data(), qpack_headers.data() + qpack_len);
+    Http3Vector<uint8_t> headers_frame(1024);
     size_t headers_frame_len = BuildHeadersFrame(encoded_headers, 
                                                   headers_frame.data(), 
                                                   headers_frame.size());
@@ -184,7 +184,7 @@ bool H3Handler::SendRequest(uint64_t stream_id,
     
     // Send DATA frame if body exists
     if (has_body) {
-        std::vector<uint8_t> data_frame(2048);
+        Http3Vector<uint8_t> data_frame(2048);
         size_t data_frame_len = BuildDataFrame(body.data(), body.size(),
                                                 data_frame.data(), data_frame.size());
         if (data_frame_len == 0) {

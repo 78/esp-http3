@@ -151,7 +151,7 @@ public:
      */
     bool SendRequest(uint64_t stream_id, const std::string& method, const std::string& path,
                      const std::string& authority, const std::vector<std::pair<std::string, std::string>>& headers,
-                     const std::vector<uint8_t>& body);
+                     const Http3Vector<uint8_t>& body);
 
     /**
      * @brief Process received stream data with offset for reassembly

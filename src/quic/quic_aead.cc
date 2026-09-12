@@ -3,6 +3,7 @@
  * @brief QUIC AEAD Implementation using mbedtls
  */
 
+#include "esp_http3_memory.h"
 #include "quic/quic_aead.h"
 #include "quic/quic_constants.h"
 
@@ -242,7 +243,7 @@ bool ComputeRetryIntegrityTag(const uint8_t* odcid, size_t odcid_len,
                                uint8_t* tag_out) {
     // Build pseudo-packet for AEAD:
     // ODCID length (1 byte) + ODCID + Retry packet
-    std::vector<uint8_t> aad;
+    Http3Vector<uint8_t> aad;
     aad.reserve(1 + odcid_len + retry_len);
     aad.push_back(static_cast<uint8_t>(odcid_len));
     aad.insert(aad.end(), odcid, odcid + odcid_len);

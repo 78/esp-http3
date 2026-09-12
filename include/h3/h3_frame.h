@@ -5,6 +5,7 @@
 
 #pragma once
 
+#include "esp_http3_memory.h"
 #include "quic/quic_types.h"
 #include "h3/h3_constants.h"
 #include <cstdint>
@@ -43,7 +44,7 @@ size_t BuildDefaultSettingsFrame(uint8_t* out, size_t out_len);
  * @param out_len Output buffer size
  * @return Bytes written, or 0 on failure
  */
-size_t BuildHeadersFrame(const std::vector<uint8_t>& encoded_headers,
+size_t BuildHeadersFrame(const Http3Vector<uint8_t>& encoded_headers,
                          uint8_t* out, size_t out_len);
 
 /**

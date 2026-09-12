@@ -62,7 +62,7 @@ size_t BuildDefaultSettingsFrame(uint8_t* out, size_t out_len) {
     return BuildSettingsFrame(default_settings, out, out_len);
 }
 
-size_t BuildHeadersFrame(const std::vector<uint8_t>& encoded_headers,
+size_t BuildHeadersFrame(const Http3Vector<uint8_t>& encoded_headers,
                          uint8_t* out, size_t out_len) {
     BufferWriter writer(out, out_len);
     

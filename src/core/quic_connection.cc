@@ -421,7 +421,7 @@ private:
     static constexpr uint32_t kMaxConsecutiveDecryptFailures = 3;
 
     // Retry token
-    std::vector<uint8_t> retry_token_;
+    Http3Vector<uint8_t> retry_token_;
 
     // Buffered Handshake packets (RFC 9000 Section 17.2.2)
     // When Handshake packets arrive before we have Handshake keys (e.g., due to
@@ -456,10 +456,10 @@ private:
     uint32_t peer_max_datagram_frame_size_ = 0;
     OnDatagramCallback on_datagram_;
 
-    // Pre-allocated buffers to avoid heap allocation in hot paths
-    uint8_t packet_buf_[1500];   // For building outgoing packets
-    uint8_t payload_buf_[1500];  // For decrypted payloads
-    uint8_t frame_buf_[1500];    // For building frames
+    // Allocate once per connection using the component PSRAM policy; reuse in hot paths.
+    Http3Vector<uint8_t> packet_buf_ = Http3Vector<uint8_t>(1500);   // For building outgoing packets
+    Http3Vector<uint8_t> payload_buf_ = Http3Vector<uint8_t>(1500);  // For decrypted payloads
+    Http3Vector<uint8_t> frame_buf_ = Http3Vector<uint8_t>(1500);    // For building frames
 
     // Maximum payload size for a single packet (considering headers and
     // encryption overhead)
@@ -485,7 +485,7 @@ private:
         }
     };
     BatchState batch_state_;
-    uint8_t batch_frames_[1500];  // Buffer for batch mode frames
+    Http3Vector<uint8_t> batch_frames_ = Http3Vector<uint8_t>(1500);  // Buffer for batch mode frames
 };
 
 //=============================================================================
@@ -629,7 +629,7 @@ void QuicConnection::Impl::Close(int error_code, const std::string& reason) {
     }
 
     // Build and send CONNECTION_CLOSE
-    std::vector<uint8_t> frame_buf(256);
+    Http3Vector<uint8_t> frame_buf(256);
     quic::BufferWriter writer(frame_buf.data(), frame_buf.size());
 
     quic::BuildConnectionCloseFrame(&writer, static_cast<uint64_t>(error_code), 0, reason);
@@ -640,15 +640,15 @@ void QuicConnection::Impl::Close(int error_code, const std::string& reason) {
     if (handshake_complete_) {
         packet_len = quic::Build1RttPacket(dcid_, app_tracker_.AllocatePacketNumber(), false,
                                            crypto_.GetKeyPhase() != 0, frame_buf.data(), writer.Offset(),
-                                           crypto_.GetClientAppSecrets(), packet_buf_, sizeof(packet_buf_));
+                                           crypto_.GetClientAppSecrets(), packet_buf_.data(), packet_buf_.size());
     } else {
         packet_len = quic::BuildInitialPacket(
             dcid_, scid_, retry_token_.data(), retry_token_.size(), initial_tracker_.AllocatePacketNumber(),
-            frame_buf.data(), writer.Offset(), crypto_.GetClientInitialSecrets(), packet_buf_, sizeof(packet_buf_));
+            frame_buf.data(), writer.Offset(), crypto_.GetClientInitialSecrets(), packet_buf_.data(), packet_buf_.size());
     }
 
     if (packet_len > 0) {
-        SendPacket(packet_buf_, packet_len);
+        SendPacket(packet_buf_.data(), packet_len);
     }
 
     state_ = ConnectionState::kClosed;
@@ -700,7 +700,7 @@ bool QuicConnection::Impl::SendInitialPacket(bool is_retransmit) {
             psk_params.identity.obfuscated_ticket_age = ticket_age_ms + config_.ticket_age_add;
 
             ch_len = tls::BuildClientHelloWithPsk(config_.hostname, crypto_.GetClientRandom(), crypto_.GetPublicKey(),
-                                                  local_params_, psk_params, payload_buf_, sizeof(payload_buf_));
+                                                  local_params_, psk_params, payload_buf_.data(), payload_buf_.size());
             if (ch_len > 0) {
                 using_psk_ = true;
                 ESP_LOGI(TAG,
@@ -715,7 +715,7 @@ bool QuicConnection::Impl::SendInitialPacket(bool is_retransmit) {
     if (ch_len == 0) {
         using_psk_ = false;
         ch_len = tls::BuildClientHello(config_.hostname, crypto_.GetClientRandom(), crypto_.GetPublicKey(),
-                                       local_params_, payload_buf_, sizeof(payload_buf_));
+                                       local_params_, payload_buf_.data(), payload_buf_.size());
     }
 
     if (ch_len == 0) {
@@ -727,12 +727,12 @@ bool QuicConnection::Impl::SendInitialPacket(bool is_retransmit) {
     // PTO retransmits the same ClientHello, so transcript hash should not be
     // updated again
     if (!is_retransmit) {
-        crypto_.UpdateTranscript(payload_buf_, ch_len);
+        crypto_.UpdateTranscript(payload_buf_.data(), ch_len);
     }
 
     // Build CRYPTO frame
-    quic::BufferWriter writer(frame_buf_, sizeof(frame_buf_));
-    if (!quic::BuildCryptoFrame(&writer, 0, payload_buf_, ch_len)) {
+    quic::BufferWriter writer(frame_buf_.data(), frame_buf_.size());
+    if (!quic::BuildCryptoFrame(&writer, 0, payload_buf_.data(), ch_len)) {
         ESP_LOGE(TAG, "BuildCryptoFrame failed");
         return false;
     }
@@ -744,8 +744,8 @@ bool QuicConnection::Impl::SendInitialPacket(bool is_retransmit) {
     // Build Initial packet
     uint64_t pn = initial_tracker_.AllocatePacketNumber();
     size_t packet_len =
-        quic::BuildInitialPacket(dcid_, scid_, retry_token_.data(), retry_token_.size(), pn, frame_buf_,
-                                 writer.Offset(), crypto_.GetClientInitialSecrets(), packet_buf_, sizeof(packet_buf_),
+        quic::BuildInitialPacket(dcid_, scid_, retry_token_.data(), retry_token_.size(), pn, frame_buf_.data(),
+                                 writer.Offset(), crypto_.GetClientInitialSecrets(), packet_buf_.data(), packet_buf_.size(),
                                  1200);  // Minimum 1200 bytes
 
     if (packet_len == 0) {
@@ -757,7 +757,7 @@ bool QuicConnection::Impl::SendInitialPacket(bool is_retransmit) {
     initial_tracker_.OnPacketSent(pn, current_time_us_, packet_len, true);
     loss_detector_.OnPacketSent(pn, current_time_us_, packet_len, true);
 
-    return SendPacket(packet_buf_, packet_len);
+    return SendPacket(packet_buf_.data(), packet_len);
 }
 
 //=============================================================================
@@ -803,7 +803,7 @@ void QuicConnection::Impl::ProcessReceivedData(uint8_t* data, size_t len) {
                         ESP_LOGI(TAG, "Received Retry packet");
                         quic::PacketInfo info;
                         quic::ConnectionId new_scid;
-                        std::vector<uint8_t> token;
+                        Http3Vector<uint8_t> token;
                         if (quic::ParseRetryPacket(pkt_data, pkt_len, initial_dcid_, &info, &new_scid, &token)) {
                             // Update DCID and retry token
                             dcid_ = new_scid;
@@ -886,7 +886,7 @@ size_t QuicConnection::Impl::ProcessInitialPacket(uint8_t* data, size_t len) {
 
     size_t payload_len =
         quic::DecryptInitialPacket(data, len, crypto_.GetServerInitialSecrets(), initial_ack_mgr_.GetLargestReceived(),
-                                   &info, payload_buf_, sizeof(payload_buf_));
+                                   &info, payload_buf_.data(), payload_buf_.size());
 
     if (payload_len == 0) {
         if (config_.enable_debug) {
@@ -917,12 +917,12 @@ size_t QuicConnection::Impl::ProcessInitialPacket(uint8_t* data, size_t len) {
 
     // Only record packet for ACK generation if it contains ACK-eliciting frames
     // (RFC 9002)
-    if (HasAckElicitingFrames(payload_buf_, payload_len)) {
+    if (HasAckElicitingFrames(payload_buf_.data(), payload_len)) {
         initial_ack_mgr_.OnPacketReceived(info.packet_number, current_time_us_);
     }
 
     // Process frames
-    ProcessFrames(payload_buf_, payload_len, quic::PacketType::kInitial);
+    ProcessFrames(payload_buf_.data(), payload_len, quic::PacketType::kInitial);
 
     return info.packet_size;  // Return consumed bytes for coalesced packet handling
 }
@@ -956,8 +956,8 @@ size_t QuicConnection::Impl::ProcessHandshakePacket(uint8_t* data, size_t len) {
     quic::PacketInfo info;
 
     size_t payload_len = quic::DecryptHandshakePacket(data, len, crypto_.GetServerHandshakeSecrets(),
-                                                      handshake_ack_mgr_.GetLargestReceived(), &info, payload_buf_,
-                                                      sizeof(payload_buf_));
+                                                      handshake_ack_mgr_.GetLargestReceived(), &info, payload_buf_.data(),
+                                                      payload_buf_.size());
 
     if (payload_len == 0) {
         // Decryption failed - try to skip this packet and continue with coalesced
@@ -988,11 +988,11 @@ size_t QuicConnection::Impl::ProcessHandshakePacket(uint8_t* data, size_t len) {
 
     // Only record packet for ACK generation if it contains ACK-eliciting frames
     // (RFC 9002)
-    if (HasAckElicitingFrames(payload_buf_, payload_len)) {
+    if (HasAckElicitingFrames(payload_buf_.data(), payload_len)) {
         handshake_ack_mgr_.OnPacketReceived(info.packet_number, current_time_us_);
     }
 
-    ProcessFrames(payload_buf_, payload_len, quic::PacketType::kHandshake);
+    ProcessFrames(payload_buf_.data(), payload_len, quic::PacketType::kHandshake);
 
     return info.packet_size;  // Return consumed bytes for coalesced packet handling
 }
@@ -1030,17 +1030,17 @@ bool QuicConnection::Impl::Process1RttPacket(uint8_t* data, size_t len) {
     // Header protection removal mutates the packet in place. Preserve the
     // ciphertext so an authenticated failure can be retried with previous or
     // next-generation receive keys (RFC 9001 section 6).
-    if (len > sizeof(frame_buf_)) {
+    if (len > frame_buf_.size()) {
         return false;
     }
-    std::memcpy(frame_buf_, data, len);
+    std::memcpy(frame_buf_.data(), data, len);
 
     const auto decrypt_with = [&](const quic::CryptoSecrets& secrets) {
-        std::memcpy(data, frame_buf_, len);
+        std::memcpy(data, frame_buf_.data(), len);
         return quic::Decrypt1RttPacket(data, len,
                                        scid_.Length(),  // Our SCID length is the expected DCID length
-                                       secrets, app_ack_mgr_.GetLargestReceived(), &info, payload_buf_,
-                                       sizeof(payload_buf_));
+                                       secrets, app_ack_mgr_.GetLargestReceived(), &info, payload_buf_.data(),
+                                       payload_buf_.size());
     };
 
     size_t payload_len = decrypt_with(crypto_.GetServerAppSecrets());
@@ -1065,7 +1065,7 @@ bool QuicConnection::Impl::Process1RttPacket(uint8_t* data, size_t len) {
     }
 
     if (payload_len == 0) {
-        std::memcpy(data, frame_buf_, len);
+        std::memcpy(data, frame_buf_.data(), len);
         // Check if this is a Stateless Reset (RFC 9000 Section 10.3)
         // Uses IsStatelessReset() which checks all known reset tokens from:
         // - Transport parameters (initial handshake)
@@ -1103,7 +1103,7 @@ bool QuicConnection::Impl::Process1RttPacket(uint8_t* data, size_t len) {
                  payload_len);
     }
 
-    const bool ack_eliciting = HasAckElicitingFrames(payload_buf_, payload_len);
+    const bool ack_eliciting = HasAckElicitingFrames(payload_buf_.data(), payload_len);
     app_ack_mgr_.OnPacketReceived(info.packet_number, current_time_us_, ack_eliciting);
 
     // Only schedule an ACK if the packet contains ACK-eliciting frames
@@ -1116,7 +1116,7 @@ bool QuicConnection::Impl::Process1RttPacket(uint8_t* data, size_t len) {
         }
     }
 
-    ProcessFrames(payload_buf_, payload_len, quic::PacketType::k1Rtt);
+    ProcessFrames(payload_buf_.data(), payload_len, quic::PacketType::k1Rtt);
 
     return true;
 }
@@ -1874,7 +1874,7 @@ bool QuicConnection::Impl::SendClientFinished() {
 
             size_t ack_packet_len = quic::BuildInitialPacket(
                 dcid_, scid_, retry_token_.data(), retry_token_.size(), ack_pn, ack_frames, ack_writer.Offset(),
-                crypto_.GetClientInitialSecrets(), packet_buf_ + total_len, sizeof(packet_buf_) - total_len,
+                crypto_.GetClientInitialSecrets(), packet_buf_.data() + total_len, packet_buf_.size() - total_len,
                 0);  // No internal padding needed
             if (ack_packet_len > 0) {
                 initial_tracker_.OnPacketSent(ack_pn, current_time_us_, ack_packet_len, false);
@@ -1892,7 +1892,7 @@ bool QuicConnection::Impl::SendClientFinished() {
     uint64_t pn = handshake_tracker_.AllocatePacketNumber();
     size_t packet_len =
         quic::BuildHandshakePacket(dcid_, scid_, pn, hs_frames, hs_writer.Offset(), crypto_.GetClientHandshakeSecrets(),
-                                   packet_buf_ + total_len, sizeof(packet_buf_) - total_len);
+                                   packet_buf_.data() + total_len, packet_buf_.size() - total_len);
 
     if (packet_len == 0) {
         ESP_LOGW(TAG, "BuildHandshakePacket failed");
@@ -1914,7 +1914,7 @@ bool QuicConnection::Impl::SendClientFinished() {
     // RFC 9000 Section 14.1: UDP datagrams carrying Initial packets MUST be >=
     // 1200 bytes Pad the datagram with zeros at the end if needed
     if (has_initial && total_len < 1200) {
-        memset(packet_buf_ + total_len, 0, 1200 - total_len);
+        memset(packet_buf_.data() + total_len, 0, 1200 - total_len);
         total_len = 1200;
     }
 
@@ -1923,7 +1923,7 @@ bool QuicConnection::Impl::SendClientFinished() {
         ESP_LOGI(TAG, "[SendPacket] Coalesced datagram, total len=%zu", total_len);
     }
 
-    bool ok = SendPacket(packet_buf_, total_len);
+    bool ok = SendPacket(packet_buf_.data(), total_len);
     if (ok) {
         state_ = ConnectionState::kConnected;
     }
@@ -1984,7 +1984,7 @@ void QuicConnection::Impl::ProcessHandshakeDoneFrame() {
     // Release handshake-related buffers that are no longer needed
     // These can be quite large (several KB) and are only used during handshake
     // Use swap trick for guaranteed memory release (shrink_to_fit is non-binding)
-    std::vector<uint8_t>().swap(retry_token_);
+    Http3Vector<uint8_t>().swap(retry_token_);
     Http3Vector<uint8_t>().swap(initial_crypto_buffer_);
     Http3Vector<uint8_t>().swap(handshake_crypto_buffer_);
     initial_crypto_cache_.clear();
@@ -2171,7 +2171,7 @@ bool QuicConnection::Impl::SendMaxDataFrame() {
     size_t frame_len = writer.Offset();
 
     // Build 1-RTT packet
-    std::vector<uint8_t> packet(256);
+    Http3Vector<uint8_t> packet(256);
     uint64_t pn = app_tracker_.AllocatePacketNumber();
     size_t packet_len = quic::Build1RttPacket(dcid_, pn, false, crypto_.GetKeyPhase() != 0, frames, frame_len,
                                               crypto_.GetClientAppSecrets(), packet.data(), packet.size());
@@ -2212,7 +2212,7 @@ bool QuicConnection::Impl::SendMaxStreamDataFrame(uint64_t stream_id) {
     size_t frame_len = writer.Offset();
 
     // Build 1-RTT packet
-    std::vector<uint8_t> packet(256);
+    Http3Vector<uint8_t> packet(256);
     uint64_t pn = app_tracker_.AllocatePacketNumber();
     size_t packet_len = quic::Build1RttPacket(dcid_, pn, false, crypto_.GetKeyPhase() != 0, frames, frame_len,
                                               crypto_.GetClientAppSecrets(), packet.data(), packet.size());
@@ -2299,7 +2299,7 @@ bool QuicConnection::Impl::SendAckIfNeeded(quic::PacketType pkt_type) {
 
     // Build ACK frame - use larger buffer for multi-range ACKs (packet loss
     // scenarios)
-    std::vector<uint8_t> frames(256);
+    Http3Vector<uint8_t> frames(256);
     quic::BufferWriter writer(frames.data(), frames.size());
     if (!ack_mgr->BuildAckFrame(&writer, current_time_us_)) {
         ESP_LOGE(TAG, "SendAckIfNeeded: BuildAckFrame FAILED");
@@ -2307,7 +2307,7 @@ bool QuicConnection::Impl::SendAckIfNeeded(quic::PacketType pkt_type) {
     }
 
     // Build packet
-    std::vector<uint8_t> packet(512);
+    Http3Vector<uint8_t> packet(512);
     uint64_t pn = tracker->AllocatePacketNumber();
     size_t packet_len = 0;
 
@@ -2369,14 +2369,14 @@ void QuicConnection::Impl::SendCoalescedAcks() {
     uint64_t pn = handshake_tracker_.AllocatePacketNumber();
     size_t packet_len =
         quic::BuildHandshakePacket(dcid_, scid_, pn, frames, writer.Offset(), crypto_.GetClientHandshakeSecrets(),
-                                   packet_buf_, sizeof(packet_buf_));
+                                   packet_buf_.data(), packet_buf_.size());
     if (packet_len > 0) {
         handshake_tracker_.OnPacketSent(pn, current_time_us_, packet_len, false);
         handshake_ack_mgr_.OnAckSent();
         if (config_.enable_debug) {
             ESP_LOGI(TAG, "[SendFrame] Handshake ACK, PN=%llu, len=%zu", (unsigned long long)pn, packet_len);
         }
-        SendPacket(packet_buf_, packet_len);
+        SendPacket(packet_buf_.data(), packet_len);
     }
 }
 
@@ -2392,7 +2392,7 @@ void QuicConnection::Impl::BeginBatch() {
 
     batch_state_.Reset();
     batch_state_.active = true;
-    batch_state_.writer = new quic::BufferWriter(batch_frames_, sizeof(batch_frames_));
+    batch_state_.writer = new quic::BufferWriter(batch_frames_.data(), batch_frames_.size());
 
     // Add ACK frame if needed (will be at the beginning of packet)
     if (app_ack_mgr_.ShouldSendAck(current_time_us_)) {
@@ -2424,9 +2424,9 @@ bool QuicConnection::Impl::EndBatch() {
 
     // Build 1-RTT packet with all accumulated frames
     uint64_t pn = app_tracker_.AllocatePacketNumber();
-    size_t packet_len = quic::Build1RttPacket(dcid_, pn, false, crypto_.GetKeyPhase() != 0, batch_frames_,
-                                              batch_state_.writer->Offset(), crypto_.GetClientAppSecrets(), packet_buf_,
-                                              sizeof(packet_buf_));
+    size_t packet_len = quic::Build1RttPacket(dcid_, pn, false, crypto_.GetKeyPhase() != 0, batch_frames_.data(),
+                                              batch_state_.writer->Offset(), crypto_.GetClientAppSecrets(), packet_buf_.data(),
+                                              packet_buf_.size());
 
     if (packet_len == 0) {
         ESP_LOGE(TAG, "EndBatch: Build1RttPacket failed");
@@ -2443,8 +2443,8 @@ bool QuicConnection::Impl::EndBatch() {
         // Build a combined frames buffer for all STREAM frames
         Http3Vector<uint8_t> stream_frames_copy;
         for (const auto& info : batch_state_.stream_frames) {
-            stream_frames_copy.insert(stream_frames_copy.end(), batch_frames_ + info.frame_start,
-                                      batch_frames_ + info.frame_start + info.frame_len);
+            stream_frames_copy.insert(stream_frames_copy.end(), batch_frames_.data() + info.frame_start,
+                                      batch_frames_.data() + info.frame_start + info.frame_len);
         }
 
         // Use first stream's ID for tracking (simplified, could be improved)
@@ -2461,7 +2461,7 @@ bool QuicConnection::Impl::EndBatch() {
                  batch_state_.stream_frames.size());
     }
 
-    bool ok = SendPacket(packet_buf_, packet_len);
+    bool ok = SendPacket(packet_buf_.data(), packet_len);
 
     delete batch_state_.writer;
     batch_state_.Reset();
@@ -2521,7 +2521,7 @@ bool QuicConnection::Impl::SendStreamData(uint64_t stream_id, const uint8_t* dat
     //=========================================================================
     // Normal Mode: build packet with STREAM frame (optionally piggyback ACK)
     //=========================================================================
-    quic::BufferWriter writer(frame_buf_, sizeof(frame_buf_));
+    quic::BufferWriter writer(frame_buf_.data(), frame_buf_.size());
 
     // First, add ACK and pending control frames (non-retransmittable)
     // Add ACK frame if needed
@@ -2544,13 +2544,13 @@ bool QuicConnection::Impl::SendStreamData(uint64_t stream_id, const uint8_t* dat
 
     // Save ONLY the STREAM frame data for retransmission (not ACK/control frames)
     size_t stream_frame_len = writer.Offset() - stream_frame_start;
-    Http3Vector<uint8_t> frame_copy(frame_buf_ + stream_frame_start,
-                                    frame_buf_ + stream_frame_start + stream_frame_len);
+    Http3Vector<uint8_t> frame_copy(frame_buf_.data() + stream_frame_start,
+                                    frame_buf_.data() + stream_frame_start + stream_frame_len);
 
     // Build 1-RTT packet
     uint64_t pn = app_tracker_.AllocatePacketNumber();
-    size_t packet_len = quic::Build1RttPacket(dcid_, pn, false, crypto_.GetKeyPhase() != 0, frame_buf_, writer.Offset(),
-                                              crypto_.GetClientAppSecrets(), packet_buf_, sizeof(packet_buf_));
+    size_t packet_len = quic::Build1RttPacket(dcid_, pn, false, crypto_.GetKeyPhase() != 0, frame_buf_.data(), writer.Offset(),
+                                              crypto_.GetClientAppSecrets(), packet_buf_.data(), packet_buf_.size());
 
     if (packet_len == 0) {
         return false;
@@ -2563,7 +2563,7 @@ bool QuicConnection::Impl::SendStreamData(uint64_t stream_id, const uint8_t* dat
     // Update flow control
     flow_controller_.OnStreamBytesSent(stream_id, len);
 
-    return SendPacket(packet_buf_, packet_len);
+    return SendPacket(packet_buf_.data(), packet_len);
 }
 
 //=============================================================================
@@ -2726,7 +2726,7 @@ int QuicConnection::Impl::SendRequest(const std::string& method, const std::stri
         return -1;
     }
 
-    std::vector<uint8_t> body_vec;
+    Http3Vector<uint8_t> body_vec;
     if (body && body_len > 0) {
         body_vec.assign(body, body + body_len);
     }
@@ -2756,8 +2756,8 @@ int QuicConnection::Impl::OpenStream(const std::string& method, const std::strin
     flow_controller_.CreateStream(static_cast<uint64_t>(stream_id), peer_params_.initial_max_stream_data_bidi_local);
 
     // Build and send HEADERS frame only (use pre-allocated member buffers)
-    size_t qpack_len = h3::BuildQpackRequestHeaders(method, path, config_.hostname, "https", headers, payload_buf_,
-                                                    sizeof(payload_buf_));
+    size_t qpack_len = h3::BuildQpackRequestHeaders(method, path, config_.hostname, "https", headers, payload_buf_.data(),
+                                                    payload_buf_.size());
 
     if (qpack_len == 0) {
         return -1;
@@ -2766,8 +2766,8 @@ int QuicConnection::Impl::OpenStream(const std::string& method, const std::strin
     // Build HEADERS frame directly into frame_buf_
     // Note: h3::BuildHeadersFrame needs the data as a vector, so we create a
     // lightweight view
-    std::vector<uint8_t> h3_frame_buf(1200);
-    std::vector<uint8_t> encoded(payload_buf_, payload_buf_ + qpack_len);
+    Http3Vector<uint8_t> h3_frame_buf(1200);
+    Http3Vector<uint8_t> encoded(payload_buf_.data(), payload_buf_.data() + qpack_len);
     size_t hf_len = h3::BuildHeadersFrame(encoded, h3_frame_buf.data(), h3_frame_buf.size());
 
     if (hf_len == 0 || !SendStreamData(static_cast<uint64_t>(stream_id), h3_frame_buf.data(), hf_len, false)) {
@@ -2797,14 +2797,14 @@ ssize_t QuicConnection::Impl::WriteStream(int stream_id, const uint8_t* data, si
 
     // Build DATA frame (use payload_buf_ as temp buffer, SendStreamData uses
     // frame_buf_)
-    size_t frame_len = h3::BuildDataFrame(data, actual_len, payload_buf_, sizeof(payload_buf_));
+    size_t frame_len = h3::BuildDataFrame(data, actual_len, payload_buf_.data(), payload_buf_.size());
     if (frame_len == 0) {
         ESP_LOGE(TAG, "WriteStream failed: BuildDataFrame returned 0 (len=%zu, buf_size=%zu)", actual_len,
-                 sizeof(payload_buf_));
+                 payload_buf_.size());
         return -1;  // Error
     }
 
-    bool result = SendStreamData(static_cast<uint64_t>(stream_id), payload_buf_, frame_len, false);
+    bool result = SendStreamData(static_cast<uint64_t>(stream_id), payload_buf_.data(), frame_len, false);
     if (!result) {
         ESP_LOGE(TAG,
                  "WriteStream failed: SendStreamData returned false (stream_id=%d, "
@@ -2859,7 +2859,7 @@ bool QuicConnection::Impl::ResetStream(int stream_id, uint64_t error_code) {
     // Build both RESET_STREAM and STOP_SENDING frames in the same packet
     // RESET_STREAM: tells peer we won't send more data
     // STOP_SENDING: tells peer to stop sending data to us
-    quic::BufferWriter writer(frame_buf_, sizeof(frame_buf_));
+    quic::BufferWriter writer(frame_buf_.data(), frame_buf_.size());
 
     if (!quic::BuildResetStreamFrame(&writer, sid, error_code, final_size)) {
         ESP_LOGE(TAG, "ResetStream: failed to build RESET_STREAM frame");
@@ -2873,8 +2873,8 @@ bool QuicConnection::Impl::ResetStream(int stream_id, uint64_t error_code) {
 
     // Build 1-RTT packet and send
     uint64_t pn = app_tracker_.AllocatePacketNumber();
-    size_t packet_len = quic::Build1RttPacket(dcid_, pn, false, crypto_.GetKeyPhase() != 0, frame_buf_, writer.Offset(),
-                                              crypto_.GetClientAppSecrets(), packet_buf_, sizeof(packet_buf_));
+    size_t packet_len = quic::Build1RttPacket(dcid_, pn, false, crypto_.GetKeyPhase() != 0, frame_buf_.data(), writer.Offset(),
+                                              crypto_.GetClientAppSecrets(), packet_buf_.data(), packet_buf_.size());
 
     if (packet_len == 0) {
         ESP_LOGE(TAG, "ResetStream: failed to build 1-RTT packet");
@@ -2893,7 +2893,7 @@ bool QuicConnection::Impl::ResetStream(int stream_id, uint64_t error_code) {
              "error=0x%llx, final_size=%llu",
              stream_id, (unsigned long long)error_code, (unsigned long long)final_size);
 
-    return SendPacket(packet_buf_, packet_len);
+    return SendPacket(packet_buf_.data(), packet_len);
 }
 
 //=============================================================================
@@ -2952,7 +2952,7 @@ void QuicConnection::Impl::RetransmitLostPackets(const std::vector<SentPacketInf
         uint64_t new_pn = app_tracker_.AllocatePacketNumber();
         size_t packet_len =
             quic::Build1RttPacket(dcid_, new_pn, false, crypto_.GetKeyPhase() != 0, pkt->frames.data(),
-                                  pkt->frames.size(), crypto_.GetClientAppSecrets(), packet_buf_, sizeof(packet_buf_));
+                                  pkt->frames.size(), crypto_.GetClientAppSecrets(), packet_buf_.data(), packet_buf_.size());
 
         if (packet_len == 0) {
             ESP_LOGW(TAG, "Failed to build retransmit packet");
@@ -2966,7 +2966,7 @@ void QuicConnection::Impl::RetransmitLostPackets(const std::vector<SentPacketInf
         app_tracker_.OnPacketSent(new_pn, current_time_us_, packet_len, true, std::move(frame_copy), pkt->stream_id);
         loss_detector_.OnPacketSent(new_pn, current_time_us_, packet_len, true);
 
-        SendPacket(packet_buf_, packet_len);
+        SendPacket(packet_buf_.data(), packet_len);
     }
 }
 
@@ -2999,7 +2999,7 @@ void QuicConnection::Impl::HandlePto() {
             uint64_t pn = handshake_tracker_.AllocatePacketNumber();
             size_t packet_len =
                 quic::BuildHandshakePacket(dcid_, scid_, pn, frames, writer.Offset(),
-                                           crypto_.GetClientHandshakeSecrets(), packet_buf_, sizeof(packet_buf_));
+                                           crypto_.GetClientHandshakeSecrets(), packet_buf_.data(), packet_buf_.size());
 
             if (packet_len > 0) {
                 handshake_tracker_.OnPacketSent(pn, current_time_us_, packet_len, true);
@@ -3007,7 +3007,7 @@ void QuicConnection::Impl::HandlePto() {
                 if (has_ack) {
                     handshake_ack_mgr_.OnAckSent();
                 }
-                SendPacket(packet_buf_, packet_len);
+                SendPacket(packet_buf_.data(), packet_len);
             }
         } else {
             // Still in Initial phase - retransmit ClientHello
@@ -3060,14 +3060,14 @@ void QuicConnection::Impl::SendPtoProbe() {
         uint64_t new_pn = app_tracker_.AllocatePacketNumber();
         size_t packet_len = quic::Build1RttPacket(dcid_, new_pn, false, crypto_.GetKeyPhase() != 0,
                                                   oldest_with_data->frames.data(), oldest_with_data->frames.size(),
-                                                  crypto_.GetClientAppSecrets(), packet_buf_, sizeof(packet_buf_));
+                                                  crypto_.GetClientAppSecrets(), packet_buf_.data(), packet_buf_.size());
 
         if (packet_len > 0) {
             Http3Vector<uint8_t> frame_copy = oldest_with_data->frames;
             app_tracker_.OnPacketSent(new_pn, current_time_us_, packet_len, true, std::move(frame_copy),
                                       oldest_with_data->stream_id);
             loss_detector_.OnPacketSent(new_pn, current_time_us_, packet_len, true);
-            SendPacket(packet_buf_, packet_len);
+            SendPacket(packet_buf_.data(), packet_len);
         }
     } else {
         // No data to retransmit - check if we have any unacked ack-eliciting
@@ -3091,12 +3091,12 @@ void QuicConnection::Impl::SendPtoProbe() {
         uint8_t ping_frame[1] = {0x01};  // PING frame
         uint64_t pn = app_tracker_.AllocatePacketNumber();
         size_t packet_len = quic::Build1RttPacket(dcid_, pn, false, crypto_.GetKeyPhase() != 0, ping_frame, 1,
-                                                  crypto_.GetClientAppSecrets(), packet_buf_, sizeof(packet_buf_));
+                                                  crypto_.GetClientAppSecrets(), packet_buf_.data(), packet_buf_.size());
 
         if (packet_len > 0) {
             app_tracker_.OnPacketSent(pn, current_time_us_, packet_len, true);
             loss_detector_.OnPacketSent(pn, current_time_us_, packet_len, true);
-            SendPacket(packet_buf_, packet_len);
+            SendPacket(packet_buf_.data(), packet_len);
         }
     }
 }
@@ -3122,13 +3122,13 @@ void QuicConnection::Impl::SendHandshakePtoProbe() {
         uint64_t new_pn = handshake_tracker_.AllocatePacketNumber();
         size_t packet_len =
             quic::BuildHandshakePacket(dcid_, scid_, new_pn, pkt->frames.data(), pkt->frames.size(),
-                                       crypto_.GetClientHandshakeSecrets(), packet_buf_, sizeof(packet_buf_));
+                                       crypto_.GetClientHandshakeSecrets(), packet_buf_.data(), packet_buf_.size());
 
         if (packet_len > 0) {
             Http3Vector<uint8_t> frame_copy = pkt->frames;
             handshake_tracker_.OnPacketSent(new_pn, current_time_us_, packet_len, true, std::move(frame_copy));
             loss_detector_.OnPacketSent(new_pn, current_time_us_, packet_len, true);
-            SendPacket(packet_buf_, packet_len);
+            SendPacket(packet_buf_.data(), packet_len);
 
             if (config_.enable_debug) {
                 ESP_LOGI(TAG, "Retransmitted Handshake packet, new PN=%llu", (unsigned long long)new_pn);
@@ -3443,15 +3443,15 @@ bool QuicConnection::Impl::SendRetireConnectionId(uint64_t sequence_number) {
     }
 
     // Build RETIRE_CONNECTION_ID frame
-    quic::BufferWriter writer(frame_buf_, sizeof(frame_buf_));
+    quic::BufferWriter writer(frame_buf_.data(), frame_buf_.size());
     if (!quic::BuildRetireConnectionIdFrame(&writer, sequence_number)) {
         return false;
     }
 
     // Build 1-RTT packet
     uint64_t pn = app_tracker_.AllocatePacketNumber();
-    size_t packet_len = quic::Build1RttPacket(dcid_, pn, false, crypto_.GetKeyPhase() != 0, frame_buf_, writer.Offset(),
-                                              crypto_.GetClientAppSecrets(), packet_buf_, sizeof(packet_buf_));
+    size_t packet_len = quic::Build1RttPacket(dcid_, pn, false, crypto_.GetKeyPhase() != 0, frame_buf_.data(), writer.Offset(),
+                                              crypto_.GetClientAppSecrets(), packet_buf_.data(), packet_buf_.size());
 
     if (packet_len == 0) {
         return false;
@@ -3462,7 +3462,7 @@ bool QuicConnection::Impl::SendRetireConnectionId(uint64_t sequence_number) {
     }
 
     app_tracker_.OnPacketSent(pn, current_time_us_, packet_len, true);
-    return SendPacket(packet_buf_, packet_len);
+    return SendPacket(packet_buf_.data(), packet_len);
 }
 
 bool QuicConnection::Impl::SendNewConnectionId() {
@@ -3510,22 +3510,22 @@ bool QuicConnection::Impl::SendNewConnectionId() {
     //=========================================================================
     // Normal Mode: build and send immediately
     //=========================================================================
-    quic::BufferWriter writer(frame_buf_, sizeof(frame_buf_));
+    quic::BufferWriter writer(frame_buf_.data(), frame_buf_.size());
     if (!quic::BuildNewConnectionIdFrame(&writer, seq, 0, info.cid, info.stateless_reset_token)) {
         return false;
     }
 
     // Build 1-RTT packet
     uint64_t pn = app_tracker_.AllocatePacketNumber();
-    size_t packet_len = quic::Build1RttPacket(dcid_, pn, false, crypto_.GetKeyPhase() != 0, frame_buf_, writer.Offset(),
-                                              crypto_.GetClientAppSecrets(), packet_buf_, sizeof(packet_buf_));
+    size_t packet_len = quic::Build1RttPacket(dcid_, pn, false, crypto_.GetKeyPhase() != 0, frame_buf_.data(), writer.Offset(),
+                                              crypto_.GetClientAppSecrets(), packet_buf_.data(), packet_buf_.size());
 
     if (packet_len == 0) {
         return false;
     }
 
     app_tracker_.OnPacketSent(pn, current_time_us_, packet_len, true);
-    return SendPacket(packet_buf_, packet_len);
+    return SendPacket(packet_buf_.data(), packet_len);
 }
 
 quic::ConnectionId* QuicConnection::Impl::GetActivePeerConnectionId() {
@@ -3578,19 +3578,19 @@ void QuicConnection::Impl::OnFramePathChallenge(const uint8_t* data) {
     }
 
     // Build PATH_RESPONSE frame
-    quic::BufferWriter writer(frame_buf_, sizeof(frame_buf_));
+    quic::BufferWriter writer(frame_buf_.data(), frame_buf_.size());
     if (!quic::BuildPathResponseFrame(&writer, data)) {
         return;
     }
 
     // Build 1-RTT packet
     uint64_t pn = app_tracker_.AllocatePacketNumber();
-    size_t packet_len = quic::Build1RttPacket(dcid_, pn, false, crypto_.GetKeyPhase() != 0, frame_buf_, writer.Offset(),
-                                              crypto_.GetClientAppSecrets(), packet_buf_, sizeof(packet_buf_));
+    size_t packet_len = quic::Build1RttPacket(dcid_, pn, false, crypto_.GetKeyPhase() != 0, frame_buf_.data(), writer.Offset(),
+                                              crypto_.GetClientAppSecrets(), packet_buf_.data(), packet_buf_.size());
 
     if (packet_len > 0) {
         app_tracker_.OnPacketSent(pn, current_time_us_, packet_len, true);
-        SendPacket(packet_buf_, packet_len);
+        SendPacket(packet_buf_.data(), packet_len);
     }
 }
 
@@ -3660,15 +3660,15 @@ bool QuicConnection::Impl::SendPathChallenge() {
     path_validated_ = false;
 
     // Build PATH_CHALLENGE frame
-    quic::BufferWriter writer(frame_buf_, sizeof(frame_buf_));
+    quic::BufferWriter writer(frame_buf_.data(), frame_buf_.size());
     if (!quic::BuildPathChallengeFrame(&writer, path_challenge_data_)) {
         return false;
     }
 
     // Build 1-RTT packet
     uint64_t pn = app_tracker_.AllocatePacketNumber();
-    size_t packet_len = quic::Build1RttPacket(dcid_, pn, false, crypto_.GetKeyPhase() != 0, frame_buf_, writer.Offset(),
-                                              crypto_.GetClientAppSecrets(), packet_buf_, sizeof(packet_buf_));
+    size_t packet_len = quic::Build1RttPacket(dcid_, pn, false, crypto_.GetKeyPhase() != 0, frame_buf_.data(), writer.Offset(),
+                                              crypto_.GetClientAppSecrets(), packet_buf_.data(), packet_buf_.size());
 
     if (packet_len == 0) {
         return false;
@@ -3679,7 +3679,7 @@ bool QuicConnection::Impl::SendPathChallenge() {
     }
 
     app_tracker_.OnPacketSent(pn, current_time_us_, packet_len, true);
-    return SendPacket(packet_buf_, packet_len);
+    return SendPacket(packet_buf_.data(), packet_len);
 }
 
 //=============================================================================
@@ -3782,7 +3782,7 @@ void QuicConnection::Impl::SendMigrationPathChallenge() {
     migration_challenge_sent_time_us_ = current_time_us_;
 
     // Build PATH_CHALLENGE frame
-    quic::BufferWriter writer(frame_buf_, sizeof(frame_buf_));
+    quic::BufferWriter writer(frame_buf_.data(), frame_buf_.size());
     if (!quic::BuildPathChallengeFrame(&writer, migration_challenge_data_)) {
         CompleteMigration(false);
         return;
@@ -3790,8 +3790,8 @@ void QuicConnection::Impl::SendMigrationPathChallenge() {
 
     // Build 1-RTT packet with NEW destination CID
     uint64_t pn = app_tracker_.AllocatePacketNumber();
-    size_t packet_len = quic::Build1RttPacket(dcid_, pn, false, crypto_.GetKeyPhase() != 0, frame_buf_, writer.Offset(),
-                                              crypto_.GetClientAppSecrets(), packet_buf_, sizeof(packet_buf_));
+    size_t packet_len = quic::Build1RttPacket(dcid_, pn, false, crypto_.GetKeyPhase() != 0, frame_buf_.data(), writer.Offset(),
+                                              crypto_.GetClientAppSecrets(), packet_buf_.data(), packet_buf_.size());
 
     if (packet_len == 0) {
         CompleteMigration(false);
@@ -3804,7 +3804,7 @@ void QuicConnection::Impl::SendMigrationPathChallenge() {
     }
 
     app_tracker_.OnPacketSent(pn, current_time_us_, packet_len, true);
-    SendPacket(packet_buf_, packet_len);
+    SendPacket(packet_buf_.data(), packet_len);
 }
 
 void QuicConnection::Impl::CompleteMigration(bool success) {
@@ -3898,15 +3898,15 @@ bool QuicConnection::Impl::SendDatagram(const uint8_t* data, size_t len) {
     }
 
     // Build DATAGRAM frame
-    quic::BufferWriter writer(frame_buf_, sizeof(frame_buf_));
+    quic::BufferWriter writer(frame_buf_.data(), frame_buf_.size());
     if (!quic::BuildDatagramFrame(&writer, data, len, true)) {
         return false;
     }
 
     // Build 1-RTT packet
     uint64_t pn = app_tracker_.AllocatePacketNumber();
-    size_t packet_len = quic::Build1RttPacket(dcid_, pn, false, crypto_.GetKeyPhase() != 0, frame_buf_, writer.Offset(),
-                                              crypto_.GetClientAppSecrets(), packet_buf_, sizeof(packet_buf_));
+    size_t packet_len = quic::Build1RttPacket(dcid_, pn, false, crypto_.GetKeyPhase() != 0, frame_buf_.data(), writer.Offset(),
+                                              crypto_.GetClientAppSecrets(), packet_buf_.data(), packet_buf_.size());
 
     if (packet_len == 0) {
         return false;
@@ -3918,7 +3918,7 @@ bool QuicConnection::Impl::SendDatagram(const uint8_t* data, size_t len) {
 
     // Track sent packet (but DATAGRAM is NOT retransmitted on loss)
     app_tracker_.OnPacketSent(pn, current_time_us_, packet_len, true);
-    return SendPacket(packet_buf_, packet_len);
+    return SendPacket(packet_buf_.data(), packet_len);
 }
 
 size_t QuicConnection::Impl::GetMaxDatagramSize() const {

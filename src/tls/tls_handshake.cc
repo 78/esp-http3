@@ -3,6 +3,7 @@
  * @brief TLS 1.3 Handshake Messages Implementation
  */
 
+#include "esp_http3_memory.h"
 #include "tls/tls_handshake.h"
 #include "quic/quic_crypto.h"
 #include "quic/quic_frame.h"
@@ -37,12 +38,12 @@ static bool WriteExtension(BufferWriter* w, ExtensionType type, const uint8_t* d
 size_t BuildClientHello(const std::string& hostname, const uint8_t* client_random, const uint8_t* x25519_public_key,
                         const quic::TransportParameters& transport_params, uint8_t* out, size_t out_len) {
     // Build extensions first
-    std::vector<uint8_t> extensions(1024);
+    Http3Vector<uint8_t> extensions(1024);
     BufferWriter ext_writer(extensions.data(), extensions.size());
 
     // 1. SNI extension
     {
-        std::vector<uint8_t> sni_data(256);
+        Http3Vector<uint8_t> sni_data(256);
         BufferWriter sni(sni_data.data(), sni_data.size());
 
         // Server Name List length (2 bytes) - will fill later
@@ -134,7 +135,7 @@ size_t BuildClientHello(const std::string& hostname, const uint8_t* client_rando
 
     // 7. QUIC Transport Parameters extension
     {
-        std::vector<uint8_t> tp_data(256);
+        Http3Vector<uint8_t> tp_data(256);
         size_t tp_len = quic::BuildTransportParameters(transport_params, tp_data.data(), tp_data.size());
         if (tp_len == 0) {
             return 0;
@@ -223,12 +224,12 @@ size_t BuildClientHelloWithPsk(const std::string& hostname, const uint8_t* clien
     }
 
     // Build extensions first (same as BuildClientHello, plus PSK extensions)
-    std::vector<uint8_t> extensions(2048);  // Larger buffer for PSK
+    Http3Vector<uint8_t> extensions(2048);  // Larger buffer for PSK
     BufferWriter ext_writer(extensions.data(), extensions.size());
 
     // 1. SNI extension
     {
-        std::vector<uint8_t> sni_data(256);
+        Http3Vector<uint8_t> sni_data(256);
         BufferWriter sni(sni_data.data(), sni_data.size());
         size_t list_len_pos = sni.Offset();
         sni.WriteUint16(0);
@@ -292,7 +293,7 @@ size_t BuildClientHelloWithPsk(const std::string& hostname, const uint8_t* clien
 
     // 7. QUIC Transport Parameters extension
     {
-        std::vector<uint8_t> tp_data(256);
+        Http3Vector<uint8_t> tp_data(256);
         size_t tp_len = quic::BuildTransportParameters(transport_params, tp_data.data(), tp_data.size());
         if (tp_len == 0) {
             return 0;
@@ -321,7 +322,7 @@ size_t BuildClientHelloWithPsk(const std::string& hostname, const uint8_t* clien
     // 3. Compute binder using binder_key
 
     // First, build the pre_shared_key extension structure (without binder value)
-    std::vector<uint8_t> psk_ext_data(512);
+    Http3Vector<uint8_t> psk_ext_data(512);
     BufferWriter psk_writer(psk_ext_data.data(), psk_ext_data.size());
 
     // Identities
