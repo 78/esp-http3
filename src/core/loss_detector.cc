@@ -227,6 +227,17 @@ void LossDetector::OnAckReceived(uint64_t largest_acked, uint64_t ack_delay_us,
     }
     
     if (!lost_packets.empty() && on_loss_) {
+        // Retransmission appends to (and may compact) the tracker's vector.
+        // Own the lost frames before invoking the callback, so every pointer
+        // stays valid even after its first retransmitted packet is tracked.
+        Http3Vector<SentPacketInfo> lost_storage;
+        lost_storage.reserve(lost_packets.size());
+        for (auto* pkt : lost_packets) {
+            lost_storage.push_back(std::move(*pkt));
+        }
+        for (size_t i = 0; i < lost_packets.size(); ++i) {
+            lost_packets[i] = &lost_storage[i];
+        }
         on_loss_(lost_packets);
     }
     
@@ -306,4 +317,3 @@ uint64_t LossDetector::GetTimeUntilNextPto(uint64_t current_time_us) const {
 }
 
 } // namespace esp_http3
-

@@ -212,12 +212,12 @@ private:
     void OnWriteReset(const std::string& error_message);
 
     // Called by Http3AsyncClient during destruction to invalidate client pointer
-    void InvalidateClient();
+    void InvalidateClient(const std::string& error_message = "Client destroyed");
 
     void NotifyReadReady();
 
 private:
-    Http3AsyncClient* client_;
+    std::atomic<Http3AsyncClient*> client_;
     int stream_id_;
     uint32_t default_timeout_ms_;
 
@@ -242,6 +242,8 @@ private:
     size_t receive_tail_ = 0;   // Write position
     size_t receive_count_ = 0;  // Bytes in buffer
     std::mutex receive_mutex_;
+    // Serializes client detachment with Close() event-group destruction.
+    std::mutex lifecycle_mutex_;
 
     // Synchronization events
     EventGroupHandle_t event_group_ = nullptr;
@@ -516,15 +518,17 @@ private:
     friend class Http3Stream;
 
     void RegisterStream(int stream_id, Http3Stream* stream);
-    void UnregisterStream(int stream_id);
-    Http3Stream* GetStream(int stream_id);
+    // The connection lock must be held while validating a stream instance.
+    bool IsRegisteredStream(int stream_id, const Http3Stream* stream);
+    bool StreamWrite(int stream_id, esp_http3::Http3Vector<uint8_t>&& data, const Http3Stream* stream);
+    bool StreamFinish(int stream_id, const Http3Stream* stream);
 
     // Called by Http3Stream
     // @param force_reset If true, send RESET_STREAM (for abnormal termination
     // like timeout/cancel)
     //                    If false, just cleanup (for normal completion)
-    void StreamClose(int stream_id, bool force_reset = false);
-    void StreamAcknowledgeData(int stream_id, size_t bytes);
+    void StreamClose(int stream_id, const Http3Stream* stream, bool force_reset = false);
+    void StreamAcknowledgeData(int stream_id, size_t bytes, const Http3Stream* stream);
 
     // Connection management
     bool EnsureConnected(uint32_t timeout_ms = 0);

@@ -22,6 +22,7 @@
 #include "quic/quic_packet.h"
 #include "tls/tls_handshake.h"
 
+#include <algorithm>
 #include <cstring>
 #include <esp_log.h>
 #include <esp_random.h>
@@ -270,6 +271,7 @@ private:
     void OnFrameConnectionClose(const ConnectionCloseData& data);
     void OnFrameHandshakeDone();
     void OnFrameNewConnectionId(const NewConnectionIdData& data);
+    void OnFrameRetireConnectionId(uint64_t sequence_number);
     void OnFramePathChallenge(const uint8_t* data);
     void OnFramePathResponse(const uint8_t* data);
     void OnFrameDatagram(const uint8_t* data, size_t len);
@@ -296,6 +298,9 @@ private:
     void RetirePeerConnectionIdsPriorTo(uint64_t retire_prior_to);
     bool SendRetireConnectionId(uint64_t sequence_number);
     bool SendNewConnectionId();
+    void InitializeLocalConnectionIds();
+    void EnsureLocalConnectionIdSupply();
+    void PruneRetiredConnectionIdFrames(Http3Vector<uint8_t>& frames);
     quic::ConnectionId* GetActivePeerConnectionId();
     bool IsStatelessReset(const uint8_t* data, size_t len);
 
@@ -352,7 +357,10 @@ private:
         uint8_t stateless_reset_token[16];
     };
     std::map<uint64_t, LocalConnectionIdInfo> local_connection_ids_;
-    uint64_t local_cid_sequence_ = 0;  // Next sequence number for NEW_CONNECTION_ID
+    uint64_t local_cid_sequence_ = 0;  // Highest issued local CID sequence
+    quic::ConnectionId received_dcid_;
+    uint64_t received_packet_number_ = 0;
+    bool processing_1rtt_packet_ = false;
 
     // Crypto manager (replaces scattered crypto state)
     CryptoManager crypto_;
@@ -477,11 +485,13 @@ private:
             size_t frame_len;    // Length of frame
         };
         std::vector<StreamFrameInfo> stream_frames;
+        Http3Vector<uint8_t> control_frames;
 
         void Reset() {
             active = false;
             writer = nullptr;
             stream_frames.clear();
+            control_frames.clear();
         }
     };
     BatchState batch_state_;
@@ -574,6 +584,7 @@ bool QuicConnection::Impl::StartHandshake() {
     // Generate connection IDs
     GenerateRandom(scid_.data.data(), 8);
     scid_.length = 8;
+    InitializeLocalConnectionIds();
     GenerateRandom(dcid_.data.data(), 8);
     dcid_.length = 8;
     initial_dcid_ = dcid_;
@@ -1142,6 +1153,7 @@ bool QuicConnection::Impl::Process1RttPacket(uint8_t* data, size_t len) {
     }
 
     const bool ack_eliciting = HasAckElicitingFrames(payload_buf_.data(), payload_len);
+    const bool duplicate_packet = app_ack_mgr_.HasReceivedPacket(info.packet_number);
     app_ack_mgr_.OnPacketReceived(info.packet_number, current_time_us_, ack_eliciting);
 
     // Only schedule an ACK if the packet contains ACK-eliciting frames
@@ -1154,7 +1166,13 @@ bool QuicConnection::Impl::Process1RttPacket(uint8_t* data, size_t len) {
         }
     }
 
+    if (duplicate_packet) return true;
+
+    received_dcid_ = info.short_header.dcid;
+    received_packet_number_ = info.packet_number;
+    processing_1rtt_packet_ = true;
     ProcessFrames(payload_buf_.data(), payload_len, quic::PacketType::k1Rtt);
+    processing_1rtt_packet_ = false;
 
     return true;
 }
@@ -1324,6 +1342,33 @@ void QuicConnection::Impl::ProcessFrames(const uint8_t* data, size_t len, quic::
                 ESP_LOGI(TAG, "[RecvFrame] [%s] Frame: NEW_CONNECTION_ID", pkt_type_str);
             }
             ProcessNewConnectionIdFrame(&reader);
+        } else if (frame_type == 0x19) {
+            uint64_t sequence_number;
+            if (pkt_type != quic::PacketType::k1Rtt) {
+                Close(0x0a, "RETIRE_CONNECTION_ID outside 1-RTT");
+                return;
+            }
+            if (!reader.ReadVarint(&sequence_number)) {
+                Close(0x07, "truncated RETIRE_CONNECTION_ID");
+                return;
+            }
+            OnFrameRetireConnectionId(sequence_number);
+            if (state_ == ConnectionState::kClosed) return;
+        } else if (frame_type == 0x1a || frame_type == 0x1b) {
+            uint8_t path_data[8];
+            if (pkt_type != quic::PacketType::k1Rtt) {
+                Close(0x0a, "path validation frame outside 1-RTT");
+                return;
+            }
+            if (!reader.ReadBytes(path_data, sizeof(path_data))) {
+                Close(0x07, "truncated path validation frame");
+                return;
+            }
+            if (frame_type == 0x1a) {
+                OnFramePathChallenge(path_data);
+            } else {
+                OnFramePathResponse(path_data);
+            }
         } else if (frame_type == 0x1c) {
             // CONNECTION_CLOSE
             if (config_.enable_debug) {
@@ -1893,19 +1938,9 @@ bool QuicConnection::Impl::SendClientFinished() {
     // Update transcript with our Finished
     crypto_.UpdateTranscript(finished_msg, finished_len);
 
-    // Build Handshake frames first: ACK (if needed) + CRYPTO (Client Finished)
+    // Reserve room for Client Finished before adding an optional ACK.
     uint8_t hs_frames[128];
     quic::BufferWriter hs_writer(hs_frames, sizeof(hs_frames));
-
-    // Add Handshake ACK if we have pending acknowledgments
-    if (handshake_ack_mgr_.HasPendingAck()) {
-        if (handshake_ack_mgr_.BuildAckFrame(&hs_writer, current_time_us_)) {
-            handshake_ack_mgr_.OnAckSent();
-            if (config_.enable_debug) {
-                ESP_LOGD(TAG, "SendClientFinished: piggybacked Handshake ACK");
-            }
-        }
-    }
 
     // Add CRYPTO frame with Client Finished
     if (!quic::BuildCryptoFrame(&hs_writer, 0, finished_msg, finished_len)) {
@@ -1913,14 +1948,17 @@ bool QuicConnection::Impl::SendClientFinished() {
         return false;
     }
 
+    bool has_handshake_ack = handshake_ack_mgr_.HasPendingAck() &&
+                             handshake_ack_mgr_.BuildAckFrame(&hs_writer, current_time_us_);
+
     // RFC 9000 Section 12.2 + 14.1: Coalesce Initial ACK + Handshake into one
     // datagram UDP datagrams carrying Initial packets MUST be >= 1200 bytes
     size_t total_len = 0;
-    bool has_initial = initial_ack_mgr_.HasPendingAck();
+    bool has_initial = false;
 
     // 1. Build Initial ACK packet (if needed, must come first in coalesced
     // datagram)
-    if (has_initial) {
+    if (initial_ack_mgr_.HasPendingAck()) {
         uint8_t ack_frames[64];
         quic::BufferWriter ack_writer(ack_frames, sizeof(ack_frames));
         if (initial_ack_mgr_.BuildAckFrame(&ack_writer, current_time_us_)) {
@@ -1932,7 +1970,7 @@ bool QuicConnection::Impl::SendClientFinished() {
                 0);  // No internal padding needed
             if (ack_packet_len > 0) {
                 initial_tracker_.OnPacketSent(ack_pn, current_time_us_, ack_packet_len, false);
-                initial_ack_mgr_.OnAckSent();
+                has_initial = true;
                 total_len += ack_packet_len;
                 if (config_.enable_debug) {
                     ESP_LOGI(TAG, "[SendFrame] Initial ACK, PN=%llu, len=%zu (coalesced)", (unsigned long long)ack_pn,
@@ -1979,6 +2017,8 @@ bool QuicConnection::Impl::SendClientFinished() {
 
     bool ok = SendPacket(packet_buf_.data(), total_len);
     if (ok) {
+        if (has_handshake_ack) handshake_ack_mgr_.OnAckSent();
+        if (has_initial) initial_ack_mgr_.OnAckSent();
         state_ = ConnectionState::kConnected;
     }
     return ok;
@@ -2096,11 +2136,19 @@ void QuicConnection::Impl::ProcessHandshakeDoneFrame() {
         // Send SETTINGS (creates control stream + QPACK streams, all go into batch)
         h3_handler_->SendSettings();
 
-        // Send our first alternative connection ID (also goes into batch)
-        SendNewConnectionId();
+        // Keep spare CIDs available for the server to validate a changed path.
+        EnsureLocalConnectionIdSupply();
+        if (state_ == ConnectionState::kClosed) {
+            delete batch_state_.writer;
+            batch_state_.Reset();
+            return;
+        }
 
         // Send all accumulated frames in one packet
-        EndBatch();
+        if (!EndBatch()) {
+            Close(0x01, "failed to send HTTP/3 initialization");
+            return;
+        }
 
         h3_initialized_ = true;
     }
@@ -2388,14 +2436,15 @@ bool QuicConnection::Impl::SendAckIfNeeded(quic::PacketType pkt_type) {
     }
 
     tracker->OnPacketSent(pn, current_time_us_, packet_len, false);
-    ack_mgr->OnAckSent();
 
     if (config_.enable_debug) {
         ESP_LOGI(TAG, "[SendFrame] ACK packet, type=%d, PN=%llu, len=%zu", static_cast<int>(pkt_type),
                  (unsigned long long)pn, packet_len);
     }
 
-    return SendPacket(packet.data(), packet_len);
+    bool ok = SendPacket(packet.data(), packet_len);
+    if (ok) ack_mgr->OnAckSent();
+    return ok;
 }
 
 void QuicConnection::Impl::SendCoalescedAcks() {
@@ -2426,11 +2475,12 @@ void QuicConnection::Impl::SendCoalescedAcks() {
                                    packet_buf_.data(), packet_buf_.size());
     if (packet_len > 0) {
         handshake_tracker_.OnPacketSent(pn, current_time_us_, packet_len, false);
-        handshake_ack_mgr_.OnAckSent();
         if (config_.enable_debug) {
             ESP_LOGI(TAG, "[SendFrame] Handshake ACK, PN=%llu, len=%zu", (unsigned long long)pn, packet_len);
         }
-        SendPacket(packet_buf_.data(), packet_len);
+        if (SendPacket(packet_buf_.data(), packet_len)) {
+            handshake_ack_mgr_.OnAckSent();
+        }
     }
 }
 
@@ -2446,17 +2496,10 @@ void QuicConnection::Impl::BeginBatch() {
 
     batch_state_.Reset();
     batch_state_.active = true;
-    batch_state_.writer = new quic::BufferWriter(batch_frames_.data(), batch_frames_.size());
-
-    // Add ACK frame if needed (will be at the beginning of packet)
-    if (app_ack_mgr_.ShouldSendAck(current_time_us_)) {
-        if (app_ack_mgr_.BuildAckFrame(batch_state_.writer, current_time_us_)) {
-            app_ack_mgr_.OnAckSent();
-            if (config_.enable_debug) {
-                ESP_LOGD(TAG, "BeginBatch: added ACK frame");
-            }
-        }
-    }
+    // Leave space for the short header, a four-byte packet number and AEAD tag.
+    const size_t packet_overhead = 1 + dcid_.Length() + 4 + 16;
+    const size_t frame_capacity = std::min(batch_frames_.size(), packet_buf_.size() - packet_overhead);
+    batch_state_.writer = new quic::BufferWriter(batch_frames_.data(), frame_capacity);
 
     if (config_.enable_debug) {
         ESP_LOGD(TAG, "BeginBatch: started, control frames offset=%zu", batch_state_.writer->Offset());
@@ -2468,6 +2511,10 @@ bool QuicConnection::Impl::EndBatch() {
         ESP_LOGW(TAG, "EndBatch called without active batch");
         return false;
     }
+
+    // Append ACK last so it cannot consume room needed by the batch's data.
+    bool has_ack = batch_state_.writer && app_ack_mgr_.ShouldSendAck(current_time_us_) &&
+                   app_ack_mgr_.BuildAckFrame(batch_state_.writer, current_time_us_);
 
     if (!batch_state_.writer || batch_state_.writer->Offset() == 0) {
         // Nothing to send
@@ -2489,20 +2536,20 @@ bool QuicConnection::Impl::EndBatch() {
         return false;
     }
 
-    // Track the packet - if it has STREAM frames, it's ack-eliciting
+    // CID frames are reliable too, including those batched with H3 SETTINGS.
     bool has_stream_frames = !batch_state_.stream_frames.empty();
+    bool has_control_frames = !batch_state_.control_frames.empty();
 
-    if (has_stream_frames) {
-        // For retransmission, we need to save STREAM frame data
-        // Build a combined frames buffer for all STREAM frames
-        Http3Vector<uint8_t> stream_frames_copy;
+    if (has_stream_frames || has_control_frames) {
+        // Keep reliable control and STREAM frames, excluding the optional ACK.
+        Http3Vector<uint8_t> stream_frames_copy = batch_state_.control_frames;
         for (const auto& info : batch_state_.stream_frames) {
             stream_frames_copy.insert(stream_frames_copy.end(), batch_frames_.data() + info.frame_start,
                                       batch_frames_.data() + info.frame_start + info.frame_len);
         }
 
-        // Use first stream's ID for tracking (simplified, could be improved)
-        uint64_t primary_stream_id = batch_state_.stream_frames[0].stream_id;
+        // A cancelled request stream must not discard reliable CID frames.
+        uint64_t primary_stream_id = has_control_frames ? UINT64_MAX : batch_state_.stream_frames[0].stream_id;
         app_tracker_.OnPacketSent(pn, current_time_us_, packet_len, true, std::move(stream_frames_copy),
                                   primary_stream_id);
         loss_detector_.OnPacketSent(pn, current_time_us_, packet_len, true);
@@ -2516,6 +2563,7 @@ bool QuicConnection::Impl::EndBatch() {
     }
 
     bool ok = SendPacket(packet_buf_.data(), packet_len);
+    if (ok && has_ack) app_ack_mgr_.OnAckSent();
 
     delete batch_state_.writer;
     batch_state_.Reset();
@@ -2575,31 +2623,22 @@ bool QuicConnection::Impl::SendStreamData(uint64_t stream_id, const uint8_t* dat
     //=========================================================================
     // Normal Mode: build packet with STREAM frame (optionally piggyback ACK)
     //=========================================================================
-    quic::BufferWriter writer(frame_buf_.data(), frame_buf_.size());
+    // Leave space for the short header, a four-byte packet number and AEAD tag.
+    const size_t packet_overhead = 1 + dcid_.Length() + 4 + 16;
+    const size_t frame_capacity = std::min(frame_buf_.size(), packet_buf_.size() - packet_overhead);
+    quic::BufferWriter writer(frame_buf_.data(), frame_capacity);
 
-    // First, add ACK and pending control frames (non-retransmittable)
-    // Add ACK frame if needed
-    if (app_ack_mgr_.ShouldSendAck(current_time_us_)) {
-        if (app_ack_mgr_.BuildAckFrame(&writer, current_time_us_)) {
-            app_ack_mgr_.OnAckSent();
-            if (config_.enable_debug) {
-                ESP_LOGD(TAG, "SendStreamData: piggybacked ACK frame");
-            }
-        }
-    }
-
-    // Mark where STREAM frame starts (for retransmission tracking)
-    size_t stream_frame_start = writer.Offset();
-
-    // Now add the STREAM frame
+    // Write STREAM first so optional ACK ranges only use the remaining space.
     if (!quic::BuildStreamFrame(&writer, stream_id, offset, data, len, fin)) {
         return false;
     }
 
     // Save ONLY the STREAM frame data for retransmission (not ACK/control frames)
-    size_t stream_frame_len = writer.Offset() - stream_frame_start;
-    Http3Vector<uint8_t> frame_copy(frame_buf_.data() + stream_frame_start,
-                                    frame_buf_.data() + stream_frame_start + stream_frame_len);
+    size_t stream_frame_len = writer.Offset();
+    Http3Vector<uint8_t> frame_copy(frame_buf_.data(), frame_buf_.data() + stream_frame_len);
+
+    bool has_ack = app_ack_mgr_.ShouldSendAck(current_time_us_) &&
+                   app_ack_mgr_.BuildAckFrame(&writer, current_time_us_);
 
     // Build 1-RTT packet
     uint64_t pn = app_tracker_.AllocatePacketNumber();
@@ -2617,7 +2656,9 @@ bool QuicConnection::Impl::SendStreamData(uint64_t stream_id, const uint8_t* dat
     // Update flow control
     flow_controller_.OnStreamBytesSent(stream_id, len);
 
-    return SendPacket(packet_buf_.data(), packet_len);
+    bool ok = SendPacket(packet_buf_.data(), packet_len);
+    if (ok && has_ack) app_ack_mgr_.OnAckSent();
+    return ok;
 }
 
 //=============================================================================
@@ -2989,6 +3030,7 @@ void QuicConnection::Impl::RetransmitLostPackets(const std::vector<SentPacketInf
     }
 
     for (auto* pkt : lost_packets) {
+        PruneRetiredConnectionIdFrames(pkt->frames);
         if (pkt->frames.empty()) {
             // No frame data saved, skip (e.g., ACK-only packets or cleared stream
             // frames)
@@ -3041,14 +3083,10 @@ void QuicConnection::Impl::HandlePto() {
             uint8_t frames[64];
             quic::BufferWriter writer(frames, sizeof(frames));
 
-            // Piggyback Handshake ACK if pending
-            bool has_ack = handshake_ack_mgr_.HasPendingAck();
-            if (has_ack) {
-                handshake_ack_mgr_.BuildAckFrame(&writer, current_time_us_);
-            }
-
-            // Add PING frame (0x01)
-            writer.WriteUint8(0x01);
+            // A PTO probe must contain PING even when ACK ranges fill the buffer.
+            if (!quic::BuildPingFrame(&writer)) return;
+            bool has_ack = handshake_ack_mgr_.HasPendingAck() &&
+                           handshake_ack_mgr_.BuildAckFrame(&writer, current_time_us_);
 
             uint64_t pn = handshake_tracker_.AllocatePacketNumber();
             size_t packet_len =
@@ -3058,10 +3096,9 @@ void QuicConnection::Impl::HandlePto() {
             if (packet_len > 0) {
                 handshake_tracker_.OnPacketSent(pn, current_time_us_, packet_len, true);
                 loss_detector_.OnPacketSent(pn, current_time_us_, packet_len, true);
-                if (has_ack) {
+                if (SendPacket(packet_buf_.data(), packet_len) && has_ack) {
                     handshake_ack_mgr_.OnAckSent();
                 }
-                SendPacket(packet_buf_.data(), packet_len);
             }
         } else {
             // Still in Initial phase - retransmit ClientHello
@@ -3096,6 +3133,7 @@ void QuicConnection::Impl::SendPtoProbe() {
     // Find the oldest unacked packet with frame data to retransmit
     SentPacketInfo* oldest_with_data = nullptr;
     for (auto* pkt : unacked) {
+        PruneRetiredConnectionIdFrames(pkt->frames);
         if (!pkt->frames.empty()) {
             if (!oldest_with_data || pkt->sent_time_us < oldest_with_data->sent_time_us) {
                 oldest_with_data = pkt;
@@ -3354,19 +3392,8 @@ void QuicConnection::Impl::SetupFrameProcessorCallbacks() {
 
     // RETIRE_CONNECTION_ID frame callback
     // Peer is retiring one of our connection IDs
-    frame_processor_.SetOnRetireConnectionId([this](uint64_t sequence_number) {
-        // Remove the retired connection ID from our list
-        auto it = local_connection_ids_.find(sequence_number);
-        if (it != local_connection_ids_.end()) {
-            if (config_.enable_debug) {
-                ESP_LOGI(TAG, "Peer retired our connection ID seq=%llu", (unsigned long long)sequence_number);
-            }
-            local_connection_ids_.erase(it);
-
-            // Optionally send a new connection ID to replace the retired one
-            SendNewConnectionId();
-        }
-    });
+    frame_processor_.SetOnRetireConnectionId(
+        [this](uint64_t sequence_number) { OnFrameRetireConnectionId(sequence_number); });
 }
 
 //=============================================================================
@@ -3478,6 +3505,92 @@ void QuicConnection::Impl::OnFrameNewConnectionId(const NewConnectionIdData& dat
 // Connection ID Management
 //=============================================================================
 
+void QuicConnection::Impl::InitializeLocalConnectionIds() {
+    local_connection_ids_.clear();
+    local_cid_sequence_ = 0;
+    LocalConnectionIdInfo initial{};
+    initial.cid = scid_;
+    // The handshake SCID is sequence 0 (RFC 9000 section 5.1.1).
+    local_connection_ids_.emplace(0, initial);
+}
+
+void QuicConnection::Impl::EnsureLocalConnectionIdSupply() {
+    if (!handshake_complete_ || !crypto_.HasApplicationKeys()) return;
+    if (peer_params_.active_connection_id_limit < 2) {
+        Close(0x08, "active_connection_id_limit below 2");
+        return;
+    }
+    // Bound device state while leaving spare CIDs for server path validation.
+    const size_t target = static_cast<size_t>(std::min<uint64_t>(4, peer_params_.active_connection_id_limit));
+    while (local_connection_ids_.size() < target) {
+        if (!SendNewConnectionId()) break;
+    }
+}
+
+void QuicConnection::Impl::OnFrameRetireConnectionId(uint64_t sequence_number) {
+    if (sequence_number > local_cid_sequence_) {
+        Close(0x0a, "RETIRE_CONNECTION_ID for unissued sequence");
+        return;
+    }
+    auto it = local_connection_ids_.find(sequence_number);
+    if (it == local_connection_ids_.end()) {
+        // A retransmitted retirement must not allocate another replacement.
+        return;
+    }
+    if (processing_1rtt_packet_ && it->second.cid == received_dcid_) {
+        Close(0x0a, "RETIRE_CONNECTION_ID for containing packet DCID");
+        return;
+    }
+    local_connection_ids_.erase(it);
+    ESP_LOGI(TAG, "Peer retired local CID: seq=%llu rx_pn=%llu active=%zu",
+             (unsigned long long)sequence_number, (unsigned long long)received_packet_number_,
+             local_connection_ids_.size());
+    for (auto* packet : app_tracker_.GetUnackedPackets()) {
+        PruneRetiredConnectionIdFrames(packet->frames);
+    }
+    EnsureLocalConnectionIdSupply();
+}
+
+void QuicConnection::Impl::PruneRetiredConnectionIdFrames(Http3Vector<uint8_t>& frames) {
+    // These locally constructed retransmission buffers contain STREAM and CID
+    // frames. Keep STREAM/RETIRE data, but never re-advertise a retired local CID.
+    quic::BufferReader reader(frames.data(), frames.size());
+    size_t kept = 0;
+    while (reader.Remaining() != 0) {
+        const size_t start = reader.Offset();
+        uint8_t type;
+        if (!reader.ReadUint8(&type)) break;
+        bool keep = true;
+        bool parsed = false;
+        if (type == 0x18) {
+            uint64_t sequence, retire;
+            quic::ConnectionId cid;
+            uint8_t token[16];
+            parsed = quic::ParseNewConnectionIdFrame(&reader, &sequence, &retire, &cid, token);
+            if (parsed) keep = local_connection_ids_.find(sequence) != local_connection_ids_.end();
+        } else if ((type & 0xf8) == 0x08) {
+            quic::StreamFrameData stream;
+            parsed = quic::ParseStreamFrame(&reader, type, &stream);
+        } else if (type == 0x19) {
+            uint64_t sequence;
+            parsed = reader.ReadVarint(&sequence);
+        }
+        if (!parsed) {
+            // Leave other reliable frames intact if new senders add them later.
+            const size_t remaining = frames.size() - start;
+            std::memmove(frames.data() + kept, frames.data() + start, remaining);
+            kept += remaining;
+            break;
+        }
+        if (keep) {
+            const size_t length = reader.Offset() - start;
+            std::memmove(frames.data() + kept, frames.data() + start, length);
+            kept += length;
+        }
+    }
+    frames.resize(kept);
+}
+
 void QuicConnection::Impl::RetirePeerConnectionIdsPriorTo(uint64_t retire_prior_to) {
     for (auto& [seq, info] : peer_connection_ids_) {
         if (seq < retire_prior_to && !info.retired) {
@@ -3515,18 +3628,22 @@ bool QuicConnection::Impl::SendRetireConnectionId(uint64_t sequence_number) {
         ESP_LOGI(TAG, "Sending RETIRE_CONNECTION_ID seq=%llu", (unsigned long long)sequence_number);
     }
 
-    app_tracker_.OnPacketSent(pn, current_time_us_, packet_len, true);
+    Http3Vector<uint8_t> frame_copy(frame_buf_.begin(), frame_buf_.begin() + writer.Offset());
+    app_tracker_.OnPacketSent(pn, current_time_us_, packet_len, true, std::move(frame_copy), UINT64_MAX);
+    loss_detector_.OnPacketSent(pn, current_time_us_, packet_len, true);
     return SendPacket(packet_buf_.data(), packet_len);
 }
 
 bool QuicConnection::Impl::SendNewConnectionId() {
-    if (!crypto_.HasApplicationKeys()) {
+    if (!crypto_.HasApplicationKeys() || scid_.Length() == 0 ||
+        local_connection_ids_.size() >= std::min<uint64_t>(4, peer_params_.active_connection_id_limit) ||
+        local_cid_sequence_ == ((uint64_t{1} << 62) - 1)) {
         return false;
     }
 
     // Generate a new connection ID
-    uint64_t seq = ++local_cid_sequence_;
-    LocalConnectionIdInfo info;
+    const uint64_t seq = local_cid_sequence_ + 1;
+    LocalConnectionIdInfo info{};
 
     // Generate random CID (8 bytes)
     for (size_t i = 0; i < 8; i += 4) {
@@ -3543,21 +3660,22 @@ bool QuicConnection::Impl::SendNewConnectionId() {
         std::memcpy(info.stateless_reset_token + i, &random_word, copy_len);
     }
 
-    // Store it
-    local_connection_ids_[seq] = info;
-
-    if (config_.enable_debug) {
-        ESP_LOGI(TAG, "Sending NEW_CONNECTION_ID seq=%llu, cid=%02x%02x%02x%02x...", (unsigned long long)seq,
-                 info.cid.data[0], info.cid.data[1], info.cid.data[2], info.cid.data[3]);
-    }
-
     //=========================================================================
     // Batch Mode: add frame to batch buffer
     //=========================================================================
     if (batch_state_.active && batch_state_.writer) {
+        const size_t start = batch_state_.writer->Offset();
         if (!quic::BuildNewConnectionIdFrame(batch_state_.writer, seq, 0, info.cid, info.stateless_reset_token)) {
+            Close(0x01, "failed to batch NEW_CONNECTION_ID");
             return false;
         }
+        batch_state_.control_frames.insert(batch_state_.control_frames.end(), batch_frames_.data() + start,
+                                           batch_frames_.data() + batch_state_.writer->Offset());
+        local_connection_ids_[seq] = info;
+        local_cid_sequence_ = seq;
+        ESP_LOGI(TAG, "Issuing local CID: seq=%llu active=%zu peer_limit=%llu (batched)",
+                 (unsigned long long)seq, local_connection_ids_.size(),
+                 (unsigned long long)peer_params_.active_connection_id_limit);
         return true;  // Frame buffered, will be sent in EndBatch()
     }
 
@@ -3578,7 +3696,15 @@ bool QuicConnection::Impl::SendNewConnectionId() {
         return false;
     }
 
-    app_tracker_.OnPacketSent(pn, current_time_us_, packet_len, true);
+    local_connection_ids_[seq] = info;
+    local_cid_sequence_ = seq;
+    Http3Vector<uint8_t> frame_copy(frame_buf_.begin(), frame_buf_.begin() + writer.Offset());
+    app_tracker_.OnPacketSent(pn, current_time_us_, packet_len, true, std::move(frame_copy), UINT64_MAX);
+    loss_detector_.OnPacketSent(pn, current_time_us_, packet_len, true);
+    ESP_LOGI(TAG, "Issuing local CID: seq=%llu active=%zu peer_limit=%llu pn=%llu",
+             (unsigned long long)seq, local_connection_ids_.size(),
+             (unsigned long long)peer_params_.active_connection_id_limit, (unsigned long long)pn);
+    // Even a local send failure leaves a reliable frame pending for PTO retry.
     return SendPacket(packet_buf_.data(), packet_len);
 }
 
@@ -3627,9 +3753,9 @@ void QuicConnection::Impl::OnFramePathChallenge(const uint8_t* data) {
         return;
     }
 
-    if (config_.enable_debug) {
-        ESP_LOGI(TAG, "PATH_CHALLENGE received, sending PATH_RESPONSE");
-    }
+    ESP_LOGI(TAG, "PATH_CHALLENGE received: rx_pn=%llu data=%02x%02x%02x%02x%02x%02x%02x%02x",
+             (unsigned long long)received_packet_number_, data[0], data[1], data[2], data[3],
+             data[4], data[5], data[6], data[7]);
 
     // Build PATH_RESPONSE frame
     quic::BufferWriter writer(frame_buf_.data(), frame_buf_.size());
@@ -3639,12 +3765,30 @@ void QuicConnection::Impl::OnFramePathChallenge(const uint8_t* data) {
 
     // Build 1-RTT packet
     uint64_t pn = app_tracker_.AllocatePacketNumber();
-    size_t packet_len = quic::Build1RttPacket(dcid_, pn, false, crypto_.GetKeyPhase() != 0, frame_buf_.data(), writer.Offset(),
+    // RFC 9000 section 8.2.2: validate a 1200-byte datagram in both directions.
+    // This client uses one connected UDP socket to the server, so the response
+    // goes out on the same path on which the challenge arrived.
+    const size_t overhead = 1 + dcid_.Length() + quic::GetPacketNumberLength(pn) + 16;
+    const size_t padded_payload_size = 1200 - overhead;
+    if (writer.Offset() > padded_payload_size || padded_payload_size > frame_buf_.size()) return;
+    std::memset(frame_buf_.data() + writer.Offset(), 0, padded_payload_size - writer.Offset());
+    size_t packet_len = quic::Build1RttPacket(dcid_, pn, false, crypto_.GetKeyPhase() != 0, frame_buf_.data(), padded_payload_size,
                                               crypto_.GetClientAppSecrets(), packet_buf_.data(), packet_buf_.size());
 
     if (packet_len > 0) {
-        app_tracker_.OnPacketSent(pn, current_time_us_, packet_len, true);
-        SendPacket(packet_buf_.data(), packet_len);
+        // PATH_RESPONSE is sent once per received challenge, never retransmitted.
+        app_tracker_.OnPacketSent(pn, current_time_us_, packet_len, true, {}, UINT64_MAX);
+        loss_detector_.OnPacketSent(pn, current_time_us_, packet_len, true);
+        if (SendPacket(packet_buf_.data(), packet_len)) {
+            ESP_LOGI(TAG, "PATH_RESPONSE sent: rx_pn=%llu tx_pn=%llu bytes=%zu data=%02x%02x%02x%02x%02x%02x%02x%02x",
+                     (unsigned long long)received_packet_number_, (unsigned long long)pn, packet_len,
+                     data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7]);
+        } else {
+            ESP_LOGW(TAG, "PATH_RESPONSE send failed: rx_pn=%llu tx_pn=%llu",
+                     (unsigned long long)received_packet_number_, (unsigned long long)pn);
+        }
+    } else {
+        ESP_LOGW(TAG, "PATH_RESPONSE packet build failed");
     }
 }
 
@@ -3657,17 +3801,12 @@ void QuicConnection::Impl::OnFramePathResponse(const uint8_t* data) {
     }
 
     // Check if this matches our regular PATH_CHALLENGE
-    if (memcmp(data, path_challenge_data_, 8) == 0) {
+    if (path_challenge_sent_time_us_ > 0 && memcmp(data, path_challenge_data_, 8) == 0) {
         path_validated_ = true;
-
-        if (path_challenge_sent_time_us_ > 0) {
-            uint64_t rtt_us = current_time_us_ - path_challenge_sent_time_us_;
-            path_validation_rtt_ms_ = static_cast<uint32_t>(rtt_us / 1000);
-
-            if (config_.enable_debug) {
-                ESP_LOGI(TAG, "Path validated! RTT: %lu ms", path_validation_rtt_ms_);
-            }
-        }
+        uint64_t rtt_us = current_time_us_ - path_challenge_sent_time_us_;
+        path_validation_rtt_ms_ = static_cast<uint32_t>(rtt_us / 1000);
+        ESP_LOGI(TAG, "PATH_RESPONSE matched: rx_pn=%llu RTT=%lu ms",
+                 (unsigned long long)received_packet_number_, path_validation_rtt_ms_);
 
         path_challenge_sent_time_us_ = 0;
         memset(path_challenge_data_, 0, 8);

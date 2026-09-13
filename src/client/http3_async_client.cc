@@ -160,8 +160,8 @@ int Http3Stream::Read(uint8_t* buffer, size_t size, uint32_t timeout_ms) {
         // to avoid ABBA deadlock with connection_mutex_ (event loop holds
         // connection_mutex_ while calling OnData which needs receive_mutex_)
         if (bytes_to_read > 0) {
-            if (client_) {
-                client_->StreamAcknowledgeData(stream_id_, bytes_to_read);
+            if (Http3AsyncClient* client = client_.load()) {
+                client->StreamAcknowledgeData(stream_id_, bytes_to_read, this);
             }
             return static_cast<int>(bytes_to_read);
         }
@@ -234,7 +234,8 @@ int Http3Stream::Write(esp_http3::Http3Vector<uint8_t>&& data, uint32_t timeout_
     size_t size = data.size();
 
     // Write to QUIC connection (takes ownership)
-    if (!client_ || !client_->StreamWrite(stream_id_, std::move(data))) {
+    Http3AsyncClient* client = client_.load();
+    if (!client || !client->StreamWrite(stream_id_, std::move(data), this)) {
         error_ = "Write failed";
         return -1;
     }
@@ -290,7 +291,8 @@ bool Http3Stream::Finish() {
         return true;  // Peer already stopped receiving request body
     }
 
-    if (!client_ || !client_->StreamFinish(stream_id_)) {
+    Http3AsyncClient* client = client_.load();
+    if (!client || !client->StreamFinish(stream_id_, this)) {
         error_ = "Finish failed";
         return false;
     }
@@ -380,8 +382,8 @@ Http3StreamReadPollResult Http3Stream::TryRead(uint8_t* buffer, size_t size, siz
     if (bytes_read_out == 0) {
         return Http3StreamReadPollResult::kPending;
     }
-    if (client_) {
-        client_->StreamAcknowledgeData(stream_id_, bytes_read_out);
+    if (Http3AsyncClient* client = client_.load()) {
+        client->StreamAcknowledgeData(stream_id_, bytes_read_out, this);
     }
     return Http3StreamReadPollResult::kData;
 }
@@ -408,23 +410,30 @@ void Http3Stream::Close() {
         return;  // Already closed
     }
 
-    // Notify waiting operations
-    if (event_group_) {
-        xEventGroupSetBits(event_group_, EVENT_CLOSED);
+    // Detachment may run concurrently on the event-loop task.
+    {
+        std::lock_guard<std::mutex> lock(lifecycle_mutex_);
+        if (event_group_) {
+            xEventGroupSetBits(event_group_, EVENT_CLOSED);
+        }
+        NotifyReadReady();
     }
-    NotifyReadReady();
 
     // Tell client to close the QUIC stream
     // Only send RESET_STREAM if stream is not finished normally
     bool force_reset = !finished_receiving_;
-    if (client_) {
-        client_->StreamClose(stream_id_, force_reset);
+    if (Http3AsyncClient* client = client_.load()) {
+        client->StreamClose(stream_id_, this, force_reset);
     }
 
-    // Cleanup
-    if (event_group_) {
-        vEventGroupDelete(event_group_);
-        event_group_ = nullptr;
+    // A detached stream still waits for InvalidateClient() to finish before
+    // deleting the synchronization object that callback is using.
+    {
+        std::lock_guard<std::mutex> lock(lifecycle_mutex_);
+        if (event_group_) {
+            vEventGroupDelete(event_group_);
+            event_group_ = nullptr;
+        }
     }
 
     power_lock_.reset();
@@ -519,13 +528,14 @@ void Http3Stream::OnWriteReset(const std::string& error_message) {
     }
 }
 
-void Http3Stream::InvalidateClient() {
+void Http3Stream::InvalidateClient(const std::string& error_message) {
+    std::lock_guard<std::mutex> lock(lifecycle_mutex_);
     // Clear client pointer to prevent use-after-free
     client_ = nullptr;
 
     // Mark as error state
+    error_ = error_message;
     has_error_ = true;
-    error_ = "Client destroyed";
 
     // Wake up any waiting operations
     if (event_group_) {
@@ -895,6 +905,14 @@ std::unique_ptr<Http3Stream> Http3AsyncClient::Open(const Http3Request& request)
         return nullptr;
     }
 
+    // Allocate before opening the transport stream. Registration below must
+    // complete before the event loop can observe a response, and allocation
+    // failure must not leave an unowned QUIC stream behind.
+    auto stream = std::unique_ptr<Http3Stream>(new Http3Stream(nullptr, -1, config_.request_timeout_ms));
+    if (!stream->Initialize(config_.receive_buffer_size)) {
+        ESP_LOGE(TAG, "Failed to initialize stream");
+        return nullptr;
+    }
     int stream_id;
 
     // Open stream in QUIC connection
@@ -927,21 +945,13 @@ std::unique_ptr<Http3Stream> Http3AsyncClient::Open(const Http3Request& request)
             ESP_LOGE(TAG, "Failed to open stream");
             return nullptr;
         }
+
+        stream->stream_id_ = stream_id;
+        stream->client_ = this;
+        stream->power_lock_ = std::move(stream_power_lock);
+        // Keep connection_mutex_ until callbacks can find their owner.
+        RegisterStream(stream_id, stream.get());
     }
-
-    // Create stream object with default timeout from config
-    auto stream = std::unique_ptr<Http3Stream>(new Http3Stream(this, stream_id, config_.request_timeout_ms));
-    if (!stream->Initialize(config_.receive_buffer_size)) {
-        ESP_LOGE(TAG, "Failed to initialize stream");
-        return nullptr;
-    }
-
-    // Transfer the continuously-held request lock to the stream. Close() or
-    // destruction releases it; every failure path above releases it by RAII.
-    stream->power_lock_ = std::move(stream_power_lock);
-
-    // Register stream
-    RegisterStream(stream_id, stream.get());
 
     // Wake event loop to process
     WakeEventLoop();
@@ -982,15 +992,10 @@ void Http3AsyncClient::RegisterStream(int stream_id, Http3Stream* stream) {
     streams_[stream_id] = stream;
 }
 
-void Http3AsyncClient::UnregisterStream(int stream_id) {
-    std::lock_guard<std::mutex> lock(streams_mutex_);
-    streams_.erase(stream_id);
-}
-
-Http3Stream* Http3AsyncClient::GetStream(int stream_id) {
+bool Http3AsyncClient::IsRegisteredStream(int stream_id, const Http3Stream* stream) {
     std::lock_guard<std::mutex> lock(streams_mutex_);
     auto iterator = streams_.find(stream_id);
-    return iterator != streams_.end() ? iterator->second : nullptr;
+    return iterator != streams_.end() && iterator->second == stream;
 }
 
 bool Http3AsyncClient::StreamWrite(int stream_id, std::vector<uint8_t>&& data) {
@@ -1000,14 +1005,23 @@ bool Http3AsyncClient::StreamWrite(int stream_id, std::vector<uint8_t>&& data) {
 }
 
 bool Http3AsyncClient::StreamWrite(int stream_id, esp_http3::Http3Vector<uint8_t>&& data) {
+    return StreamWrite(stream_id, std::move(data), nullptr);
+}
+
+bool Http3AsyncClient::StreamWrite(int stream_id, esp_http3::Http3Vector<uint8_t>&& data,
+                                 const Http3Stream* stream) {
     if (data.empty()) {
         return true;  // Nothing to write
     }
 
-    // Add to write queue (takes ownership, must not hold this lock when calling
-    // ProcessWriteQueue)
+    // Validate the stream and enqueue atomically with respect to disconnect.
+    // A delayed call from an old connection must not write to a reused ID.
     {
-        std::lock_guard<std::mutex> lock(write_queues_mutex_);
+        std::lock_guard<std::mutex> conn_lock(connection_mutex_);
+        if (!connection_ || !connected_ || (stream && !IsRegisteredStream(stream_id, stream))) {
+            return false;
+        }
+        std::lock_guard<std::mutex> queue_lock(write_queues_mutex_);
         write_queues_[stream_id].emplace_back(std::move(data));
     }
 
@@ -1018,9 +1032,16 @@ bool Http3AsyncClient::StreamWrite(int stream_id, esp_http3::Http3Vector<uint8_t
 }
 
 bool Http3AsyncClient::StreamFinish(int stream_id) {
+    return StreamFinish(stream_id, nullptr);
+}
+
+bool Http3AsyncClient::StreamFinish(int stream_id, const Http3Stream* stream) {
     // Must acquire locks in same order as ProcessWriteQueue: connection first,
     // then queue
     std::lock_guard<std::mutex> conn_lock(connection_mutex_);
+    if (!connection_ || !connected_ || (stream && !IsRegisteredStream(stream_id, stream))) {
+        return false;
+    }
 
     // Check if there's pending data in the write queue
     bool has_pending_data = false;
@@ -1053,6 +1074,7 @@ bool Http3AsyncClient::StreamFinish(int stream_id) {
 
 void Http3AsyncClient::ProcessWriteQueue(int stream_id) {
     bool item_completed = false;
+    const char* write_error = nullptr;
 
     // Lock order: connection_mutex_ first, then write_queues_mutex_
     {
@@ -1061,7 +1083,7 @@ void Http3AsyncClient::ProcessWriteQueue(int stream_id) {
             return;
         }
 
-        std::lock_guard<std::mutex> queue_lock(write_queues_mutex_);
+        std::unique_lock<std::mutex> queue_lock(write_queues_mutex_);
         auto iterator = write_queues_.find(stream_id);
         if (iterator == write_queues_.end() || iterator->second.empty()) {
             return;
@@ -1080,7 +1102,11 @@ void Http3AsyncClient::ProcessWriteQueue(int stream_id) {
                 item_completed = true;
 
                 if (should_finish) {
-                    connection_->FinishStream(stream_id);
+                    if (!connection_->FinishStream(stream_id)) {
+                        write_error = "Failed to finish request body";
+                        queue.clear();
+                        break;
+                    }
                     WakeEventLoop();
                 }
                 continue;
@@ -1090,11 +1116,10 @@ void Http3AsyncClient::ProcessWriteQueue(int stream_id) {
             ssize_t bytes_written = connection_->WriteStream(stream_id, item.data.data() + item.offset, remaining);
 
             if (bytes_written < 0) {
-                // Error - discard this item
                 ESP_LOGE(TAG, "WriteStream failed for stream %d", stream_id);
-                queue.pop_front();
-                item_completed = true;
-                continue;
+                write_error = "Failed to write request body";
+                queue.clear();
+                break;
             }
 
             if (bytes_written == 0) {
@@ -1118,14 +1143,20 @@ void Http3AsyncClient::ProcessWriteQueue(int stream_id) {
         if (queue.empty()) {
             write_queues_.erase(iterator);
         }
-    }
 
-    // Notify stream that write completed (after releasing all locks to avoid
-    // deadlock)
-    if (item_completed) {
-        Http3Stream* stream = GetStream(stream_id);
-        if (stream && stream->event_group_) {
-            xEventGroupSetBits(stream->event_group_, Http3Stream::EVENT_WRITE_COMPLETE);
+        // Release the queue before callbacks, but retain the connection lock
+        // so reconnect cannot deliver this result to a new owner of this ID.
+        queue_lock.unlock();
+        if (item_completed || write_error) {
+            std::lock_guard<std::mutex> lock(streams_mutex_);
+            auto iterator = streams_.find(stream_id);
+            if (iterator != streams_.end()) {
+                if (write_error) {
+                    iterator->second->OnError(write_error);
+                } else if (iterator->second->event_group_) {
+                    xEventGroupSetBits(iterator->second->event_group_, Http3Stream::EVENT_WRITE_COMPLETE);
+                }
+            }
         }
     }
 }
@@ -1161,8 +1192,10 @@ void Http3AsyncClient::OnStreamReset(int stream_id, uint64_t error_code) {
 
     // RESET_STREAM terminates the entire stream - both reads and writes should
     // fail This is different from STOP_SENDING which only affects writes
-    Http3Stream* stream = GetStream(stream_id);
-    if (stream) {
+    std::lock_guard<std::mutex> lock(streams_mutex_);
+    auto iterator = streams_.find(stream_id);
+    if (iterator != streams_.end()) {
+        Http3Stream* stream = iterator->second;
         char error_msg[64];
         snprintf(error_msg, sizeof(error_msg), "Stream reset by peer (error=%llu)", (unsigned long long)error_code);
         // Call OnError to terminate both reads and writes
@@ -1176,8 +1209,10 @@ void Http3AsyncClient::OnStreamReset(int stream_id, uint64_t error_code) {
 void Http3AsyncClient::OnStreamStopSending(int stream_id, uint64_t error_code) {
     ESP_LOGW(TAG, "Stream %d stopped sending by peer, error=%llu", stream_id, (unsigned long long)error_code);
 
-    Http3Stream* stream = GetStream(stream_id);
-    if (stream) {
+    std::lock_guard<std::mutex> lock(streams_mutex_);
+    auto iterator = streams_.find(stream_id);
+    if (iterator != streams_.end()) {
+        Http3Stream* stream = iterator->second;
         char error_msg[80];
         snprintf(error_msg, sizeof(error_msg), "Server stopped receiving request body (error=%llu)",
                  (unsigned long long)error_code);
@@ -1187,9 +1222,18 @@ void Http3AsyncClient::OnStreamStopSending(int stream_id, uint64_t error_code) {
     WakeEventLoop();
 }
 
-void Http3AsyncClient::StreamClose(int stream_id, bool force_reset) {
-    // Unregister first
-    UnregisterStream(stream_id);
+void Http3AsyncClient::StreamClose(int stream_id, const Http3Stream* stream, bool force_reset) {
+    // Serialize with callbacks and reconnect before checking the instance.
+    // QUIC stream IDs start over on each connection.
+    std::lock_guard<std::mutex> conn_lock(connection_mutex_);
+    {
+        std::lock_guard<std::mutex> streams_lock(streams_mutex_);
+        auto iterator = streams_.find(stream_id);
+        if (iterator == streams_.end() || iterator->second != stream) {
+            return;
+        }
+        streams_.erase(iterator);
+    }
 
     // Clean up write queue for this stream (data is automatically freed when
     // queue is erased)
@@ -1201,7 +1245,6 @@ void Http3AsyncClient::StreamClose(int stream_id, bool force_reset) {
     // Only reset if stream is not finished normally (e.g., user cancelled,
     // timeout) Normal stream completion doesn't need RESET_STREAM
     if (force_reset && !needs_cleanup_.load()) {
-        std::lock_guard<std::mutex> lock(connection_mutex_);
         if (connection_) {
             ESP_LOGD(TAG, "Force resetting stream %d", stream_id);
             connection_->ResetStream(stream_id);
@@ -1210,9 +1253,9 @@ void Http3AsyncClient::StreamClose(int stream_id, bool force_reset) {
     }
 }
 
-void Http3AsyncClient::StreamAcknowledgeData(int stream_id, size_t bytes) {
+void Http3AsyncClient::StreamAcknowledgeData(int stream_id, size_t bytes, const Http3Stream* stream) {
     std::lock_guard<std::mutex> lock(connection_mutex_);
-    if (connection_) {
+    if (connection_ && IsRegisteredStream(stream_id, stream)) {
         // Notify QUIC layer that bytes have been consumed
         // This will trigger MAX_STREAM_DATA if flow control window needs updating
         connection_->AcknowledgeStreamData(stream_id, bytes);
@@ -1384,6 +1427,7 @@ void Http3AsyncClient::RunEventLoop() {
             if (!stop_tasks_.load()) {
                 const int select_error = errno;
                 ESP_LOGE(TAG, "Event-loop select failed: errno=%d", select_error);
+                std::lock_guard<std::mutex> lock(connection_mutex_);
                 OnDisconnected(select_error, "HTTP/3 event-loop select failed");
             }
             break;
@@ -1416,6 +1460,7 @@ void Http3AsyncClient::RunEventLoop() {
             if (received_length < 0 && errno != EAGAIN && errno != EWOULDBLOCK && !stop_tasks_.load()) {
                 const int receive_error = errno;
                 ESP_LOGE(TAG, "UDP receive failed: errno=%d", receive_error);
+                std::lock_guard<std::mutex> lock(connection_mutex_);
                 OnDisconnected(receive_error, "HTTP/3 UDP receive failed");
             }
             break;
@@ -1457,14 +1502,20 @@ void Http3AsyncClient::OnDisconnected(int error_code, const std::string& reason)
     SetLastError(reason);
     xEventGroupSetBits(event_group_, EVENT_DISCONNECTED);
 
-    // Notify all active streams of disconnection
+    // All callers hold connection_mutex_. Retire stream ownership and queued
+    // writes before a new connection can reuse these stream IDs.
     {
         std::lock_guard<std::mutex> lock(streams_mutex_);
         for (auto& [stream_id, stream] : streams_) {
             if (stream) {
-                stream->OnError(reason);
+                stream->InvalidateClient(reason);
             }
         }
+        streams_.clear();
+    }
+    {
+        std::lock_guard<std::mutex> lock(write_queues_mutex_);
+        write_queues_.clear();
     }
 
     // Mark for cleanup
@@ -1480,15 +1531,19 @@ void Http3AsyncClient::OnDisconnected(int error_code, const std::string& reason)
 void Http3AsyncClient::OnResponse(int stream_id, const esp_http3::H3Response& response) {
     ESP_LOGD(TAG, "Response on stream %d: status=%d", stream_id, response.status);
 
-    Http3Stream* stream = GetStream(stream_id);
-    if (stream) {
+    std::lock_guard<std::mutex> lock(streams_mutex_);
+    auto iterator = streams_.find(stream_id);
+    if (iterator != streams_.end()) {
+        Http3Stream* stream = iterator->second;
         stream->OnHeaders(response.status, response.headers);
     }
 }
 
 void Http3AsyncClient::OnStreamData(int stream_id, const uint8_t* data, size_t length, bool finished) {
-    Http3Stream* stream = GetStream(stream_id);
-    if (stream) {
+    std::lock_guard<std::mutex> lock(streams_mutex_);
+    auto iterator = streams_.find(stream_id);
+    if (iterator != streams_.end()) {
+        Http3Stream* stream = iterator->second;
         stream->OnData(data, length, finished);
     }
 }

@@ -33,6 +33,16 @@ bool BuildAckFrame(BufferWriter* writer,
                    uint64_t ack_delay,
                    uint64_t first_ack_range,
                    const std::vector<std::pair<uint64_t, uint64_t>>& ack_ranges) {
+    // Callers may append another frame after failure. Never leave a partial ACK.
+    size_t encoded_size = 1 + VarintEncodedSize(largest_ack) + VarintEncodedSize(ack_delay)
+                          + VarintEncodedSize(ack_ranges.size()) + VarintEncodedSize(first_ack_range);
+    if (encoded_size > writer->Remaining()) return false;
+    for (const auto& range : ack_ranges) {
+        size_t range_size = VarintEncodedSize(range.first) + VarintEncodedSize(range.second);
+        if (range_size > writer->Remaining() - encoded_size) return false;
+        encoded_size += range_size;
+    }
+
     // ACK frame type
     if (!writer->WriteUint8(frame::kAck)) {
         return false;
@@ -107,6 +117,13 @@ bool BuildStreamFrame(BufferWriter* writer,
                       const uint8_t* data,
                       size_t len,
                       bool fin) {
+    // Batch mode keeps earlier frames when this one does not fit. Check the
+    // complete size before writing a header that EndBatch could otherwise send.
+    size_t header_size = 1 + VarintEncodedSize(stream_id) + VarintEncodedSize(len)
+                         + (offset > 0 ? VarintEncodedSize(offset) : 0);
+    if (header_size > writer->Remaining() || len > writer->Remaining() - header_size) return false;
+    if (len > 0 && data == nullptr) return false;
+
     // STREAM frame type with flags
     // 0x08 = STREAM base
     // 0x01 = FIN
@@ -377,6 +394,10 @@ bool ParseAckFrame(BufferReader* reader, AckFrameData* out) {
         return false;
     }
     
+    if (out->first_ack_range > out->largest_ack || range_count > reader->Remaining() / 2) {
+        return false;
+    }
+    uint64_t smallest = out->largest_ack - out->first_ack_range;
     out->ack_ranges.clear();
     for (uint64_t i = 0; i < range_count; i++) {
         uint64_t gap, range;
@@ -386,6 +407,14 @@ bool ParseAckFrame(BufferReader* reader, AckFrameData* out) {
         if (!reader->ReadVarint(&range)) {
             return false;
         }
+        if (smallest < 2 || gap > smallest - 2) {
+            return false;
+        }
+        const uint64_t next_largest = smallest - gap - 2;
+        if (range > next_largest) {
+            return false;
+        }
+        smallest = next_largest - range;
         out->ack_ranges.push_back({gap, range});
     }
     
@@ -791,4 +820,3 @@ bool ParseTransportParameters(const uint8_t* data, size_t len,
 
 } // namespace quic
 } // namespace esp_http3
-

@@ -33,6 +33,9 @@ public:
      */
     void OnPacketReceived(uint64_t pn, uint64_t recv_time_us, bool ack_eliciting = true);
 
+    // Also gate frame delivery: duplicate packets must not repeat control actions.
+    bool HasReceivedPacket(uint64_t pn) const { return received_packets_.count(pn) != 0; }
+
     /**
      * @brief Check if ACK should be sent (simple check, 2+ ack-eliciting packets)
      * 

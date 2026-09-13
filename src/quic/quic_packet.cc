@@ -51,8 +51,19 @@ size_t BuildInitialPacket(const ConnectionId& dcid, const ConnectionId& scid, co
     // Calculate sizes
     size_t pn_len = GetPacketNumberLength(packet_number);
 
+    // Retry tokens are opaque peer data and can be larger than 256 bytes.
+    // Check the complete prefix before allocating or copying any token bytes.
+    const size_t prefix_len = 7 + dcid.Length() + scid.Length() + VarintEncodedSize(token_len);
+    if (prefix_len > out_len || token_len > out_len - prefix_len || min_packet_size > out_len) {
+        return 0;
+    }
+    const size_t header_size = prefix_len + token_len;
+    if (out_len - header_size < pn_len + 16 ||
+        payload_len > out_len - header_size - pn_len - 16) {
+        return 0;
+    }
     // Build header (without length and PN)
-    Http3Vector<uint8_t> header(256);
+    Http3Vector<uint8_t> header(header_size);
     size_t header_offset = 0;
 
     // First byte (will update PN length later)
@@ -86,18 +97,28 @@ size_t BuildInitialPacket(const ConnectionId& dcid, const ConnectionId& scid, co
 
     // Calculate total packet size
     size_t length_field_size = VarintEncodedSize(pn_len + encrypted_payload_len);
+    if (length_field_size > out_len - header_offset - pn_len - encrypted_payload_len) {
+        return 0;
+    }
     size_t total_header_len = header_offset + length_field_size + pn_len;
     size_t total_packet_len = total_header_len + encrypted_payload_len;
 
-    // Add padding if needed
-    size_t padding_len = 0;
-    if (total_packet_len < min_packet_size) {
+    // RFC 9001 section 5.4.2 requires a full sample at pn_offset + 4,
+    // even when the caller does not request minimum Initial padding.
+    size_t padding_len = payload_len < 4 - pn_len ? 4 - pn_len - payload_len : 0;
+    if (total_packet_len < min_packet_size && min_packet_size - total_packet_len > padding_len) {
         padding_len = min_packet_size - total_packet_len;
+    }
+    if (padding_len > out_len - total_packet_len) {
+        return 0;
     }
 
     // Recalculate with padding
     encrypted_payload_len = payload_len + padding_len + 16;
     length_field_size = VarintEncodedSize(pn_len + encrypted_payload_len);
+    if (length_field_size > out_len - header_offset - pn_len - encrypted_payload_len) {
+        return 0;
+    }
     total_header_len = header_offset + length_field_size + pn_len;
     total_packet_len = total_header_len + encrypted_payload_len;
 
@@ -121,7 +142,9 @@ size_t BuildInitialPacket(const ConnectionId& dcid, const ConnectionId& scid, co
 
     // Prepare plaintext (payload + padding)
     Http3Vector<uint8_t> plaintext(payload_len + padding_len);
-    std::memcpy(plaintext.data(), payload, payload_len);
+    if (payload_len > 0) {
+        std::memcpy(plaintext.data(), payload, payload_len);
+    }
     std::memset(plaintext.data() + payload_len, 0, padding_len);  // PADDING frames
 
     // Encrypt
@@ -150,6 +173,26 @@ size_t BuildHandshakePacket(const ConnectionId& dcid, const ConnectionId& scid, 
     }
 
     size_t pn_len = GetPacketNumberLength(packet_number);
+
+    // A packet-number plus plaintext length of at least four bytes leaves
+    // all 16 header-protection sample bytes inside the encrypted packet.
+    uint8_t padded_payload[3] = {};
+    if (payload_len < 4 - pn_len) {
+        if (payload_len > 0) {
+            std::memcpy(padded_payload, payload, payload_len);
+        }
+        payload = padded_payload;
+        payload_len = 4 - pn_len;
+    }
+    const size_t prefix_len = 7 + dcid.Length() + scid.Length();
+    if (out_len < prefix_len + pn_len + 16 ||
+        payload_len > out_len - prefix_len - pn_len - 16) {
+        return 0;
+    }
+    const size_t length_field_size = VarintEncodedSize(pn_len + payload_len + 16);
+    if (length_field_size > out_len - prefix_len - pn_len - payload_len - 16) {
+        return 0;
+    }
 
     // Build header
     Http3Vector<uint8_t> header(256);
@@ -217,6 +260,21 @@ size_t Build1RttPacket(const ConnectionId& dcid, uint64_t packet_number, bool sp
     }
 
     size_t pn_len = GetPacketNumberLength(packet_number);
+
+    uint8_t padded_payload[3] = {};
+    if (payload_len < 4 - pn_len) {
+        if (payload_len > 0) {
+            std::memcpy(padded_payload, payload, payload_len);
+        }
+        payload = padded_payload;
+        payload_len = 4 - pn_len;
+    }
+    // Validate before writing even the header. Include any PADDING needed
+    // to keep the complete header-protection sample inside the packet.
+    const size_t required_header_len = 1 + dcid.Length() + pn_len;
+    if (out_len < required_header_len + 16 || payload_len > out_len - required_header_len - 16) {
+        return 0;
+    }
 
     // First byte: 0 | 1 | S | Reserved | K | PN Len
     uint8_t first_byte = 0x40 | (pn_len - 1);

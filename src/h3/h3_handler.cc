@@ -245,8 +245,10 @@ void H3Handler::OnStreamData(uint64_t stream_id, uint64_t offset,
              (unsigned long long)stream_id, (unsigned long long)offset, 
              len, fin ? 1 : 0);
     
-    // Check if this is a new unidirectional stream from server
-    if (stream_id % 4 == 3) {  // Server-initiated unidirectional
+    // Server unidirectional streams need the same offset-based reassembly
+    // as request streams: QUIC may reorder or retransmit their STREAM frames.
+    const bool is_peer_uni = stream_id % 4 == 3;
+    if (is_peer_uni) {
         ESP_LOGD(TAG, "  Server-initiated unidirectional stream");
         auto* stream = GetStream(stream_id);
         if (!stream) {
@@ -259,14 +261,6 @@ void H3Handler::OnStreamData(uint64_t stream_id, uint64_t offset,
             streams_[stream_id] = std::move(new_stream);
             stream = streams_[stream_id].get();
         }
-        
-        // Unidirectional streams are typically small, use simple append for now
-        stream->recv_buffer.insert(stream->recv_buffer.end(), data, data + len);
-        stream->contiguous_end = stream->recv_buffer.size();
-        
-        // Handle unidirectional stream
-        HandleUniStreamType(stream_id);
-        return;
     }
     
     auto* stream = GetStream(stream_id);
@@ -344,8 +338,11 @@ void H3Handler::OnStreamData(uint64_t stream_id, uint64_t offset,
     ESP_LOGD(TAG, "  recv_buffer contiguous: %zu bytes, pending chunks: %zu",
              stream->recv_buffer.size(), stream->pending_chunks.size());
     
-    // Process based on stream type
-    if (stream->is_control) {
+    // Only identify a peer stream type after its offset-zero prefix arrives.
+    // Subsequent chunks retain absolute offsets even when a handler drains its buffer.
+    if (is_peer_uni) {
+        HandleUniStreamType(stream_id);
+    } else if (stream->is_control) {
         ESP_LOGD(TAG, "  Processing as control stream");
         HandleControlStream(stream_id, stream->recv_buffer.data(), 
                            stream->recv_buffer.size());

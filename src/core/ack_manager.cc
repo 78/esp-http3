@@ -10,6 +10,7 @@
 
 #include "core/ack_manager.h"
 #include "quic/quic_frame.h"
+#include "quic/quic_varint.h"
 
 #include <algorithm>
 #include <esp_log.h>
@@ -180,6 +181,22 @@ bool AckManager::BuildAckFrame(quic::BufferWriter* writer, uint64_t current_time
         ack_ranges.push_back({gap, ack_range_len});
     }
 
+    // Report the newest complete ranges that fit. Sparse reception can produce
+    // more ranges than the small ACK buffer holds; do not send a truncated frame
+    // or indefinitely fail to acknowledge packets until all gaps disappear.
+    size_t base_size = 1 + quic::VarintEncodedSize(static_cast<uint64_t>(largest_received_))
+                       + quic::VarintEncodedSize(encoded_ack_delay) + quic::VarintEncodedSize(first_ack_range);
+    size_t ranges_size = 0;
+    size_t fitting_ranges = 0;
+    for (const auto& range : ack_ranges) {
+        size_t next_size = ranges_size + quic::VarintEncodedSize(range.first)
+                           + quic::VarintEncodedSize(range.second);
+        if (base_size + quic::VarintEncodedSize(fitting_ranges + 1) + next_size > writer->Remaining()) break;
+        ranges_size = next_size;
+        ++fitting_ranges;
+    }
+    ack_ranges.resize(fitting_ranges);
+
     return quic::BuildAckFrame(writer, static_cast<uint64_t>(largest_received_), encoded_ack_delay, first_ack_range,
                                ack_ranges);
 }
@@ -248,17 +265,40 @@ bool SentPacketTracker::OnAckReceived(uint64_t largest_acked, uint64_t ack_delay
     *newly_acked_bytes = 0;
     bool any_acked = false;
 
-    // Calculate range of acknowledged packets
-    uint64_t ack_start = largest_acked;
-    uint64_t ack_end = largest_acked >= first_ack_range ? largest_acked - first_ack_range : 0;
+    // Validate every range before changing packet state. Gap is the number of
+    // missing packets minus one (RFC 9000, Section 19.3.1).
+    if (first_ack_range > largest_acked) {
+        return false;
+    }
+    uint64_t smallest = largest_acked - first_ack_range;
+    for (const auto& range : ack_ranges) {
+        if (smallest < 2 || range.first > smallest - 2) {
+            return false;
+        }
+        const uint64_t next_largest = smallest - range.first - 2;
+        if (range.second > next_largest) {
+            return false;
+        }
+        smallest = next_largest - range.second;
+    }
 
     for (auto& pkt : sent_packets_) {
         if (pkt.acknowledged || pkt.lost) {
             continue;
         }
 
-        // Check if packet is in first ACK range
-        if (pkt.packet_number >= ack_end && pkt.packet_number <= ack_start) {
+        uint64_t range_largest = largest_acked;
+        uint64_t range_smallest = largest_acked - first_ack_range;
+        bool covered = pkt.packet_number >= range_smallest && pkt.packet_number <= range_largest;
+        for (const auto& range : ack_ranges) {
+            if (covered || pkt.packet_number > range_largest) {
+                break;
+            }
+            range_largest = range_smallest - range.first - 2;
+            range_smallest = range_largest - range.second;
+            covered = pkt.packet_number >= range_smallest && pkt.packet_number <= range_largest;
+        }
+        if (covered) {
             pkt.acknowledged = true;
             pkt.in_flight = false;
             *newly_acked_bytes += pkt.sent_bytes;
@@ -276,7 +316,6 @@ bool SentPacketTracker::OnAckReceived(uint64_t largest_acked, uint64_t ack_delay
             }
         }
 
-        // TODO: Handle additional ACK ranges
     }
 
     // Update largest acked
