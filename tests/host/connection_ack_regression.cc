@@ -11,6 +11,7 @@
 #include <cstring>
 #include <functional>
 #include <iostream>
+#include <set>
 #include <esp_log.h>
 
 namespace esp_http3::memory {
@@ -79,6 +80,7 @@ public:
     AckManager app_ack_mgr_, handshake_ack_mgr_, initial_ack_mgr_;
     SentPacketTracker app_tracker_, handshake_tracker_, initial_tracker_;
     FlowController flow_controller_;
+    std::set<uint64_t> reset_streams_, local_stop_sending_streams_;
     LossDetector loss_detector_;
     quic::ConnectionId dcid_, scid_;
     quic::TransportParameters peer_params_;
@@ -103,6 +105,8 @@ public:
     void BeginBatch();
     bool EndBatch();
     bool SendStreamData(uint64_t, const uint8_t*, size_t, bool);
+    bool ResetStream(int, uint64_t);
+    bool IsConnected() const { return true; }
     void HandlePto();
     bool SendClientFinished();
     bool SendAckIfNeeded(quic::PacketType);
@@ -225,6 +229,38 @@ static void TestFailedSends() {
     }
     fail_packet_build = false;
 }
+static void TestResetFinalSize() {
+    QuicConnection::Impl connection;
+    connection.flow_controller_.CreateStream(48, 4096);
+    connection.flow_controller_.OnStreamBytesSent(48, 484);
+    assert(connection.ResetStream(48, 0x10c));
+    quic::BufferReader reader(built_payloads.back().data(), built_payloads.back().size());
+    uint8_t type;
+    uint64_t stream, error, final_size;
+    assert(reader.ReadUint8(&type) && type == 0x04);
+    assert(reader.ReadVarint(&stream) && stream == 48);
+    assert(reader.ReadVarint(&error) && error == 0x10c);
+    assert(reader.ReadVarint(&final_size) && final_size == 484);
+    assert(reader.ReadUint8(&type) && type == 0x05);
+    assert(reader.ReadVarint(&stream) && stream == 48);
+    assert(reader.ReadVarint(&error) && error == 0x10c);
+    assert(reader.Remaining() == 0);
+
+    // A response FIN cleans this state before a late Close can reset it. No
+    // RESET_STREAM with an invented final size of zero may reach the peer.
+    QuicConnection::Impl completed;
+    completed.flow_controller_.CreateStream(48, 4096);
+    completed.flow_controller_.OnStreamBytesSent(48, 484);
+    completed.flow_controller_.RemoveStream(48);
+    const size_t payloads = built_payloads.size();
+    assert(!completed.ResetStream(48, 0x10c));
+    assert(completed.send_count == 0 && built_payloads.size() == payloads);
+    assert(completed.reset_streams_.empty());
+
+    // Zero is still valid for an active stream that has sent no bytes.
+    completed.flow_controller_.CreateStream(52, 4096);
+    assert(completed.ResetStream(52, 0x10c));
+}
 int main(int argc, char** argv) {
     const char* mode = argc > 1 ? argv[1] : "all";
     if (!std::strcmp(mode, "stream") || !std::strcmp(mode, "all")) TestStream();
@@ -232,5 +268,6 @@ int main(int argc, char** argv) {
     if (!std::strcmp(mode, "batch") || !std::strcmp(mode, "all")) TestBatch();
     if (!std::strcmp(mode, "finished") || !std::strcmp(mode, "all")) TestFinished();
     if (!std::strcmp(mode, "failure") || !std::strcmp(mode, "all")) TestFailedSends();
+    if (!std::strcmp(mode, "reset") || !std::strcmp(mode, "all")) TestResetFinalSize();
     std::cout << "connection ACK regression tests passed\n";
 }

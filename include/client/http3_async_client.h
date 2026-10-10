@@ -26,6 +26,7 @@
 // Forward declarations
 class Http3AsyncClient;
 class Http3Stream;
+namespace esp_http3 { class GzipDecoder; }
 
 // Readiness callbacks run on the HTTP/3 event-loop task. They must not block
 // or call back into the client; use them only to wake an owning task.
@@ -45,6 +46,21 @@ struct Http3Request {
 
     // For streaming upload
     bool streaming_upload = false;
+
+    // Opt-in response decoding for text consumers. Read/TryRead yield decoded
+    // identity/gzip bytes; headers, including Content-Length, remain wire values.
+    // Other consumers (audio, OTA, assets) retain their existing raw behavior.
+    bool decode_gzip_response = false;
+    size_t decoded_body_limit = 512 * 1024;
+};
+
+struct Http3BodyStatistics {
+    size_t wire_received_bytes = 0;
+    size_t wire_consumed_bytes = 0;
+    size_t decoded_bytes = 0;
+    uint64_t inflate_us = 0;
+    int64_t first_wire_at_us = 0;
+    int64_t wire_finished_at_us = 0;
 };
 
 enum class Http3StreamStatusPollResult : uint8_t {
@@ -120,6 +136,10 @@ public:
    * Get error message (if any)
    */
     const std::string& GetError() const { return error_; }
+
+    // Snapshot of this response body. inflate_us measures decoder work only,
+    // excluding wait time and application processing. Headers retain wire size.
+    Http3BodyStatistics GetBodyStatistics() const;
 
     /**
    * Read response data (blocking)
@@ -235,13 +255,22 @@ private:
     std::atomic<bool> has_error_{false};
     std::atomic<bool> write_reset_{false};  // True if peer sent STOP_SENDING
 
+    bool decode_gzip_response_ = false;
+    bool head_request_ = false;
+    bool body_has_no_content_ = false;
+    size_t decoded_body_limit_ = 512 * 1024;
+    enum class BodyEncoding { kIdentity, kGzip, kUnsupported };
+    BodyEncoding body_encoding_ = BodyEncoding::kIdentity;
+    esp_http3::GzipDecoder* gzip_decoder_ = nullptr;
+    Http3BodyStatistics body_statistics_;
+
     // Receive buffer (ring buffer in PSRAM)
     uint8_t* receive_buffer_ = nullptr;
     size_t receive_buffer_size_ = 0;
     size_t receive_head_ = 0;   // Read position
     size_t receive_tail_ = 0;   // Write position
     size_t receive_count_ = 0;  // Bytes in buffer
-    std::mutex receive_mutex_;
+    mutable std::mutex receive_mutex_;
     // Serializes client detachment with Close() event-group destruction.
     std::mutex lifecycle_mutex_;
 

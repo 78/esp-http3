@@ -2937,11 +2937,15 @@ bool QuicConnection::Impl::ResetStream(int stream_id, uint64_t error_code) {
     }
 
     // Get stream flow state to determine final size
-    uint64_t final_size = 0;
     StreamFlowState* stream_state = flow_controller_.GetStreamState(sid);
-    if (stream_state) {
-        final_size = stream_state->send_offset;
+    if (!stream_state) {
+        // A completed stream has already released its flow state. Inventing a
+        // zero final size here contradicts the bytes/FIN the peer received and
+        // turns a harmless late close into a connection-wide FINAL_SIZE_ERROR.
+        ESP_LOGD(TAG, "ResetStream: stream %d is no longer active", stream_id);
+        return false;
     }
+    const uint64_t final_size = stream_state->send_offset;
 
     // Clear frame data for unacked packets belonging to this stream
     // This prevents unnecessary retransmissions of data that will be ignored by

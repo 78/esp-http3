@@ -26,11 +26,13 @@ For example: `bash tests/host/run.sh packet`.
 - HTTP/3 tests compile the actual handler and codec. They cover reordered and
   retransmitted control prefixes, late offset-zero data, absolute QPACK offsets
   after buffer drainage, and request body/FIN reassembly.
-- Connection tests extract seven actual production method bodies at test time,
+- Connection tests extract eight actual production method bodies at test time,
   then compile them with real ACK/frame/tracker/flow implementations and a small
   transport fixture. They cover sparse STREAM, PTO, batch and Client Finished
   paths, ACK-free retransmission data, and pending ACK preservation after failed
-  packet construction or socket sends. The extraction fails if a method cannot
+  packet construction or socket sends. Reset tests validate the sent final size
+  and reject resets after normal completion has removed the flow state, rather
+  than emitting an incorrect zero final size. The extraction fails if a method cannot
   be found; it does not maintain copied production behavior.
 - Path/CID tests extract the active `QuicConnection::Impl::ProcessFrames`, path
   response, CID lifecycle, batch and loss/PTO method bodies, plus their production

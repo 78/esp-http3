@@ -12,7 +12,7 @@ from pathlib import Path
 import re
 import sys
 source = Path(sys.argv[1]).read_text()
-methods = ['SendStreamData', 'HandlePto', 'BeginBatch', 'EndBatch',
+methods = ['SendStreamData', 'ResetStream', 'HandlePto', 'BeginBatch', 'EndBatch',
            'SendClientFinished', 'SendAckIfNeeded', 'SendCoalescedAcks']
 result = []
 for method in methods:

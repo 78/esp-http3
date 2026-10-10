@@ -10,5 +10,6 @@ trap 'rm -rf "$build_dir"' EXIT
   -I"$test_dir/stubs" -I"$source_root/include" -I"$header_root/include" \
   "$test_dir/client_lifetime_regression.cc" \
   "$source_root/src/client/http3_async_client.cc" \
-  "$source_root/src/client/http3_async_scheduler.cc" -o "$build_dir/client_lifetime_regression"
+  "$source_root/src/client/http3_async_scheduler.cc" \
+  "$source_root/src/client/gzip_decoder.cc" -lz -o "$build_dir/client_lifetime_regression"
 "$build_dir/client_lifetime_regression" "${1:-all}"

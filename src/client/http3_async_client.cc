@@ -5,6 +5,7 @@
  */
 
 #include "client/http3_async_client.h"
+#include "client/gzip_decoder.h"
 #include "esp_http3_memory.h"
 #include <algorithm>
 #include <arpa/inet.h>
@@ -59,6 +60,7 @@ Http3Stream::Http3Stream(Http3AsyncClient* client, int stream_id, uint32_t defau
 
 Http3Stream::~Http3Stream() {
     Close();
+    esp_http3::GzipDecoder::Destroy(gzip_decoder_);
 
     // Free receive buffer.
     if (receive_buffer_) {
@@ -125,46 +127,10 @@ int Http3Stream::Read(uint8_t* buffer, size_t size, uint32_t timeout_ms) {
 
     while (true) {
         size_t bytes_to_read = 0;
-
-        // Check for data in buffer (hold lock only for buffer access)
-        {
-            std::lock_guard<std::mutex> lock(receive_mutex_);
-
-            // Check error state
-            if (has_error_) {
-                return -1;
-            }
-
-            // Return data if available
-            if (receive_count_ > 0) {
-                bytes_to_read = std::min(size, receive_count_);
-
-                // Copy from ring buffer using memcpy (handles wrap-around)
-                size_t first_chunk = std::min(bytes_to_read, receive_buffer_size_ - receive_head_);
-                memcpy(buffer, receive_buffer_ + receive_head_, first_chunk);
-                if (first_chunk < bytes_to_read) {
-                    // Wrap around - copy remaining from start of buffer
-                    memcpy(buffer + first_chunk, receive_buffer_, bytes_to_read - first_chunk);
-                }
-                receive_head_ = (receive_head_ + bytes_to_read) % receive_buffer_size_;
-                receive_count_ -= bytes_to_read;
-            }
-
-            // No data and finished receiving - return EOF
-            if (bytes_to_read == 0 && finished_receiving_) {
-                return 0;
-            }
-        }
-
-        // If we got data, notify flow controller AFTER releasing receive_mutex_
-        // to avoid ABBA deadlock with connection_mutex_ (event loop holds
-        // connection_mutex_ while calling OnData which needs receive_mutex_)
-        if (bytes_to_read > 0) {
-            if (Http3AsyncClient* client = client_.load()) {
-                client->StreamAcknowledgeData(stream_id_, bytes_to_read, this);
-            }
-            return static_cast<int>(bytes_to_read);
-        }
+        const auto result = TryRead(buffer, size, bytes_to_read);
+        if (result == Http3StreamReadPollResult::kData) return static_cast<int>(bytes_to_read);
+        if (result == Http3StreamReadPollResult::kFinished) return 0;
+        if (result == Http3StreamReadPollResult::kError) return -1;
 
         // Treat timeout_ms as one deadline for the whole Read() operation.
         // Empty/spurious stream notifications must not restart the timeout.
@@ -363,9 +329,47 @@ Http3StreamReadPollResult Http3Stream::TryRead(uint8_t* buffer, size_t size, siz
         return Http3StreamReadPollResult::kError;
     }
 
+    // Decode only after the final response headers selected the encoding.
+    if (decode_gzip_response_ && !headers_received_) return Http3StreamReadPollResult::kPending;
+
+    size_t wire_consumed = 0;
+    const char* decode_error = nullptr;
+    auto result = Http3StreamReadPollResult::kPending;
     {
         std::lock_guard<std::mutex> lock(receive_mutex_);
-        if (receive_count_ > 0) {
+        if (has_error_) return Http3StreamReadPollResult::kError;
+        if (body_has_no_content_) {
+            if (receive_count_) decode_error = "Unexpected body for no-content response";
+            else if (finished_receiving_) result = Http3StreamReadPollResult::kFinished;
+        } else if (decode_gzip_response_ && body_encoding_ == BodyEncoding::kUnsupported) {
+            decode_error = "Unsupported response Content-Encoding";
+        } else if (decode_gzip_response_ && body_encoding_ == BodyEncoding::kGzip) {
+            if (!gzip_decoder_) gzip_decoder_ = esp_http3::GzipDecoder::Create(decoded_body_limit_);
+            if (!gzip_decoder_) decode_error = "Failed to allocate gzip decoder";
+            else for (;;) {
+                const size_t contiguous = std::min(receive_count_, receive_buffer_size_ - receive_head_);
+                const bool final_input = finished_receiving_ && contiguous == receive_count_;
+                size_t consumed = 0;
+                const int64_t started = esp_timer_get_time();
+                const auto decoded = gzip_decoder_->Decode(receive_buffer_ + receive_head_, contiguous,
+                    final_input, consumed, buffer, size, bytes_read_out);
+                body_statistics_.inflate_us += static_cast<uint64_t>(esp_timer_get_time() - started);
+                body_statistics_.decoded_bytes = gzip_decoder_->DecodedBytes();
+                receive_head_ = (receive_head_ + consumed) % receive_buffer_size_;
+                receive_count_ -= consumed;
+                wire_consumed += consumed;
+                if (decoded == esp_http3::GzipDecoder::Result::kData) {
+                    result = Http3StreamReadPollResult::kData; break;
+                }
+                if (decoded == esp_http3::GzipDecoder::Result::kFinished) {
+                    result = Http3StreamReadPollResult::kFinished; break;
+                }
+                if (decoded == esp_http3::GzipDecoder::Result::kError) {
+                    decode_error = gzip_decoder_->GetError(); break;
+                }
+                if (!consumed || !receive_count_) break;
+            }
+        } else if (receive_count_ > 0) {
             bytes_read_out = std::min(size, receive_count_);
             const size_t first_chunk = std::min(bytes_read_out, receive_buffer_size_ - receive_head_);
             memcpy(buffer, receive_buffer_ + receive_head_, first_chunk);
@@ -374,18 +378,31 @@ Http3StreamReadPollResult Http3Stream::TryRead(uint8_t* buffer, size_t size, siz
             }
             receive_head_ = (receive_head_ + bytes_read_out) % receive_buffer_size_;
             receive_count_ -= bytes_read_out;
+            wire_consumed = bytes_read_out;
+            body_statistics_.decoded_bytes += bytes_read_out;
+            if (decode_gzip_response_ && body_statistics_.decoded_bytes > decoded_body_limit_) {
+                decode_error = "Decoded response body exceeds limit";
+                bytes_read_out = 0;
+            } else result = Http3StreamReadPollResult::kData;
         } else if (finished_receiving_) {
-            return Http3StreamReadPollResult::kFinished;
+            result = Http3StreamReadPollResult::kFinished;
+        }
+        body_statistics_.wire_consumed_bytes += wire_consumed;
+    }
+    // QUIC flow control counts compressed wire bytes, never expanded bytes.
+    // Keep the existing connection/receive lock ordering intact.
+    if (wire_consumed) {
+        if (Http3AsyncClient* client = client_.load()) {
+            client->StreamAcknowledgeData(stream_id_, wire_consumed, this);
         }
     }
+    if (decode_error) { OnError(decode_error); return Http3StreamReadPollResult::kError; }
+    return result;
+}
 
-    if (bytes_read_out == 0) {
-        return Http3StreamReadPollResult::kPending;
-    }
-    if (Http3AsyncClient* client = client_.load()) {
-        client->StreamAcknowledgeData(stream_id_, bytes_read_out, this);
-    }
-    return Http3StreamReadPollResult::kData;
+Http3BodyStatistics Http3Stream::GetBodyStatistics() const {
+    std::lock_guard<std::mutex> lock(receive_mutex_);
+    return body_statistics_;
 }
 
 void Http3Stream::SetReadReadySink(Http3ReadySink sink, void* context) {
@@ -419,11 +436,10 @@ void Http3Stream::Close() {
         NotifyReadReady();
     }
 
-    // Tell client to close the QUIC stream
-    // Only send RESET_STREAM if stream is not finished normally
-    bool force_reset = !finished_receiving_;
+    // Decide whether a reset is still needed under the connection lock. A FIN
+    // can arrive while Close() is waiting for the event loop to release it.
     if (Http3AsyncClient* client = client_.load()) {
-        client->StreamClose(stream_id_, this, force_reset);
+        client->StreamClose(stream_id_, this, true);
     }
 
     // A detached stream still waits for InvalidateClient() to finish before
@@ -447,6 +463,23 @@ void Http3Stream::OnHeaders(int status, const std::vector<std::pair<std::string,
         headers_.emplace_back(esp_http3::Http3String(name.data(), name.size()),
                               esp_http3::Http3String(value.data(), value.size()));
     }
+    body_has_no_content_ = decode_gzip_response_ && (head_request_ || status == 204 || status == 304);
+    if (decode_gzip_response_ && !body_has_no_content_) {
+        size_t encoding_headers = 0;
+        for (const auto& [name, value] : headers) {
+            if (name.size() == 16 && std::equal(name.begin(), name.end(), "content-encoding",
+                [](unsigned char a, unsigned char b) { return std::tolower(a) == b; })) ++encoding_headers;
+        }
+        std::string encoding = GetHeader("content-encoding");
+        auto begin = encoding.find_first_not_of(" \t");
+        auto end = encoding.find_last_not_of(" \t");
+        encoding = begin == std::string::npos ? "" : encoding.substr(begin, end - begin + 1);
+        std::transform(encoding.begin(), encoding.end(), encoding.begin(),
+            [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+        body_encoding_ = encoding.empty() || encoding == "identity" ? BodyEncoding::kIdentity :
+            encoding == "gzip" ? BodyEncoding::kGzip : BodyEncoding::kUnsupported;
+        if (encoding_headers > 1) body_encoding_ = BodyEncoding::kUnsupported;
+    }
     headers_received_ = true;
 
     if (event_group_) {
@@ -456,13 +489,23 @@ void Http3Stream::OnHeaders(int status, const std::vector<std::pair<std::string,
 }
 
 void Http3Stream::OnData(const uint8_t* data, size_t length, bool finished) {
+    const int64_t received_at_us = esp_timer_get_time();
+    // Close() may have marked the handle closed before it acquires the
+    // connection lock. Preserve FIN state without delivering data or touching
+    // its events so StreamClose() observes normal transport completion.
     if (closed_) {
+        if (finished) {
+            std::lock_guard<std::mutex> lock(receive_mutex_);
+            body_statistics_.wire_finished_at_us = received_at_us;
+            finished_receiving_ = true;
+        }
         return;
     }
 
     bool data_available = false;
     if (data && length > 0) {
         std::lock_guard<std::mutex> lock(receive_mutex_);
+        if (!body_statistics_.first_wire_at_us) body_statistics_.first_wire_at_us = received_at_us;
 
         // Calculate available space in ring buffer
         size_t space = receive_buffer_size_ - receive_count_;
@@ -478,6 +521,7 @@ void Http3Stream::OnData(const uint8_t* data, size_t length, bool finished) {
             }
             receive_tail_ = (receive_tail_ + bytes_to_copy) % receive_buffer_size_;
             receive_count_ += bytes_to_copy;
+            body_statistics_.wire_received_bytes += bytes_to_copy;
             data_available = true;
         }
 
@@ -490,7 +534,11 @@ void Http3Stream::OnData(const uint8_t* data, size_t length, bool finished) {
     }
 
     if (finished) {
-        finished_receiving_ = true;
+        {
+            std::lock_guard<std::mutex> lock(receive_mutex_);
+            body_statistics_.wire_finished_at_us = received_at_us;
+            finished_receiving_ = true;
+        }
         if (event_group_) {
             xEventGroupSetBits(event_group_, EVENT_FINISHED);
         }
@@ -909,6 +957,9 @@ std::unique_ptr<Http3Stream> Http3AsyncClient::Open(const Http3Request& request)
     // complete before the event loop can observe a response, and allocation
     // failure must not leave an unowned QUIC stream behind.
     auto stream = std::unique_ptr<Http3Stream>(new Http3Stream(nullptr, -1, config_.request_timeout_ms));
+    stream->decode_gzip_response_ = request.decode_gzip_response;
+    stream->head_request_ = request.method == "HEAD";
+    stream->decoded_body_limit_ = request.decoded_body_limit;
     if (!stream->Initialize(config_.receive_buffer_size)) {
         ESP_LOGE(TAG, "Failed to initialize stream");
         return nullptr;
@@ -1226,6 +1277,7 @@ void Http3AsyncClient::StreamClose(int stream_id, const Http3Stream* stream, boo
     // Serialize with callbacks and reconnect before checking the instance.
     // QUIC stream IDs start over on each connection.
     std::lock_guard<std::mutex> conn_lock(connection_mutex_);
+    const bool should_reset = force_reset && !stream->finished_receiving_.load();
     {
         std::lock_guard<std::mutex> streams_lock(streams_mutex_);
         auto iterator = streams_.find(stream_id);
@@ -1244,7 +1296,7 @@ void Http3AsyncClient::StreamClose(int stream_id, const Http3Stream* stream, boo
 
     // Only reset if stream is not finished normally (e.g., user cancelled,
     // timeout) Normal stream completion doesn't need RESET_STREAM
-    if (force_reset && !needs_cleanup_.load()) {
+    if (should_reset && !needs_cleanup_.load()) {
         if (connection_) {
             ESP_LOGD(TAG, "Force resetting stream %d", stream_id);
             connection_->ResetStream(stream_id);

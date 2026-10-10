@@ -32,6 +32,7 @@ set(COMPONENT_SRCS
     "src/client/http3_client.cc"
     "src/client/http3_async_client.cc"
     "src/client/http3_async_scheduler.cc"
+    "src/client/gzip_decoder.cc"
 )
 
 set(COMPONENT_INCLUDE_DIRS
@@ -44,6 +45,7 @@ set(COMPONENT_REQUIRES
     freertos
     lwip
     esp_psram
+    esp_rom
     vfs
 )
 

@@ -128,6 +128,41 @@ either own an asynchronous client or borrow one whose lifetime is managed by
 the application. The adapter copies final headers/body into the original
 standard-library response types at that compatibility boundary.
 
+Text download consumers can opt into incremental gzip decoding on `Open()`:
+
+```cpp
+Http3Request request;
+request.path = "/document";
+request.headers = {{"accept-encoding", "gzip"}};
+request.decode_gzip_response = true;
+request.decoded_body_limit = 512 * 1024;
+auto stream = requests.Open(request);
+```
+
+`Read()` and `TryRead()` then return decoded identity/gzip body bytes. Response
+headers remain the original wire values: `Content-Length` measures the compressed
+body and must not be compared to the decoded byte count. Missing/identity encoding
+is accepted, and unsupported, chained or duplicate content encodings fail closed.
+HEAD, 204 and 304 responses have no body to decode; their encoding headers do not
+require a gzip member, while unexpected body bytes produce a read error.
+The default remains raw body delivery for existing audio, OTA and asset consumers.
+The caller adds `Accept-Encoding` only after opting into decoding.
+
+The gzip decoder runs on the reading task, using the component allocator for the
+ESP ROM inflater and its 32 KiB history. Header and body checksums, member sizes,
+concatenated members and final trailers are validated. The framing layer also
+recovers trailer bytes prefetched by ESP ROM miniz 1.15, including bytes consumed
+during an earlier inflate call. Decoded bytes can arrive before FIN; EOF requires
+both validated trailers and transport FIN. Corruption,
+truncation, an oversized decoded body, more than 128 members or a member header
+over 66,560 bytes produce a read error. Decompression never changes QUIC flow
+control: only compressed bytes consumed from the receive ring are acknowledged.
+
+`GetBodyStatistics()` reports received/consumed wire bytes, produced decoded bytes,
+decoder CPU time in microseconds, and absolute `esp_timer_get_time()` timestamps
+for the first body callback and transport FIN (zero until observed). These values
+separate network delivery, decompression and later application processing.
+
 ### Streaming Upload
 
 ```cpp
